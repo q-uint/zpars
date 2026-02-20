@@ -1,7 +1,7 @@
 .{
     .name = .zpars,
     .version = "0.0.0",
-    .fingerprint = 0xe2088cfb07a9fa63, // Changing this has security and trust implications.
+    .fingerprint = 0x836f350ae3416351, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},
     .paths = .{

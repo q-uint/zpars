@@ -231,3 +231,69 @@ fn addToken(self: *Scanner, tag: Token.Tag) !void {
         .line = self.line,
     });
 }
+
+// --- Tests -------------------------------------------------------------------
+
+fn expectTags(source: []const u8, expected: []const Token.Tag) !void {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator, source);
+    defer scanner.deinit();
+    const tokens = try scanner.scanTokens();
+    const actual = try allocator.alloc(Token.Tag, tokens.len);
+    defer allocator.free(actual);
+    for (tokens, 0..) |tok, i| actual[i] = tok.tag;
+    try std.testing.expectEqualSlices(Token.Tag, expected, actual);
+}
+
+test "simple rule" {
+    try expectTags("foo = bar", &.{ .rulename, .equals, .rulename, .eof });
+}
+
+test "alternation" {
+    try expectTags("a = b / c", &.{
+        .rulename, .equals, .rulename, .slash, .rulename, .eof,
+    });
+}
+
+test "repetition prefixes" {
+    try expectTags("a = 3*5b", &.{
+        .rulename, .equals, .number, .star, .number, .rulename, .eof,
+    });
+}
+
+test "numeric values" {
+    try expectTags("a = %x41-5A / %d65.66 / %b0101", &.{
+        .rulename, .equals, .hex_val, .slash, .dec_val, .slash, .bin_val, .eof,
+    });
+}
+
+test "groups and options" {
+    try expectTags("a = (b / c) [d]", &.{
+        .rulename,    .equals,       .left_paren, .rulename,      .slash, .rulename,
+        .right_paren, .left_bracket, .rulename,   .right_bracket, .eof,
+    });
+}
+
+test "char val and prose val" {
+    try expectTags(
+        \\a = "hello" <world>
+    , &.{ .rulename, .equals, .char_val, .prose_val, .eof });
+}
+
+test "comment" {
+    try expectTags("a = b ; comment", &.{
+        .rulename, .equals, .rulename, .comment, .eof,
+    });
+}
+
+test "incremental alternation" {
+    try expectTags("a =/ b", &.{ .rulename, .equals_slash, .rulename, .eof });
+}
+
+test "multiline" {
+    try expectTags("a = b\nc = d", &.{
+        .rulename, .equals, .rulename, .newline,
+        .rulename, .equals, .rulename, .newline,
+        .eof,
+    });
+}
