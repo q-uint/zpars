@@ -1,13 +1,17 @@
 const std = @import("std");
 const Token = @import("Token.zig");
 const Ast = @import("Ast.zig");
+const Diagnostic = @import("Diagnostic.zig");
 
 const Parser = @This();
+
+pub const ParseError = error{ SyntaxError, OutOfMemory, Overflow, InvalidCharacter };
 
 tokens: []const Token,
 source: []const u8,
 allocator: std.mem.Allocator,
 pos: usize,
+diagnostic: ?Diagnostic = null,
 
 pub fn init(allocator: std.mem.Allocator, tokens: []const Token, source: []const u8) Parser {
     return .{
@@ -149,7 +153,7 @@ fn parseRepetition(self: *Parser) !Ast.Node {
 }
 
 /// element = rulename / group / option / char-val / num-val / prose-val
-fn parseElement(self: *Parser) !Ast.Node {
+fn parseElement(self: *Parser) ParseError!Ast.Node {
     return switch (self.peek().tag) {
         .rulename => .{ .rulename = self.advance().lexeme(self.source) },
         .char_val => {
@@ -163,27 +167,46 @@ fn parseElement(self: *Parser) !Ast.Node {
         },
         .left_paren => try self.parseGroup(),
         .left_bracket => try self.parseOption(),
-        else => error.UnexpectedToken,
+        else => {
+            self.fail(.element, self.peek());
+            return error.SyntaxError;
+        },
     };
 }
 
 /// group = "(" alternation ")"
 fn parseGroup(self: *Parser) !Ast.Node {
-    if (self.advance().tag != .left_paren) return error.UnexpectedToken;
+    const open = self.advance();
+    if (open.tag != .left_paren) {
+        self.fail(.left_paren, open);
+        return error.SyntaxError;
+    }
     self.skipTrivia();
     const node = try self.parseAlternation();
     self.skipTrivia();
-    if (self.advance().tag != .right_paren) return error.UnexpectedToken;
+    const close = self.advance();
+    if (close.tag != .right_paren) {
+        self.fail(.right_paren, close);
+        return error.SyntaxError;
+    }
     return node;
 }
 
 /// option = "[" alternation "]"  →  *1( alternation )
 fn parseOption(self: *Parser) !Ast.Node {
-    if (self.advance().tag != .left_bracket) return error.UnexpectedToken;
+    const open = self.advance();
+    if (open.tag != .left_bracket) {
+        self.fail(.left_bracket, open);
+        return error.SyntaxError;
+    }
     self.skipTrivia();
     const inner = try self.parseAlternation();
     self.skipTrivia();
-    if (self.advance().tag != .right_bracket) return error.UnexpectedToken;
+    const close = self.advance();
+    if (close.tag != .right_bracket) {
+        self.fail(.right_bracket, close);
+        return error.SyntaxError;
+    }
 
     const ptr = try self.allocator.create(Ast.Node);
     ptr.* = inner;
@@ -219,6 +242,18 @@ fn parseNumVal(self: *Parser) !Ast.NumVal {
     }
 
     return .{ .single = try std.fmt.parseInt(u8, digits, base) };
+}
+
+// --- Diagnostics -------------------------------------------------------------
+
+fn fail(self: *Parser, expected: Diagnostic.Expected, token: Token) void {
+    self.diagnostic = .{
+        .expected = expected,
+        .found_tag = token.tag,
+        .found_start = token.start,
+        .found_len = token.len,
+        .line = token.line,
+    };
 }
 
 // --- Helpers -----------------------------------------------------------------
@@ -409,4 +444,29 @@ test "incremental alternation merges" {
     try std.testing.expectEqual(2, alts.len);
     try std.testing.expectEqualStrings("a", alts[0].rulename);
     try std.testing.expectEqualStrings("b", alts[1].rulename);
+}
+
+fn expectSyntaxError(source: []const u8, expected: Diagnostic.Expected, found_tag: Token.Tag) !void {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator, source);
+    defer scanner.deinit();
+    const tokens = try scanner.scanTokens();
+    var parser = Parser.init(allocator, tokens, source);
+    const result = parser.parse();
+    try std.testing.expectError(error.SyntaxError, result);
+    const diag = parser.diagnostic.?;
+    try std.testing.expectEqual(expected, diag.expected);
+    try std.testing.expectEqual(found_tag, diag.found_tag);
+}
+
+test "diagnostic: unexpected token in element position" {
+    try expectSyntaxError("foo = (a / )", .element, .right_paren);
+}
+
+test "diagnostic: missing closing paren" {
+    try expectSyntaxError("foo = (a", .right_paren, .eof);
+}
+
+test "diagnostic: missing closing bracket" {
+    try expectSyntaxError("foo = [bar", .right_bracket, .eof);
 }

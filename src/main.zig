@@ -14,25 +14,38 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    const source = try std.fs.cwd().readFileAlloc(allocator, args[1], 1024 * 1024);
+    const filename = args[1];
+    const source = try std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024);
     defer allocator.free(source);
 
-    var scanner = zpars.Scanner.init(allocator, source);
-    defer scanner.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
 
+    var scanner = zpars.Scanner.init(aa, source);
     const tokens = try scanner.scanTokens();
+
+    var parser = zpars.Parser.init(aa, tokens, source);
+    const rules = parser.parse() catch |err| switch (err) {
+        error.SyntaxError => {
+            if (parser.diagnostic) |diag| {
+                var stderr_buffer: [4096]u8 = undefined;
+                var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+                const stderr = &stderr_writer.interface;
+                diag.format(source, filename, stderr) catch {};
+                stderr.flush() catch {};
+            }
+            std.process.exit(1);
+        },
+        else => return err,
+    };
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    for (tokens) |tok| {
-        try stdout.print("[{d}:{d: >3}] {s: <16} \"{s}\"\n", .{
-            tok.line,
-            tok.start,
-            @tagName(tok.tag),
-            tok.lexeme(source),
-        });
+    for (rules) |rule| {
+        try stdout.print("{s}\n", .{rule.name});
     }
     try stdout.flush();
 }
