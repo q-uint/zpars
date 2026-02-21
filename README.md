@@ -6,6 +6,8 @@ An ABNF ([RFC 5234](https://www.rfc-editor.org/rfc/rfc5234)) parser and comptime
 
 - **ABNF Parser** — Tokenizes and parses ABNF grammars into an AST, with structured error diagnostics and error recovery on malformed input.
 - **Grammar Validator** — Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
+- **Runtime Matcher** — Match input strings against any rule in a dynamically loaded grammar.
+- **Formatter** — Pretty-print parsed grammars back to canonical ABNF with aligned `=` signs.
 - **Comptime Combinators** — Zero-overhead parser combinator library resolved entirely at comptime.
 - **ABNF-to-Combinator Compiler** — Compile ABNF grammar strings into combinator types at comptime. Define your grammar in standard ABNF and get a parser for free.
 
@@ -60,29 +62,67 @@ Available primitives: `Literal`, `Char`, `CharRange`, `ByteLiteral`, `CaseInsens
 
 Available combinators: `Sequence`, `Choice`, `Many`, `Optional`, `Map`, `Capture`.
 
+## Runtime Matcher
+
+For grammars loaded at runtime, use the `Matcher`:
+
+```zig
+const zpars = @import("zpars");
+
+var scanner = zpars.Scanner.init(grammar);
+const tokens = scanner.scanTokens();
+var parser = zpars.Parser.init(tokens, grammar);
+const rules = try parser.parse();
+var validator = zpars.Validator.init(allocator, rules);
+const merged = try validator.validate();
+const matcher = zpars.Matcher.init(merged);
+
+const r = matcher.match("version", "HTTP/1.1 OK").?;
+// r.value == "HTTP/1.1", r.rest == " OK"
+```
+
 ## CLI
 
 ```
-$ zpars grammar.abnf
-greeting
-hello
-world
+zpars check <file>                       # validate a grammar
+zpars fmt   <file>                       # format a grammar
+zpars match -r <rule> <file> <input>     # match input against a rule
 ```
 
-Syntax errors point to the exact location:
+### check
+
+Validate an ABNF grammar, reporting syntax errors and semantic issues:
 
 ```
+$ zpars check grammar.abnf
 grammar.abnf:1:12: error: expected element, found ')'
    foo = (a / )
               ^
 ```
 
-Semantic issues are reported as warnings or errors:
-
 ```
+$ zpars check grammar.abnf
 grammar.abnf: warning: rule 'helper' is defined but never referenced
 grammar.abnf: error: rule 'start' references undefined rule 'missing'
-grammar.abnf: error: rule 'a' is unproductive (circular with no terminal escape)
+```
+
+### fmt
+
+Parse and reformat a grammar with aligned `=` signs:
+
+```
+$ zpars fmt grammar.abnf
+number = 1*DIGIT
+pair   = number "," number
+```
+
+### match
+
+Match an input string against a rule:
+
+```
+$ zpars match -r version grammar.abnf "HTTP/1.1 OK"
+HTTP/1.1
 ```
 
 ## Building
@@ -91,6 +131,5 @@ Requires Zig 0.15.2+.
 
 ```
 zig build                      # build the executable
-zig build run -- grammar.abnf  # run on a file
 zig build test                 # run all tests
 ```
