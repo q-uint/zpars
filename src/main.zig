@@ -18,29 +18,29 @@ pub fn main() !void {
     const source = try std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024);
     defer allocator.free(source);
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
+    var scanner = zpars.Scanner.init(source);
+    const tokens = scanner.scanTokens();
 
-    var scanner = zpars.Scanner.init(aa, source);
-    const tokens = try scanner.scanTokens();
-
-    var parser = zpars.Parser.init(aa, tokens, source);
+    var parser = zpars.Parser.init(tokens, source);
     const rules = try parser.parse();
 
     var stderr_buffer: [4096]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    if (parser.diagnostics.items.len > 0) {
-        for (parser.diagnostics.items) |diag| {
+    const diags = parser.getDiagnostics();
+    if (diags.len > 0) {
+        for (diags) |diag| {
             diag.format(source, filename, stderr) catch {};
         }
         stderr.flush() catch {};
         std.process.exit(1);
     }
 
-    var validator = zpars.Validator.init(aa, rules);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var validator = zpars.Validator.init(arena.allocator(), rules);
     const merged = try validator.validate();
 
     var has_errors = false;

@@ -173,6 +173,55 @@ pub fn Map(comptime P: type, comptime mapFn: anytype) type {
 }
 
 // ---------------------------------------------------------------------------
+// ABNF support combinators
+// ---------------------------------------------------------------------------
+
+/// Match a single exact byte value.
+pub fn ByteLiteral(comptime byte: u8) type {
+    return Char(struct {
+        fn f(c: u8) bool {
+            return c == byte;
+        }
+    }.f);
+}
+
+/// Match a string literal case-insensitively (ASCII only).
+/// ABNF `"text"` is case-insensitive by default (RFC 5234 §2.3).
+pub fn CaseInsensitiveLiteral(comptime str: []const u8) type {
+    return struct {
+        pub const Value = void;
+
+        pub fn parse(input: []const u8) ?Result(Value) {
+            if (input.len < str.len) return null;
+            inline for (str, 0..) |expected, i| {
+                if (toLower(input[i]) != toLower(expected)) return null;
+            }
+            return .{ .value = {}, .rest = input[str.len..] };
+        }
+
+        fn toLower(c: u8) u8 {
+            return if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+    };
+}
+
+/// Run inner parser `P`; on success, produce the matched input span
+/// as `[]const u8` rather than `P`'s native Value type.
+pub fn Capture(comptime P: type) type {
+    return struct {
+        pub const Value = []const u8;
+
+        pub fn parse(input: []const u8) ?Result(Value) {
+            const r = P.parse(input) orelse return null;
+            return .{
+                .value = input[0 .. input.len - r.rest.len],
+                .rest = r.rest,
+            };
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -338,4 +387,55 @@ test "composed: keyword then identifier" {
 
     const r = P.parse("let foo123 = 1").?;
     try std.testing.expectEqualStrings(" = 1", r.rest);
+}
+
+test "ByteLiteral matches exact byte" {
+    const P = ByteLiteral(0x41);
+    const r = P.parse("Abc").?;
+    try std.testing.expectEqual('A', r.value);
+    try std.testing.expectEqualStrings("bc", r.rest);
+}
+
+test "ByteLiteral rejects wrong byte" {
+    const P = ByteLiteral(0x41);
+    try std.testing.expect(P.parse("abc") == null);
+}
+
+test "CaseInsensitiveLiteral matches any case" {
+    const P = CaseInsensitiveLiteral("hello");
+    try std.testing.expect(P.parse("hello") != null);
+    try std.testing.expect(P.parse("HELLO") != null);
+    try std.testing.expect(P.parse("HeLLo") != null);
+}
+
+test "CaseInsensitiveLiteral rejects mismatch" {
+    const P = CaseInsensitiveLiteral("hello");
+    try std.testing.expect(P.parse("hxllo") == null);
+}
+
+test "Capture returns matched span" {
+    const P = Capture(Sequence(Literal("ab"), Literal("cd")));
+    const r = P.parse("abcdef").?;
+    try std.testing.expectEqualStrings("abcd", r.value);
+    try std.testing.expectEqualStrings("ef", r.rest);
+}
+
+test "Capture with Many returns full span" {
+    const P = Capture(Many(CharRange('0', '9'), .{ .min = 1 }));
+    const r = P.parse("123abc").?;
+    try std.testing.expectEqualStrings("123", r.value);
+    try std.testing.expectEqualStrings("abc", r.rest);
+}
+
+test "Capture enables heterogeneous Choice" {
+    // Without Capture, Choice(Literal, CharRange) would fail because
+    // void != u8. Capture makes both produce []const u8.
+    const P = Choice(
+        Capture(Literal("ab")),
+        Capture(CharRange('0', '9')),
+    );
+    const r1 = P.parse("abXX").?;
+    try std.testing.expectEqualStrings("ab", r1.value);
+    const r2 = P.parse("5XX").?;
+    try std.testing.expectEqualStrings("5", r2.value);
 }

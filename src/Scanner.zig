@@ -3,63 +3,48 @@ const Token = @import("Token.zig");
 
 const Scanner = @This();
 
+pub const max_tokens = 4096;
+
 /// The full source text being scanned.
 source: []const u8,
-/// Collected tokens.
-tokens: std.ArrayList(Token),
-/// Allocator for the token list.
-allocator: std.mem.Allocator,
+/// Collected tokens (bounded).
+tokens: [max_tokens]Token = undefined,
+/// Number of tokens collected so far.
+token_count: usize = 0,
 /// Start of the current lexeme being scanned.
-start: usize,
+start: usize = 0,
 /// Current position in source (next character to read).
-current: usize,
+current: usize = 0,
 /// Current line number (1-based).
-line: usize,
+line: usize = 1,
 
-pub fn init(allocator: std.mem.Allocator, source: []const u8) Scanner {
-    return .{
-        .source = source,
-        .tokens = .empty,
-        .allocator = allocator,
-        .start = 0,
-        .current = 0,
-        .line = 1,
-    };
-}
-
-pub fn deinit(self: *Scanner) void {
-    self.tokens.deinit(self.allocator);
+pub fn init(source: []const u8) Scanner {
+    return .{ .source = source };
 }
 
 /// Scan the entire source and return the token list.
-pub fn scanTokens(self: *Scanner) ![]const Token {
+pub fn scanTokens(self: *Scanner) []const Token {
     while (!self.isAtEnd()) {
-        // We are at the beginning of the next lexeme.
         self.start = self.current;
-        try self.scanToken();
+        self.scanToken();
     }
 
     // Append final EOF token.
-    try self.tokens.append(self.allocator, .{
-        .tag = .eof,
-        .start = self.current,
-        .len = 0,
-        .line = self.line,
-    });
+    self.addToken(.eof);
 
-    return self.tokens.items;
+    return self.tokens[0..self.token_count];
 }
 
-fn scanToken(self: *Scanner) !void {
+fn scanToken(self: *Scanner) void {
     const c = self.advance();
     switch (c) {
-        '(' => try self.addToken(.left_paren),
-        ')' => try self.addToken(.right_paren),
-        '[' => try self.addToken(.left_bracket),
-        ']' => try self.addToken(.right_bracket),
-        '*' => try self.addToken(.star),
-        '/' => try self.addToken(.slash),
-        '=' => try self.addToken(if (self.match('/')) .equals_slash else .equals),
+        '(' => self.addToken(.left_paren),
+        ')' => self.addToken(.right_paren),
+        '[' => self.addToken(.left_bracket),
+        ']' => self.addToken(.right_bracket),
+        '*' => self.addToken(.star),
+        '/' => self.addToken(.slash),
+        '=' => self.addToken(if (self.match('/')) .equals_slash else .equals),
 
         // String literals — "..."
         '"' => {
@@ -68,10 +53,10 @@ fn scanToken(self: *Scanner) !void {
                 _ = self.advance();
             }
             if (self.isAtEnd()) {
-                try self.addToken(.invalid); // unterminated string
+                self.addToken(.invalid); // unterminated string
             } else {
                 _ = self.advance(); // consume closing "
-                try self.addToken(.char_val);
+                self.addToken(.char_val);
             }
         },
 
@@ -81,10 +66,10 @@ fn scanToken(self: *Scanner) !void {
                 _ = self.advance();
             }
             if (self.isAtEnd()) {
-                try self.addToken(.invalid); // unterminated prose
+                self.addToken(.invalid); // unterminated prose
             } else {
                 _ = self.advance(); // consume closing >
-                try self.addToken(.prose_val);
+                self.addToken(.prose_val);
             }
         },
 
@@ -95,22 +80,22 @@ fn scanToken(self: *Scanner) !void {
                 'b' => {
                     _ = self.advance(); // consume 'b'
                     self.consumeDigits(isBit);
-                    try self.addToken(.bin_val);
+                    self.addToken(.bin_val);
                 },
                 'd' => {
                     _ = self.advance(); // consume 'd'
                     self.consumeDigits(isDigit);
-                    try self.addToken(.dec_val);
+                    self.addToken(.dec_val);
                 },
                 'x' => {
                     _ = self.advance(); // consume 'x'
                     self.consumeDigits(isHexDigit);
-                    try self.addToken(.hex_val);
+                    self.addToken(.hex_val);
                 },
                 's', 'i' => {
                     _ = self.advance(); // consume 's' or 'i'
                     if (self.peek() != '"') {
-                        try self.addToken(.invalid); // %s or %i without opening quote
+                        self.addToken(.invalid); // %s or %i without opening quote
                     } else {
                         _ = self.advance(); // consume opening "
                         while (self.peek() != '"' and !self.isAtEnd()) {
@@ -118,14 +103,14 @@ fn scanToken(self: *Scanner) !void {
                             _ = self.advance();
                         }
                         if (self.isAtEnd()) {
-                            try self.addToken(.invalid); // unterminated string
+                            self.addToken(.invalid); // unterminated string
                         } else {
                             _ = self.advance(); // consume closing "
-                            try self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
+                            self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
                         }
                     }
                 },
-                else => try self.addToken(.invalid), // bare % with no base
+                else => self.addToken(.invalid), // bare % with no base
             }
         },
 
@@ -134,7 +119,7 @@ fn scanToken(self: *Scanner) !void {
             while (self.peek() != '\n' and self.peek() != '\r' and !self.isAtEnd()) {
                 _ = self.advance();
             }
-            try self.addToken(.comment);
+            self.addToken(.comment);
         },
 
         // Whitespace — skip silently.
@@ -144,11 +129,11 @@ fn scanToken(self: *Scanner) !void {
         '\r' => {
             _ = self.match('\n'); // consume LF after CR (CRLF)
             self.line += 1;
-            try self.addToken(.newline);
+            self.addToken(.newline);
         },
         '\n' => {
             self.line += 1;
-            try self.addToken(.newline);
+            self.addToken(.newline);
         },
 
         else => {
@@ -157,13 +142,13 @@ fn scanToken(self: *Scanner) !void {
                 while (isAlpha(self.peek()) or isDigit(self.peek()) or self.peek() == '-') {
                     _ = self.advance();
                 }
-                try self.addToken(.rulename);
+                self.addToken(.rulename);
             } else if (isDigit(c)) {
                 // Number: 1*DIGIT (used in repetition)
                 while (isDigit(self.peek())) _ = self.advance();
-                try self.addToken(.number);
+                self.addToken(.number);
             } else {
-                try self.addToken(.invalid);
+                self.addToken(.invalid);
             }
         },
     }
@@ -183,12 +168,6 @@ fn advance(self: *Scanner) u8 {
 fn peek(self: *Scanner) u8 {
     if (self.isAtEnd()) return 0;
     return self.source[self.current];
-}
-
-/// Look one character ahead (past current). Returns 0 if at end.
-fn peekNext(self: *Scanner) u8 {
-    if (self.current + 1 >= self.source.len) return 0;
-    return self.source[self.current + 1];
 }
 
 /// Conditional advance: if current char matches `expected`, consume it
@@ -241,22 +220,22 @@ fn isAlpha(c: u8) bool {
 }
 
 /// Append a token with the current lexeme span.
-fn addToken(self: *Scanner, tag: Token.Tag) !void {
-    try self.tokens.append(self.allocator, .{
+fn addToken(self: *Scanner, tag: Token.Tag) void {
+    self.tokens[self.token_count] = .{
         .tag = tag,
         .start = self.start,
         .len = self.current - self.start,
         .line = self.line,
-    });
+    };
+    self.token_count += 1;
 }
 
 // --- Tests -------------------------------------------------------------------
 
 fn expectTags(source: []const u8, expected: []const Token.Tag) !void {
+    var scanner = Scanner.init(source);
+    const tokens = scanner.scanTokens();
     const allocator = std.testing.allocator;
-    var scanner = Scanner.init(allocator, source);
-    defer scanner.deinit();
-    const tokens = try scanner.scanTokens();
     const actual = try allocator.alloc(Token.Tag, tokens.len);
     defer allocator.free(actual);
     for (tokens, 0..) |tok, i| actual[i] = tok.tag;

@@ -6,6 +6,9 @@ const Validator = @This();
 rules: []const Ast.Rule,
 allocator: std.mem.Allocator,
 diagnostics: std.ArrayList(Validation) = .empty,
+/// Name of the start rule (exempt from "unused" check).
+/// When null, the first rule is assumed to be the start rule.
+start_rule: ?[]const u8 = null,
 
 pub const Validation = struct {
     kind: Kind,
@@ -89,8 +92,13 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
         });
     }
 
-    // Stage 4: unused rules (skip index 0 — start symbol).
-    for (merged_rules[1..]) |rule| {
+    // Stage 4: unused rules (skip the start rule).
+    for (merged_rules, 0..) |rule, i| {
+        if (self.start_rule) |start| {
+            if (std.ascii.eqlIgnoreCase(rule.name, start)) continue;
+        } else {
+            if (i == 0) continue;
+        }
         if (!refs.contains(rule.name)) {
             try self.diagnostics.append(self.allocator, .{
                 .kind = .unused_rule,
@@ -228,13 +236,11 @@ fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
     rules: []const Ast.Rule,
     diagnostics: []const Validation,
 } {
-    var scanner = Scanner.init(allocator, source);
-    defer scanner.deinit();
-    const tokens = try scanner.scanTokens();
-    var parser = Parser.init(allocator, tokens, source);
-    defer parser.diagnostics.deinit(allocator);
+    var scanner = Scanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, source);
     const rules = try parser.parse();
-    try std.testing.expectEqual(0, parser.diagnostics.items.len);
+    try std.testing.expectEqual(0, parser.getDiagnostics().len);
     var validator = Validator.init(allocator, rules);
     const merged = try validator.validate();
     return .{ .rules = merged, .diagnostics = try validator.diagnostics.toOwnedSlice(allocator) };
