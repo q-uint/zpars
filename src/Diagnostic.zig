@@ -15,6 +15,7 @@ found_len: usize,
 line: usize,
 
 pub const Expected = enum {
+    rulename,
     element,
     left_paren,
     right_paren,

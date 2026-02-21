@@ -11,7 +11,7 @@ tokens: []const Token,
 source: []const u8,
 allocator: std.mem.Allocator,
 pos: usize,
-diagnostic: ?Diagnostic = null,
+diagnostics: std.ArrayList(Diagnostic) = .empty,
 
 pub fn init(allocator: std.mem.Allocator, tokens: []const Token, source: []const u8) Parser {
     return .{
@@ -28,7 +28,14 @@ pub fn parse(self: *Parser) ![]const Ast.Rule {
 
     self.skipTrivia();
     while (self.peek().tag != .eof) {
-        const rule = try self.parseRule();
+        const rule = self.parseRule() catch |err| switch (err) {
+            error.SyntaxError => {
+                self.synchronize();
+                self.skipTrivia();
+                continue;
+            },
+            else => return err,
+        };
 
         // Handle incremental alternation (=/): merge with existing rule.
         var merged = false;
@@ -68,6 +75,10 @@ fn mergeAlternation(self: *Parser, a: Ast.Node, b: Ast.Node) !Ast.Node {
 
 /// rule = rulename ("=" / "=/") alternation
 fn parseRule(self: *Parser) !Ast.Rule {
+    if (self.peek().tag != .rulename) {
+        try self.fail(.rulename, self.peek());
+        return error.SyntaxError;
+    }
     const name = self.advance().lexeme(self.source);
     self.skipTrivia();
     if (self.peek().tag == .equals or self.peek().tag == .equals_slash) _ = self.advance();
@@ -168,7 +179,7 @@ fn parseElement(self: *Parser) ParseError!Ast.Node {
         .left_paren => try self.parseGroup(),
         .left_bracket => try self.parseOption(),
         else => {
-            self.fail(.element, self.peek());
+            try self.fail(.element, self.peek());
             return error.SyntaxError;
         },
     };
@@ -178,7 +189,7 @@ fn parseElement(self: *Parser) ParseError!Ast.Node {
 fn parseGroup(self: *Parser) !Ast.Node {
     const open = self.advance();
     if (open.tag != .left_paren) {
-        self.fail(.left_paren, open);
+        try self.fail(.left_paren, open);
         return error.SyntaxError;
     }
     self.skipTrivia();
@@ -186,7 +197,7 @@ fn parseGroup(self: *Parser) !Ast.Node {
     self.skipTrivia();
     const close = self.advance();
     if (close.tag != .right_paren) {
-        self.fail(.right_paren, close);
+        try self.fail(.right_paren, close);
         return error.SyntaxError;
     }
     return node;
@@ -196,7 +207,7 @@ fn parseGroup(self: *Parser) !Ast.Node {
 fn parseOption(self: *Parser) !Ast.Node {
     const open = self.advance();
     if (open.tag != .left_bracket) {
-        self.fail(.left_bracket, open);
+        try self.fail(.left_bracket, open);
         return error.SyntaxError;
     }
     self.skipTrivia();
@@ -204,7 +215,7 @@ fn parseOption(self: *Parser) !Ast.Node {
     self.skipTrivia();
     const close = self.advance();
     if (close.tag != .right_bracket) {
-        self.fail(.right_bracket, close);
+        try self.fail(.right_bracket, close);
         return error.SyntaxError;
     }
 
@@ -246,14 +257,14 @@ fn parseNumVal(self: *Parser) !Ast.NumVal {
 
 // --- Diagnostics -------------------------------------------------------------
 
-fn fail(self: *Parser, expected: Diagnostic.Expected, token: Token) void {
-    self.diagnostic = .{
+fn fail(self: *Parser, expected: Diagnostic.Expected, token: Token) error{OutOfMemory}!void {
+    try self.diagnostics.append(self.allocator, .{
         .expected = expected,
         .found_tag = token.tag,
         .found_start = token.start,
         .found_len = token.len,
         .line = token.line,
-    };
+    });
 }
 
 // --- Helpers -----------------------------------------------------------------
@@ -284,6 +295,18 @@ fn skipTrivia(self: *Parser) void {
             .comment, .newline => self.pos += 1,
             else => break,
         }
+    }
+}
+
+/// Skip tokens until the start of the next rule or EOF.
+/// A rule boundary is a `rulename` followed by `=` or `=/`.
+fn synchronize(self: *Parser) void {
+    while (self.peek().tag != .eof) {
+        if (self.peek().tag == .rulename) {
+            const next = self.peekNextMeaningful();
+            if (next == .equals or next == .equals_slash) return;
+        }
+        self.pos += 1;
     }
 }
 
@@ -328,7 +351,10 @@ fn parseSource(allocator: std.mem.Allocator, source: []const u8) ![]const Ast.Ru
     defer scanner.deinit();
     const tokens = try scanner.scanTokens();
     var parser = Parser.init(allocator, tokens, source);
-    return try parser.parse();
+    defer parser.diagnostics.deinit(allocator);
+    const rules = try parser.parse();
+    try std.testing.expectEqual(0, parser.diagnostics.items.len);
+    return rules;
 }
 
 test "single rule with rulename reference" {
@@ -452,9 +478,11 @@ fn expectSyntaxError(source: []const u8, expected: Diagnostic.Expected, found_ta
     defer scanner.deinit();
     const tokens = try scanner.scanTokens();
     var parser = Parser.init(allocator, tokens, source);
-    const result = parser.parse();
-    try std.testing.expectError(error.SyntaxError, result);
-    const diag = parser.diagnostic.?;
+    defer parser.diagnostics.deinit(allocator);
+    const rules = try parser.parse();
+    allocator.free(rules);
+    try std.testing.expect(parser.diagnostics.items.len > 0);
+    const diag = parser.diagnostics.items[0];
     try std.testing.expectEqual(expected, diag.expected);
     try std.testing.expectEqual(found_tag, diag.found_tag);
 }
@@ -469,4 +497,66 @@ test "diagnostic: missing closing paren" {
 
 test "diagnostic: missing closing bracket" {
     try expectSyntaxError("foo = [bar", .right_bracket, .eof);
+}
+
+// --- Synchronization / recovery tests ----------------------------------------
+
+test "recovery: error in first rule, second rule parsed" {
+    const allocator = std.testing.allocator;
+    const source = "foo = )\nbar = baz";
+    var scanner = Scanner.init(allocator, source);
+    defer scanner.deinit();
+    const tokens = try scanner.scanTokens();
+    var parser = Parser.init(allocator, tokens, source);
+    defer parser.diagnostics.deinit(allocator);
+    const rules = try parser.parse();
+    defer allocator.free(rules);
+    try std.testing.expectEqual(1, rules.len);
+    try std.testing.expectEqualStrings("bar", rules[0].name);
+    try std.testing.expectEqual(1, parser.diagnostics.items.len);
+}
+
+test "recovery: multiple errors accumulate" {
+    const allocator = std.testing.allocator;
+    const source = "a = )\nb = ]\nc = d";
+    var scanner = Scanner.init(allocator, source);
+    defer scanner.deinit();
+    const tokens = try scanner.scanTokens();
+    var parser = Parser.init(allocator, tokens, source);
+    defer parser.diagnostics.deinit(allocator);
+    const rules = try parser.parse();
+    defer allocator.free(rules);
+    try std.testing.expectEqual(1, rules.len);
+    try std.testing.expectEqualStrings("c", rules[0].name);
+    try std.testing.expectEqual(2, parser.diagnostics.items.len);
+}
+
+test "recovery: all rules have errors" {
+    const allocator = std.testing.allocator;
+    const source = "a = )\nb = ]";
+    var scanner = Scanner.init(allocator, source);
+    defer scanner.deinit();
+    const tokens = try scanner.scanTokens();
+    var parser = Parser.init(allocator, tokens, source);
+    defer parser.diagnostics.deinit(allocator);
+    const rules = try parser.parse();
+    defer allocator.free(rules);
+    try std.testing.expectEqual(0, rules.len);
+    try std.testing.expectEqual(2, parser.diagnostics.items.len);
+}
+
+test "recovery: unclosed group, next rule still parsed" {
+    const allocator = std.testing.allocator;
+    const source = "a = (b /\nc = d";
+    var scanner = Scanner.init(allocator, source);
+    defer scanner.deinit();
+    const tokens = try scanner.scanTokens();
+    var parser = Parser.init(allocator, tokens, source);
+    defer parser.diagnostics.deinit(allocator);
+    const rules = try parser.parse();
+    defer allocator.free(rules);
+    try std.testing.expect(parser.diagnostics.items.len > 0);
+    // The second rule "c = d" should be recovered.
+    try std.testing.expectEqual(1, rules.len);
+    try std.testing.expectEqualStrings("c", rules[0].name);
 }

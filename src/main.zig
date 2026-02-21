@@ -26,19 +26,18 @@ pub fn main() !void {
     const tokens = try scanner.scanTokens();
 
     var parser = zpars.Parser.init(aa, tokens, source);
-    const rules = parser.parse() catch |err| switch (err) {
-        error.SyntaxError => {
-            if (parser.diagnostic) |diag| {
-                var stderr_buffer: [4096]u8 = undefined;
-                var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-                const stderr = &stderr_writer.interface;
-                diag.format(source, filename, stderr) catch {};
-                stderr.flush() catch {};
-            }
-            std.process.exit(1);
-        },
-        else => return err,
-    };
+    const rules = try parser.parse();
+
+    if (parser.diagnostics.items.len > 0) {
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+        const stderr = &stderr_writer.interface;
+        for (parser.diagnostics.items) |diag| {
+            diag.format(source, filename, stderr) catch {};
+        }
+        stderr.flush() catch {};
+        std.process.exit(1);
+    }
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
