@@ -3,6 +3,22 @@ const Ast = @import("Ast.zig");
 
 const Validator = @This();
 
+/// Case-insensitive hash map context for rule name lookups (RFC 5234 §2.1).
+const CaseInsensitiveContext = struct {
+    pub fn hash(_: CaseInsensitiveContext, s: []const u8) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        for (s) |c| h.update(&.{std.ascii.toLower(c)});
+        return h.final();
+    }
+    pub fn eql(_: CaseInsensitiveContext, a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
+fn CiHashMap(comptime V: type) type {
+    return std.HashMap([]const u8, V, CaseInsensitiveContext, std.hash_map.default_max_load_percentage);
+}
+
 rules: []const Ast.Rule,
 allocator: std.mem.Allocator,
 diagnostics: std.ArrayList(Validation) = .empty,
@@ -28,10 +44,10 @@ pub const Validation = struct {
 /// Core rules from RFC 5234 Appendix B — implicitly defined in every
 /// ABNF grammar.
 const core_rules = [_][]const u8{
-    "ALPHA", "BIT",   "CHAR",  "CR",
-    "CRLF",  "CTL",   "DIGIT", "DQUOTE",
-    "HEXDIG", "HTAB", "LF",   "LWSP",
-    "OCTET", "SP",    "VCHAR", "WSP",
+    "ALPHA",  "BIT",  "CHAR",  "CR",
+    "CRLF",   "CTL",  "DIGIT", "DQUOTE",
+    "HEXDIG", "HTAB", "LF",    "LWSP",
+    "OCTET",  "SP",   "VCHAR", "WSP",
 };
 
 pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) Validator {
@@ -44,7 +60,7 @@ pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) Validator {
 /// rules have incremental alternations (`=/`) merged.
 pub fn validate(self: *Validator) ![]const Ast.Rule {
     // Stage 1: merge rules, detect duplicates.
-    var name_index = std.StringHashMap(usize).init(self.allocator);
+    var name_index = CiHashMap(usize).init(self.allocator);
     defer name_index.deinit();
     var merged: std.ArrayList(Ast.Rule) = .empty;
 
@@ -72,7 +88,7 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
     const merged_rules = try merged.toOwnedSlice(self.allocator);
 
     // Stage 2: collect all referenced rule names.
-    var refs = std.StringHashMap(void).init(self.allocator);
+    var refs = CiHashMap(void).init(self.allocator);
     defer refs.deinit();
     for (merged_rules) |rule| {
         try self.collectRefs(rule.node, &refs);
@@ -153,7 +169,7 @@ fn mergeAlternation(self: *Validator, a: Ast.Node, b: Ast.Node) !Ast.Node {
     return .{ .alternation = try alts.toOwnedSlice(self.allocator) };
 }
 
-fn collectRefs(self: *Validator, node: Ast.Node, refs: *std.StringHashMap(void)) !void {
+fn collectRefs(self: *Validator, node: Ast.Node, refs: *CiHashMap(void)) !void {
     switch (node) {
         .rulename => |name| try refs.put(name, {}),
         .alternation => |items| for (items) |item| try self.collectRefs(item, refs),
@@ -173,7 +189,7 @@ fn findReferencer(self: *Validator, rules: []const Ast.Rule, ref_name: []const u
 
 fn nodeReferences(node: Ast.Node, name: []const u8) bool {
     return switch (node) {
-        .rulename => |n| std.mem.eql(u8, n, name),
+        .rulename => |n| std.ascii.eqlIgnoreCase(n, name),
         .alternation => |items| for (items) |item| {
             if (nodeReferences(item, name)) return true;
         } else false,
@@ -196,7 +212,7 @@ fn isProductive(
     self: *Validator,
     node: Ast.Node,
     merged_rules: []const Ast.Rule,
-    name_index: *const std.StringHashMap(usize),
+    name_index: *const CiHashMap(usize),
     productive: []const bool,
 ) bool {
     _ = self;
@@ -346,4 +362,58 @@ test "incremental alternation merges via validator" {
     try std.testing.expectEqual(2, alts.len);
     try std.testing.expectEqualStrings("a", alts[0].char_val.value);
     try std.testing.expectEqualStrings("b", alts[1].char_val.value);
+}
+
+test "mixed-case rule names merge as duplicates" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "Foo = \"a\"\nfoo = \"b\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    try std.testing.expectEqual(1, result.diagnostics.len);
+    try std.testing.expectEqual(.duplicate_rule, result.diagnostics[0].kind);
+    try std.testing.expectEqual(1, result.rules.len);
+}
+
+test "mixed-case incremental alternation merges" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "Foo = \"a\"\nfoo =/ \"b\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    try std.testing.expectEqual(0, result.diagnostics.len);
+    try std.testing.expectEqual(1, result.rules.len);
+    try std.testing.expectEqual(2, result.rules[0].node.alternation.len);
+}
+
+test "mixed-case reference not flagged as undefined" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "foo = Bar\nbar = \"x\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .undefined_rule);
+    }
+}
+
+test "mixed-case reference counts as used" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "foo = Bar\nbar = \"x\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .unused_rule);
+    }
+}
+
+test "mixed-case undefined reference reports correct owner" {
+    const allocator = std.testing.allocator;
+    // "foo" references "Missing" which is undefined — diagnostic should
+    // identify "foo" as the rule containing the bad reference regardless
+    // of casing.
+    const result = try parseAndValidate(allocator, "foo = Missing");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    try std.testing.expectEqual(1, result.diagnostics.len);
+    try std.testing.expectEqual(.undefined_rule, result.diagnostics[0].kind);
+    try std.testing.expectEqualStrings("foo", result.diagnostics[0].rule_name);
+    try std.testing.expectEqualStrings("Missing", result.diagnostics[0].ref_name.?);
 }

@@ -46,5 +46,5 @@ pub const Tag = enum {
 
 /// Returns the lexeme slice from the source text.
 pub fn lexeme(self: Token, source: []const u8) []const u8 {
-    return source[self.start..self.start + self.len];
+    return source[self.start .. self.start + self.len];
 }

@@ -69,12 +69,20 @@ hello
 world
 ```
 
-On syntax errors:
+Syntax errors point to the exact location:
 
 ```
 grammar.abnf:1:12: error: expected element, found ')'
    foo = (a / )
               ^
+```
+
+Semantic issues are reported as warnings or errors:
+
+```
+grammar.abnf: warning: rule 'helper' is defined but never referenced
+grammar.abnf: error: rule 'start' references undefined rule 'missing'
+grammar.abnf: error: rule 'a' is unproductive (circular with no terminal escape)
 ```
 
 ## Building
