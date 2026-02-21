@@ -27,7 +27,9 @@ pub const Tag = enum {
     // Literals
     rulename, // e.g. "ALPHA", "my-rule"
     number, // e.g. "3" in "3*5"
-    char_val, // "quoted string"
+    char_val, // "quoted string" (case-insensitive, RFC 5234)
+    char_val_ci, // %i"quoted string" (case-insensitive, RFC 7405)
+    char_val_cs, // %s"quoted string" (case-sensitive, RFC 7405)
     prose_val, // <prose description>
     bin_val, // %b01010
     dec_val, // %d65

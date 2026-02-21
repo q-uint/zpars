@@ -1,6 +1,6 @@
 # zpars
 
-An ABNF ([RFC 5234](https://www.rfc-editor.org/rfc/rfc5234)) parser written in Zig.
+An ABNF ([RFC 5234](https://www.rfc-editor.org/rfc/rfc5234)) parser written in Zig, with support for case-sensitive strings ([RFC 7405](https://www.rfc-editor.org/rfc/rfc7405)).
 
 Tokenizes and parses ABNF grammars into an AST, with structured error diagnostics on malformed input.
 

@@ -18,14 +18,22 @@ pub const Node = union(enum) {
     concatenation: []const Node,
     /// `[min]*[max] element` — bounded repetition.
     repetition: Repetition,
-    /// `"quoted string"` — case-insensitive literal.
-    char_val: []const u8,
+    /// Quoted string literal (RFC 5234 + RFC 7405).
+    char_val: CharVal,
     /// `%x41`, `%x41-5A`, or `%x41.42.43`.
     num_val: NumVal,
     /// `<prose description>` — free-form text.
     prose_val: []const u8,
     /// Reference to another rule by name.
     rulename: []const u8,
+};
+
+/// A quoted string literal with case-sensitivity (RFC 5234 + RFC 7405).
+/// - `"text"` and `%i"text"` are case-insensitive.
+/// - `%s"text"` is case-sensitive.
+pub const CharVal = struct {
+    value: []const u8,
+    case_sensitive: bool,
 };
 
 /// Repetition operator: `*element`, `3*5element`, `1*element`, etc.

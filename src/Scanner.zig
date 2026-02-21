@@ -88,7 +88,7 @@ fn scanToken(self: *Scanner) !void {
             }
         },
 
-        // Numeric values — %b, %d, %x
+        // Numeric values (%b, %d, %x) and case-sensitive/insensitive strings (%s, %i) per RFC 7405.
         '%' => {
             const base = self.peek();
             switch (base) {
@@ -106,6 +106,24 @@ fn scanToken(self: *Scanner) !void {
                     _ = self.advance(); // consume 'x'
                     self.consumeDigits(isHexDigit);
                     try self.addToken(.hex_val);
+                },
+                's', 'i' => {
+                    _ = self.advance(); // consume 's' or 'i'
+                    if (self.peek() != '"') {
+                        try self.addToken(.invalid); // %s or %i without opening quote
+                    } else {
+                        _ = self.advance(); // consume opening "
+                        while (self.peek() != '"' and !self.isAtEnd()) {
+                            if (self.peek() == '\n') self.line += 1;
+                            _ = self.advance();
+                        }
+                        if (self.isAtEnd()) {
+                            try self.addToken(.invalid); // unterminated string
+                        } else {
+                            _ = self.advance(); // consume closing "
+                            try self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
+                        }
+                    }
                 },
                 else => try self.addToken(.invalid), // bare % with no base
             }
@@ -284,6 +302,18 @@ test "comment" {
     try expectTags("a = b ; comment", &.{
         .rulename, .equals, .rulename, .comment, .eof,
     });
+}
+
+test "case-sensitive string (RFC 7405)" {
+    try expectTags(
+        \\a = %s"Hello"
+    , &.{ .rulename, .equals, .char_val_cs, .eof });
+}
+
+test "case-insensitive string (RFC 7405)" {
+    try expectTags(
+        \\a = %i"Hello"
+    , &.{ .rulename, .equals, .char_val_ci, .eof });
 }
 
 test "incremental alternation" {

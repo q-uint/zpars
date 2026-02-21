@@ -169,7 +169,17 @@ fn parseElement(self: *Parser) ParseError!Ast.Node {
         .rulename => .{ .rulename = self.advance().lexeme(self.source) },
         .char_val => {
             const lex = self.advance().lexeme(self.source);
-            return .{ .char_val = lex[1 .. lex.len - 1] };
+            return .{ .char_val = .{ .value = lex[1 .. lex.len - 1], .case_sensitive = false } };
+        },
+        .char_val_ci => {
+            const lex = self.advance().lexeme(self.source);
+            // %i"..." — strip the leading %i and surrounding quotes.
+            return .{ .char_val = .{ .value = lex[3 .. lex.len - 1], .case_sensitive = false } };
+        },
+        .char_val_cs => {
+            const lex = self.advance().lexeme(self.source);
+            // %s"..." — strip the leading %s and surrounding quotes.
+            return .{ .char_val = .{ .value = lex[3 .. lex.len - 1], .case_sensitive = true } };
         },
         .bin_val, .dec_val, .hex_val => .{ .num_val = try self.parseNumVal() },
         .prose_val => {
@@ -318,6 +328,8 @@ fn isAtRepetition(self: *Parser) bool {
         .left_paren,
         .left_bracket,
         .char_val,
+        .char_val_ci,
+        .char_val_cs,
         .bin_val,
         .dec_val,
         .hex_val,
@@ -422,7 +434,24 @@ test "char val strips quotes" {
     const allocator = std.testing.allocator;
     const rules = try parseSource(allocator, "foo = \"hello\"");
     defer allocator.free(rules);
-    try std.testing.expectEqualStrings("hello", rules[0].node.char_val);
+    try std.testing.expectEqualStrings("hello", rules[0].node.char_val.value);
+    try std.testing.expectEqual(false, rules[0].node.char_val.case_sensitive);
+}
+
+test "case-sensitive char val (RFC 7405)" {
+    const allocator = std.testing.allocator;
+    const rules = try parseSource(allocator, "foo = %s\"Hello\"");
+    defer allocator.free(rules);
+    try std.testing.expectEqualStrings("Hello", rules[0].node.char_val.value);
+    try std.testing.expectEqual(true, rules[0].node.char_val.case_sensitive);
+}
+
+test "explicit case-insensitive char val (RFC 7405)" {
+    const allocator = std.testing.allocator;
+    const rules = try parseSource(allocator, "foo = %i\"Hello\"");
+    defer allocator.free(rules);
+    try std.testing.expectEqualStrings("Hello", rules[0].node.char_val.value);
+    try std.testing.expectEqual(false, rules[0].node.char_val.case_sensitive);
 }
 
 test "hex val range" {
