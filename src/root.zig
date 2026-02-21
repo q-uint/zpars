@@ -5,3 +5,4 @@ pub const Ast = @import("Ast.zig");
 pub const Diagnostic = @import("Diagnostic.zig");
 pub const Parser = @import("Parser.zig");
 pub const Validator = @import("Validator.zig");
+pub const combinators = @import("combinators.zig");
