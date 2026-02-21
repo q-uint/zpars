@@ -37,38 +37,11 @@ pub fn parse(self: *Parser) ![]const Ast.Rule {
             else => return err,
         };
 
-        // Handle incremental alternation (=/): merge with existing rule.
-        var merged = false;
-        for (rules.items) |*existing| {
-            if (std.mem.eql(u8, existing.name, rule.name)) {
-                existing.node = try self.mergeAlternation(existing.node, rule.node);
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            try rules.append(self.allocator, rule);
-        }
-
+        try rules.append(self.allocator, rule);
         self.skipTrivia();
     }
 
     return try rules.toOwnedSlice(self.allocator);
-}
-
-fn mergeAlternation(self: *Parser, a: Ast.Node, b: Ast.Node) !Ast.Node {
-    var alts: std.ArrayList(Ast.Node) = .empty;
-
-    switch (a) {
-        .alternation => |items| for (items) |item| try alts.append(self.allocator, item),
-        else => try alts.append(self.allocator, a),
-    }
-    switch (b) {
-        .alternation => |items| for (items) |item| try alts.append(self.allocator, item),
-        else => try alts.append(self.allocator, b),
-    }
-
-    return .{ .alternation = try alts.toOwnedSlice(self.allocator) };
 }
 
 // --- Grammar rules -----------------------------------------------------------
@@ -81,9 +54,12 @@ fn parseRule(self: *Parser) !Ast.Rule {
     }
     const name = self.advance().lexeme(self.source);
     self.skipTrivia();
-    if (self.peek().tag == .equals or self.peek().tag == .equals_slash) _ = self.advance();
+    var incremental = false;
+    if (self.peek().tag == .equals or self.peek().tag == .equals_slash) {
+        incremental = self.advance().tag == .equals_slash;
+    }
     self.skipTrivia();
-    return .{ .name = name, .node = try self.parseAlternation() };
+    return .{ .name = name, .node = try self.parseAlternation(), .incremental = incremental };
 }
 
 /// alternation = concatenation *("/" concatenation)
@@ -490,15 +466,17 @@ test "multiple rules" {
     try std.testing.expectEqualStrings("bar", rules[1].name);
 }
 
-test "incremental alternation merges" {
+test "incremental alternation preserved unmerged" {
     const allocator = std.testing.allocator;
     const rules = try parseSource(allocator, "foo = a\nfoo =/ b");
     defer allocator.free(rules);
-    try std.testing.expectEqual(1, rules.len);
-    const alts = rules[0].node.alternation;
-    try std.testing.expectEqual(2, alts.len);
-    try std.testing.expectEqualStrings("a", alts[0].rulename);
-    try std.testing.expectEqualStrings("b", alts[1].rulename);
+    try std.testing.expectEqual(2, rules.len);
+    try std.testing.expectEqualStrings("foo", rules[0].name);
+    try std.testing.expectEqual(false, rules[0].incremental);
+    try std.testing.expectEqualStrings("a", rules[0].node.rulename);
+    try std.testing.expectEqualStrings("foo", rules[1].name);
+    try std.testing.expectEqual(true, rules[1].incremental);
+    try std.testing.expectEqualStrings("b", rules[1].node.rulename);
 }
 
 fn expectSyntaxError(source: []const u8, expected: Diagnostic.Expected, found_tag: Token.Tag) !void {

@@ -8,6 +8,8 @@ const Ast = @This();
 pub const Rule = struct {
     name: []const u8,
     node: Node,
+    /// True when defined with `=/` (incremental alternation).
+    incremental: bool,
 };
 
 /// A single node in the ABNF syntax tree.
