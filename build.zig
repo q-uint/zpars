@@ -31,6 +31,20 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    const bench_step = b.step("bench", "Run benchmarks");
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zpars", .module = mod },
+            },
+        }),
+    });
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+
     const test_step = b.step("test", "Run tests");
     const mod_tests = b.addTest(.{ .root_module = mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
