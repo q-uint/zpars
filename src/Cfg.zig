@@ -102,8 +102,8 @@ fn formatProduction(self: Cfg, prod: Production, writer: anytype) !void {
             .terminal => |t| switch (t) {
                 .byte => |b| try writer.print("%x{X:0>2}", .{b}),
                 .range => |r| try writer.print("%x{X:0>2}-{X:0>2}", .{ r.lo, r.hi }),
-                .string => |s| try writer.print("%s\"{s}\"", .{s}),
-                .string_ci => |s| try writer.print("\"{s}\"", .{s}),
+                .string => |s| try writer.print("\"{s}\"", .{s}),
+                .string_ci => |s| try writer.print("%i\"{s}\"", .{s}),
             },
             .nonterminal => |id| try writer.writeAll(self.nonterminalName(id)),
         }
@@ -151,6 +151,31 @@ pub fn parse(comptime source: []const u8) Cfg {
         const tokens = scanner.scanTokens();
         var parser = Parser.init(tokens, source);
         return parser.parse() catch @compileError("CFG grammar has syntax errors");
+    }
+}
+
+// --- CNF conversion ----------------------------------------------------------
+
+const CnfBuilder = @import("cfg/CnfBuilder.zig");
+
+/// Convert this grammar to Chomsky Normal Form at compile time.
+///
+/// CNF restricts every production to one of:
+///   - `A → B C`   (exactly two nonterminals)
+///   - `A → a`     (exactly one terminal)
+///   - `S0 → ε`    (only the start symbol, if ε ∈ L)
+///
+/// The conversion applies the standard textbook steps in order:
+///   1. **START** — guarantee the start symbol never appears on any RHS
+///   2. **DEL**   — eliminate ε-productions
+///   3. **UNIT**  — eliminate unit productions
+///   4. **TERM**  — isolate terminals in long RHS
+///   5. **BIN**   — break long RHS into binary chains
+pub fn toCnf(comptime self: Cfg) Cfg {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var b = CnfBuilder.init(self);
+        return b.build();
     }
 }
 
@@ -361,7 +386,7 @@ test "parse: format round-trip" {
     try std.fmt.format(fbs.writer(), "{}", .{cfg});
     try std.testing.expectEqualStrings(
         \\S → A %x78
-        \\A → %s"hello"
+        \\A → "hello"
         \\A → ε
     , fbs.getWritten());
 }

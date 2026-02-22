@@ -357,7 +357,7 @@ test "format round-trip" {
     try std.fmt.format(fbs.writer(), "{}", .{result.cfg});
     try std.testing.expectEqualStrings(
         \\S → A %x78
-        \\A → %s"hello"
+        \\A → "hello"
         \\A → ε
     , fbs.getWritten());
 }

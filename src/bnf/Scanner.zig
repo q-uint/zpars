@@ -191,12 +191,12 @@ test "empty rule" {
 
 test "ALGOL 60 example" {
     try expectTags("<ab> ::= ( | [ | <ab> ( | <ab> <d>", &.{
-        .rulename,  .definition,
-        .terminal,  .pipe,
-        .terminal,  .pipe,
-        .rulename,  .terminal, .pipe,
-        .rulename,  .rulename,
-        .eof,
+        .rulename, .definition,
+        .terminal, .pipe,
+        .terminal, .pipe,
+        .rulename, .terminal,
+        .pipe,     .rulename,
+        .rulename, .eof,
     });
 }
 

@@ -255,7 +255,7 @@ test "line comment" {
 test "multiline" {
     try expectTags("S -> A\nA -> \"x\"", &.{
         .identifier, .arrow, .identifier, .newline,
-        .identifier, .arrow, .string, .eof,
+        .identifier, .arrow, .string,     .eof,
     });
 }
 

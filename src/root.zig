@@ -15,6 +15,7 @@ pub const bnf = struct {
     pub const Token = @import("bnf/Token.zig");
 };
 pub const cfg = struct {
+    pub const CnfBuilder = @import("cfg/CnfBuilder.zig");
     pub const Diagnostic = @import("cfg/Diagnostic.zig");
     pub const Parser = @import("cfg/Parser.zig");
     pub const Scanner = @import("cfg/Scanner.zig");
