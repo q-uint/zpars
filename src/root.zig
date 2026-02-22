@@ -14,7 +14,14 @@ pub const bnf = struct {
     pub const Scanner = @import("bnf/Scanner.zig");
     pub const Token = @import("bnf/Token.zig");
 };
+pub const cfg = struct {
+    pub const Diagnostic = @import("cfg/Diagnostic.zig");
+    pub const Parser = @import("cfg/Parser.zig");
+    pub const Scanner = @import("cfg/Scanner.zig");
+    pub const Token = @import("cfg/Token.zig");
+};
 pub const Ast = @import("Ast.zig");
+pub const Cfg = @import("Cfg.zig");
 pub const Matcher = @import("Matcher.zig");
 pub const Validator = @import("Validator.zig");
 pub const combinators = @import("combinators.zig");
