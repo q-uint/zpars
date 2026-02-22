@@ -1,13 +1,14 @@
 # zpars
 
-An ABNF ([RFC 5234](https://www.rfc-editor.org/rfc/rfc5234)) parser and comptime parser combinator library written in Zig, with support for case-sensitive strings ([RFC 7405](https://www.rfc-editor.org/rfc/rfc7405)).
+A grammar parser toolkit written in Zig, supporting [ABNF](https://www.rfc-editor.org/rfc/rfc5234) (RFC 5234, RFC 7405) and [BNF](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) (ALGOL 60) with comptime parser combinators.
 
 ## Features
 
 - **ABNF Parser** — Tokenizes and parses ABNF grammars into an AST, with structured error diagnostics and error recovery on malformed input.
+- **BNF Parser** — Tokenizes and parses BNF grammars (ALGOL 60 variant) into the same shared AST.
 - **Grammar Validator** — Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
 - **Runtime Matcher** — Match input strings against any rule in a dynamically loaded grammar.
-- **Formatter** — Pretty-print parsed grammars back to canonical ABNF with aligned `=` signs.
+- **Formatter** — Pretty-print parsed grammars back to canonical ABNF or BNF with aligned operators.
 - **Comptime Combinators** — Zero-overhead parser combinator library resolved entirely at comptime.
 - **ABNF-to-Combinator Compiler** — Compile ABNF grammar strings into combinator types at comptime. Define your grammar in standard ABNF and get a parser for free.
 
@@ -18,7 +19,7 @@ Define a grammar in ABNF and compile it to a parser type at comptime — zero ru
 ```zig
 const zpars = @import("zpars");
 
-const HttpVersion = zpars.Abnf.Compile(
+const HttpVersion = zpars.abnf.Compiler.Compile(
    \\version = "HTTP/" 1*DIGIT "." 1*DIGIT
 , "version");
 
@@ -32,7 +33,7 @@ test "parse HTTP version" {
 Multi-rule grammars with cross-references work too:
 
 ```zig
-const Pair = zpars.Abnf.Compile(
+const Pair = zpars.abnf.Compiler.Compile(
    \\number = 1*DIGIT
    \\pair   = number "," number
 , "pair");
@@ -69,9 +70,9 @@ For grammars loaded at runtime, use the `Matcher`:
 ```zig
 const zpars = @import("zpars");
 
-var scanner = zpars.Scanner.init(grammar);
+var scanner = zpars.abnf.Scanner.init(grammar);
 const tokens = scanner.scanTokens();
-var parser = zpars.Parser.init(tokens, grammar);
+var parser = zpars.abnf.Parser.init(tokens, grammar);
 const rules = try parser.parse();
 var validator = zpars.Validator.init(allocator, rules);
 const merged = try validator.validate();
@@ -133,3 +134,9 @@ Requires Zig 0.15.2+.
 zig build                      # build the executable
 zig build test                 # run all tests
 ```
+
+## References
+
+- [RFC 5234 — Augmented BNF for Syntax Specifications: ABNF](https://www.rfc-editor.org/rfc/rfc5234)
+- [RFC 7405 — Case-Sensitive String Support in ABNF](https://www.rfc-editor.org/rfc/rfc7405)
+- [Report on the Algorithmic Language ALGOL 60 (1960)](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) — original BNF definition (Section 1.1)
