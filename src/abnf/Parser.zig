@@ -1,7 +1,7 @@
 const std = @import("std");
-const Token = @import("Token.zig");
+const Token = @import("Token.zig").Token;
 const Ast = @import("../Ast.zig");
-const Diagnostic = @import("Diagnostic.zig");
+const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 
 const Parser = @This();
 

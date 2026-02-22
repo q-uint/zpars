@@ -5,7 +5,7 @@
 /// meta-symbols: `<>` (metalinguistic variable), `::=` (definition),
 /// and `|` (alternation). All other marks are terminal literals.
 const std = @import("std");
-const Token = @import("Token.zig");
+const Token = @import("Token.zig").Token;
 
 const Scanner = @This();
 

@@ -1,14 +1,4 @@
-/// A token produced by the ABNF scanner.
-/// Each token is a tagged slice into the original source text.
-const Token = @This();
-
-tag: Tag,
-/// Byte offset into source where this token's lexeme starts.
-start: usize,
-/// Length of the lexeme in bytes.
-len: usize,
-/// Line number (1-based) where this token appears.
-line: usize,
+const token = @import("../token.zig");
 
 /// All possible token types in ABNF (RFC 5234).
 pub const Tag = enum {
@@ -44,7 +34,6 @@ pub const Tag = enum {
     invalid,
 };
 
-/// Returns the lexeme slice from the source text.
-pub fn lexeme(self: Token, source: []const u8) []const u8 {
-    return source[self.start .. self.start + self.len];
-}
+/// A token produced by the ABNF scanner.
+/// Each token is a tagged slice into the original source text.
+pub const Token = token.Token(Tag);

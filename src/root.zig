@@ -18,3 +18,5 @@ pub const Ast = @import("Ast.zig");
 pub const Matcher = @import("Matcher.zig");
 pub const Validator = @import("Validator.zig");
 pub const combinators = @import("combinators.zig");
+pub const diagnostic = @import("diagnostic.zig");
+pub const token = @import("token.zig");
