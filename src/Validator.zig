@@ -245,8 +245,8 @@ fn isProductive(
 
 // --- Tests -------------------------------------------------------------------
 
-const Scanner = @import("Scanner.zig");
-const Parser = @import("Parser.zig");
+const Scanner = @import("abnf/Scanner.zig");
+const Parser = @import("abnf/Parser.zig");
 
 fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
     rules: []const Ast.Rule,

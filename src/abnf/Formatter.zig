@@ -3,7 +3,7 @@
 /// Rule names are padded to align the `=` / `=/` operators across all
 /// rules in the grammar.
 const std = @import("std");
-const Ast = @import("Ast.zig");
+const Ast = @import("../Ast.zig");
 
 /// Format a complete grammar (list of rules) to the writer.
 pub fn formatGrammar(rules: []const Ast.Rule, writer: anytype) !void {

@@ -7,10 +7,10 @@
 ///     const r = NumParser.parse("42abc").?;
 ///     // r.value == "42", r.rest == "abc"
 const std = @import("std");
-const Ast = @import("Ast.zig");
+const Ast = @import("../Ast.zig");
 const Scanner = @import("Scanner.zig");
 const Parser = @import("Parser.zig");
-const c = @import("combinators.zig");
+const c = @import("../combinators.zig");
 
 /// Compile an ABNF grammar string into a comptime parser combinator type.
 ///

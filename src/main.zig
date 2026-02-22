@@ -51,10 +51,10 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readSource(allocator, filename);
     defer allocator.free(source);
 
-    var scanner = zpars.Scanner.init(source);
+    var scanner = zpars.abnf.Scanner.init(source);
     const tokens = scanner.scanTokens();
 
-    var parser = zpars.Parser.init(tokens, source);
+    var parser = zpars.abnf.Parser.init(tokens, source);
     const rules = try parser.parse();
 
     var stderr_buffer: [4096]u8 = undefined;
@@ -95,10 +95,10 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readSource(allocator, filename);
     defer allocator.free(source);
 
-    var scanner = zpars.Scanner.init(source);
+    var scanner = zpars.abnf.Scanner.init(source);
     const tokens = scanner.scanTokens();
 
-    var parser = zpars.Parser.init(tokens, source);
+    var parser = zpars.abnf.Parser.init(tokens, source);
     const rules = try parser.parse();
 
     var stderr_buffer: [4096]u8 = undefined;
@@ -118,7 +118,7 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    zpars.Formatter.formatGrammar(rules, stdout) catch {
+    zpars.abnf.Formatter.formatGrammar(rules, stdout) catch {
         std.process.exit(1);
     };
     try stdout.flush();
@@ -155,10 +155,10 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readSource(allocator, filename.?);
     defer allocator.free(source);
 
-    var scanner = zpars.Scanner.init(source);
+    var scanner = zpars.abnf.Scanner.init(source);
     const tokens = scanner.scanTokens();
 
-    var parser = zpars.Parser.init(tokens, source);
+    var parser = zpars.abnf.Parser.init(tokens, source);
     const rules = try parser.parse();
 
     var stderr_buffer: [4096]u8 = undefined;

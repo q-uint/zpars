@@ -271,8 +271,8 @@ fn matchByte(input: []const u8, expected: u8) ?Result {
 
 // --- Tests -------------------------------------------------------------------
 
-const Scanner = @import("Scanner.zig");
-const Parser = @import("Parser.zig");
+const Scanner = @import("abnf/Scanner.zig");
+const Parser = @import("abnf/Parser.zig");
 const Validator = @import("Validator.zig");
 
 /// Parse an ABNF grammar, validate it, and return a Matcher ready to use.

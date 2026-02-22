@@ -1,6 +1,6 @@
-/// AST node types for ABNF grammars (RFC 5234).
+/// Shared AST node types for grammar parsers (ABNF, BNF, etc.).
 ///
-/// Each node represents a construct in the ABNF syntax. The parser produces
+/// Each node represents a construct in a grammar's syntax. The parser produces
 /// a list of `Rule`s, each mapping a name to a `Node` tree.
 const Ast = @This();
 

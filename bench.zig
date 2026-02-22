@@ -1,9 +1,9 @@
 const std = @import("std");
 const zpars = @import("zpars");
-const Abnf = zpars.Abnf;
+const Abnf = zpars.abnf.Compiler;
 const Matcher = zpars.Matcher;
-const Scanner = zpars.Scanner;
-const Parser = zpars.Parser;
+const Scanner = zpars.abnf.Scanner;
+const Parser = zpars.abnf.Parser;
 const Validator = zpars.Validator;
 const Ast = zpars.Ast;
 

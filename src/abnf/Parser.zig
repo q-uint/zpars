@@ -1,6 +1,6 @@
 const std = @import("std");
 const Token = @import("Token.zig");
-const Ast = @import("Ast.zig");
+const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig");
 
 const Parser = @This();
