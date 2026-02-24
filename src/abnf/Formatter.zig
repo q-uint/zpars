@@ -1,12 +1,122 @@
 /// ABNF formatter — pretty-prints an AST back into canonical ABNF text.
 ///
 /// Rule names are padded to align the `=` / `=/` operators across all
-/// rules in the grammar.
+/// rules in the grammar. Comments are preserved from the token stream.
 const std = @import("std");
 const Ast = @import("../Ast.zig");
+const Token = @import("Token.zig").Token;
 
-/// Format a complete grammar (list of rules) to the writer.
-pub fn formatGrammar(rules: []const Ast.Rule, writer: anytype) !void {
+/// Format a complete grammar to the writer, preserving comments from the
+/// token stream while reformatting rule bodies from the parsed AST.
+pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []const u8, writer: anytype) !void {
+    var max_name: usize = 0;
+    for (rules) |rule| {
+        if (rule.name.len > max_name) max_name = rule.name.len;
+    }
+
+    var rule_idx: usize = 0;
+    var tok_idx: usize = 0;
+
+    while (tok_idx < tokens.len) {
+        const tok = tokens[tok_idx];
+        switch (tok.tag) {
+            .eof => break,
+            .comment => {
+                try writer.writeAll(tok.lexeme(source));
+                try writer.writeByte('\n');
+                tok_idx += 1;
+                // Skip the newline after the comment (if any).
+                if (tok_idx < tokens.len and tokens[tok_idx].tag == .newline)
+                    tok_idx += 1;
+            },
+            .newline => {
+                tok_idx += 1;
+            },
+            .rulename => {
+                if (rule_idx < rules.len) {
+                    const rule = rules[rule_idx];
+                    rule_idx += 1;
+
+                    try writer.writeAll(rule.name);
+                    for (0..max_name - rule.name.len + 1) |_| try writer.writeByte(' ');
+                    if (rule.incremental) {
+                        try writer.writeAll("=/ ");
+                    } else {
+                        try writer.writeAll("= ");
+                    }
+                    try formatNode(rule.node, writer);
+
+                    // Skip past the original rule tokens to find an
+                    // optional trailing comment on the same logical line.
+                    tok_idx += 1; // skip rulename
+                    tok_idx = skipRuleTokens(tokens, tok_idx);
+
+                    // Emit any trailing comment on this rule's line.
+                    if (tok_idx < tokens.len and tokens[tok_idx].tag == .comment) {
+                        try writer.writeByte(' ');
+                        try writer.writeAll(tokens[tok_idx].lexeme(source));
+                        tok_idx += 1;
+                    }
+                    try writer.writeByte('\n');
+                    // Skip trailing newline(s).
+                    while (tok_idx < tokens.len and tokens[tok_idx].tag == .newline)
+                        tok_idx += 1;
+                } else {
+                    // No more parsed rules; skip the token.
+                    tok_idx += 1;
+                }
+            },
+            else => {
+                // Unexpected token outside a rule — skip.
+                tok_idx += 1;
+            },
+        }
+    }
+}
+
+/// Advance past all tokens that belong to a rule body (everything up to
+/// but not including the next comment, newline that isn't a continuation,
+/// or eof). A newline is a continuation if it's followed by non-trivia
+/// tokens that don't start a new rule.
+fn skipRuleTokens(tokens: []const Token, start: usize) usize {
+    var i = start;
+    while (i < tokens.len) {
+        const tag = tokens[i].tag;
+        switch (tag) {
+            .eof => return i,
+            .comment => return i,
+            .newline => {
+                // Check if this newline is a continuation (next meaningful
+                // token is part of the current rule, not a new rule).
+                const next = nextMeaningful(tokens, i + 1);
+                if (next >= tokens.len or tokens[next].tag == .eof) return i;
+                if (tokens[next].tag == .rulename) {
+                    // A rulename followed by = or =/ starts a new rule.
+                    const after = nextMeaningful(tokens, next + 1);
+                    if (after < tokens.len and
+                        (tokens[after].tag == .equals or tokens[after].tag == .equals_slash))
+                        return i;
+                }
+                // Continuation line — skip the newline and keep going.
+                i += 1;
+            },
+            else => i += 1,
+        }
+    }
+    return i;
+}
+
+/// Index of the next non-trivia token at or after `start`.
+fn nextMeaningful(tokens: []const Token, start: usize) usize {
+    var i = start;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].tag != .comment and tokens[i].tag != .newline) return i;
+    }
+    return i;
+}
+
+/// Format a complete grammar from only the AST (no comment preservation).
+pub fn formatGrammarRules(rules: []const Ast.Rule, writer: anytype) !void {
     var max_name: usize = 0;
     for (rules) |rule| {
         if (rule.name.len > max_name) max_name = rule.name.len;
@@ -140,7 +250,7 @@ fn expectFmt(expected: []const u8, input: []const u8) !void {
     std.debug.assert(parser.getDiagnostics().len == 0);
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try formatGrammar(rules, fbs.writer());
+    try formatGrammar(rules, tokens, input, fbs.writer());
     try std.testing.expectEqualStrings(expected, fbs.getWritten());
 }
 
@@ -229,4 +339,57 @@ test "grouped alternation in concatenation" {
 
 test "grouped repetition element" {
     try expectFmt("foo = *(a b)\n", "foo = *(a b)");
+}
+
+test "inline comment preserved" {
+    try expectFmt("foo = bar ; a comment\n", "foo = bar ; a comment");
+}
+
+test "standalone comment before rule" {
+    try expectFmt("; header\nfoo = bar\n", "; header\nfoo = bar");
+}
+
+test "multiple leading comments" {
+    try expectFmt("; line 1\n; line 2\nfoo = bar\n", "; line 1\n; line 2\nfoo = bar");
+}
+
+test "inline and standalone comments" {
+    try expectFmt(
+        \\; section
+        \\foo = a ; comment on foo
+        \\bar = b
+        \\
+    ,
+        \\; section
+        \\foo = a ; comment on foo
+        \\bar = b
+    );
+}
+
+test "comment between rules" {
+    try expectFmt(
+        \\foo = a
+        \\; separator
+        \\bar = b
+        \\
+    ,
+        \\foo = a
+        \\; separator
+        \\bar = b
+    );
+}
+
+test "multi-line comment block" {
+    try expectFmt(
+        \\; line 1
+        \\; line 2
+        \\; line 3
+        \\foo = a
+        \\
+    ,
+        \\; line 1
+        \\; line 2
+        \\; line 3
+        \\foo = a
+    );
 }
