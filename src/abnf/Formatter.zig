@@ -166,6 +166,9 @@ pub fn formatNode(node: Ast.Node, writer: anytype) anyerror!void {
             try writer.writeByte('>');
         },
         .rulename => |name| try writer.writeAll(name),
+        // PEG-only nodes — not produced by the ABNF parser, but handle
+        // gracefully to keep the switch exhaustive.
+        .and_predicate, .not_predicate, .char_class, .any => {},
     }
 }
 

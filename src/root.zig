@@ -14,6 +14,13 @@ pub const bnf = struct {
     pub const Scanner = @import("bnf/Scanner.zig");
     pub const Token = @import("bnf/Token.zig");
 };
+pub const peg = struct {
+    pub const Diagnostic = @import("peg/Diagnostic.zig");
+    pub const Formatter = @import("peg/Formatter.zig");
+    pub const Parser = @import("peg/Parser.zig");
+    pub const Scanner = @import("peg/Scanner.zig");
+    pub const Token = @import("peg/Token.zig");
+};
 pub const cfg = struct {
     pub const CnfBuilder = @import("cfg/CnfBuilder.zig");
     pub const Diagnostic = @import("cfg/Diagnostic.zig");

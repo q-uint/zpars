@@ -48,8 +48,8 @@ pub fn formatNode(node: Ast.Node, writer: anytype) anyerror!void {
             try writer.writeByte('>');
         },
         // These node types don't appear in BNF-parsed ASTs, but handle
-        // them gracefully in case an ABNF AST is formatted as BNF.
-        .repetition, .num_val, .prose_val => {},
+        // them gracefully in case another format's AST is formatted as BNF.
+        .repetition, .num_val, .prose_val, .and_predicate, .not_predicate, .char_class, .any => {},
     }
 }
 

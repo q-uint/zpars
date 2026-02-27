@@ -32,12 +32,29 @@ fn printUsage() void {
         \\usage: zpars <command> [options]
         \\
         \\commands:
-        \\  check <file>                       Validate an ABNF grammar
-        \\  fmt   <file>                       Format an ABNF grammar
+        \\  check <file>                       Validate a grammar
+        \\  fmt   <file>                       Format a grammar
         \\  match -r <rule> <file> <input>     Match input against a rule
+        \\
+        \\Format is auto-detected from file extension (.abnf, .peg).
         \\
     , .{});
 }
+
+const Format = enum { abnf, peg };
+
+fn detectFormat(filename: []const u8) Format {
+    if (std.mem.endsWith(u8, filename, ".peg")) return .peg;
+    return .abnf;
+}
+
+/// Parsed grammar: format-independent representation after scanning + parsing.
+const ParsedGrammar = struct {
+    rules: []const zpars.Ast.Rule,
+    // For the formatter we need the token stream — store both variants.
+    abnf_tokens: ?[]const zpars.abnf.Token.Token = null,
+    peg_tokens: ?[]const zpars.peg.Token.Token = null,
+};
 
 // --- check -------------------------------------------------------------------
 
@@ -51,24 +68,38 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readSource(allocator, filename);
     defer allocator.free(source);
 
-    var scanner = zpars.abnf.Scanner.init(source);
-    const tokens = scanner.scanTokens();
-
-    var parser = zpars.abnf.Parser.init(tokens, source);
-    const rules = try parser.parse();
-
     var stderr_buffer: [4096]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    const diags = parser.getDiagnostics();
-    if (diags.len > 0) {
-        for (diags) |diag| {
-            diag.format(source, filename, stderr) catch {};
-        }
-        stderr.flush() catch {};
-        std.process.exit(1);
-    }
+    const rules = switch (detectFormat(filename)) {
+        .abnf => blk: {
+            var scanner = zpars.abnf.Scanner.init(source);
+            const tokens = scanner.scanTokens();
+            var parser = zpars.abnf.Parser.init(tokens, source);
+            const rules = try parser.parse();
+            const diags = parser.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(source, filename, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            break :blk rules;
+        },
+        .peg => blk: {
+            var scanner = zpars.peg.Scanner.init(source);
+            const tokens = scanner.scanTokens();
+            var parser = zpars.peg.Parser.init(tokens, source);
+            const rules = try parser.parse();
+            const diags = parser.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(source, filename, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            break :blk rules;
+        },
+    };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -95,32 +126,46 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readSource(allocator, filename);
     defer allocator.free(source);
 
-    var scanner = zpars.abnf.Scanner.init(source);
-    const tokens = scanner.scanTokens();
-
-    var parser = zpars.abnf.Parser.init(tokens, source);
-    const rules = try parser.parse();
-
     var stderr_buffer: [4096]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &stderr_writer.interface;
-
-    const diags = parser.getDiagnostics();
-    if (diags.len > 0) {
-        for (diags) |diag| {
-            diag.format(source, filename, stderr) catch {};
-        }
-        stderr.flush() catch {};
-        std.process.exit(1);
-    }
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    zpars.abnf.Formatter.formatGrammar(rules, tokens, source, stdout) catch {
-        std.process.exit(1);
-    };
+    switch (detectFormat(filename)) {
+        .abnf => {
+            var scanner = zpars.abnf.Scanner.init(source);
+            const tokens = scanner.scanTokens();
+            var parser = zpars.abnf.Parser.init(tokens, source);
+            const rules = try parser.parse();
+            const diags = parser.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(source, filename, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            zpars.abnf.Formatter.formatGrammar(rules, tokens, source, stdout) catch {
+                std.process.exit(1);
+            };
+        },
+        .peg => {
+            var scanner = zpars.peg.Scanner.init(source);
+            const tokens = scanner.scanTokens();
+            var parser = zpars.peg.Parser.init(tokens, source);
+            const rules = try parser.parse();
+            const diags = parser.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(source, filename, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            zpars.peg.Formatter.formatGrammar(rules, tokens, source, stdout) catch {
+                std.process.exit(1);
+            };
+        },
+    }
     try stdout.flush();
 }
 
@@ -155,24 +200,38 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const source = try readSource(allocator, filename.?);
     defer allocator.free(source);
 
-    var scanner = zpars.abnf.Scanner.init(source);
-    const tokens = scanner.scanTokens();
-
-    var parser = zpars.abnf.Parser.init(tokens, source);
-    const rules = try parser.parse();
-
     var stderr_buffer: [4096]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    const diags = parser.getDiagnostics();
-    if (diags.len > 0) {
-        for (diags) |diag| {
-            diag.format(source, filename.?, stderr) catch {};
-        }
-        stderr.flush() catch {};
-        std.process.exit(1);
-    }
+    const rules = switch (detectFormat(filename.?)) {
+        .abnf => blk: {
+            var scanner = zpars.abnf.Scanner.init(source);
+            const tokens = scanner.scanTokens();
+            var parser = zpars.abnf.Parser.init(tokens, source);
+            const rules = try parser.parse();
+            const diags = parser.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(source, filename.?, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            break :blk rules;
+        },
+        .peg => blk: {
+            var scanner = zpars.peg.Scanner.init(source);
+            const tokens = scanner.scanTokens();
+            var parser = zpars.peg.Parser.init(tokens, source);
+            const rules = try parser.parse();
+            const diags = parser.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(source, filename.?, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            break :blk rules;
+        },
+    };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

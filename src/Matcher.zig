@@ -53,7 +53,36 @@ fn matchNode(self: *const Matcher, node: Ast.Node, input: []const u8, depth: usi
         .alternation => |alts| self.matchAlternation(alts, input, depth),
         .concatenation => |elems| self.matchConcatenation(elems, input, depth),
         .repetition => |rep| self.matchRepetition(rep, input, depth),
+        .and_predicate => |inner| {
+            // Succeed if inner matches, but consume nothing.
+            if (self.matchNode(inner.*, input, depth + 1)) |_|
+                return .{ .value = input[0..0], .rest = input }
+            else
+                return null;
+        },
+        .not_predicate => |inner| {
+            // Succeed if inner does NOT match, consume nothing.
+            if (self.matchNode(inner.*, input, depth + 1)) |_|
+                return null
+            else
+                return .{ .value = input[0..0], .rest = input };
+        },
+        .char_class => |ranges| matchCharClass(ranges, input),
+        .any => {
+            if (input.len == 0) return null;
+            return .{ .value = input[0..1], .rest = input[1..] };
+        },
     };
+}
+
+fn matchCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
+    if (input.len == 0) return null;
+    const c = input[0];
+    for (ranges) |r| {
+        if (c >= r.lo and c <= r.hi)
+            return .{ .value = input[0..1], .rest = input[1..] };
+    }
+    return null;
 }
 
 fn matchCharVal(cv: Ast.CharVal, input: []const u8) ?Result {

@@ -12,7 +12,7 @@ pub const Rule = struct {
     incremental: bool,
 };
 
-/// A single node in the ABNF syntax tree.
+/// A single node in the grammar syntax tree.
 pub const Node = union(enum) {
     /// `a / b / c` — one of the alternatives.
     alternation: []const Node,
@@ -28,6 +28,20 @@ pub const Node = union(enum) {
     prose_val: []const u8,
     /// Reference to another rule by name.
     rulename: []const u8,
+    /// `&e` — positive lookahead (match without consuming).
+    and_predicate: *const Node,
+    /// `!e` — negative lookahead (succeed if e fails, consume nothing).
+    not_predicate: *const Node,
+    /// `[a-zA-Z0-9]` — character class with ranges and singles.
+    char_class: []const ClassRange,
+    /// `.` — match any single character.
+    any,
+};
+
+/// A character class range entry (e.g. `a-z` or a single `_`).
+pub const ClassRange = struct {
+    lo: u8,
+    hi: u8, // lo == hi for single characters
 };
 
 /// A quoted string literal with case-sensitivity (RFC 5234 + RFC 7405).
