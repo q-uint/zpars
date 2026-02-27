@@ -99,6 +99,11 @@ fn scanToken(self: *Scanner) void {
 }
 
 fn scanLiteral(self: *Scanner, quote: u8) void {
+    if (!self.isAtEnd() and self.peek() == quote) {
+        _ = self.advance(); // consume closing quote
+        self.addToken(.invalid); // empty literal
+        return;
+    }
     while (!self.isAtEnd() and self.peek() != quote) {
         if (self.peek() == '\n' or self.peek() == '\r') {
             self.addToken(.invalid);

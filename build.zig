@@ -50,4 +50,35 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    // --- WASM target for the VSCode extension ---
+    const wasm_step = b.step("wasm", "Build WASM module for the VSCode extension");
+    const wasm_lib = b.addExecutable(.{
+        .name = "zpars",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .wasm32,
+                .os_tag = .freestanding,
+            }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_lib.entry = .disabled;
+    wasm_lib.root_module.export_symbol_names = &.{
+        "alloc",
+        "free",
+        "analyze",
+    };
+    const install_wasm = b.addInstallArtifact(wasm_lib, .{
+        .dest_dir = .{ .override = .{ .custom = "../editors/vscode/wasm" } },
+    });
+    wasm_step.dependOn(&install_wasm.step);
+
+    // --- VSCode extension (WASM + TypeScript) ---
+    const vscode_step = b.step("vscode", "Build the VSCode extension (WASM + TypeScript)");
+    const npm_compile = b.addSystemCommand(&.{ "npm", "run", "compile" });
+    npm_compile.setCwd(b.path("editors/vscode"));
+    npm_compile.step.dependOn(&install_wasm.step);
+    vscode_step.dependOn(&npm_compile.step);
 }

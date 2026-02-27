@@ -16,6 +16,7 @@
         buildInputs = with pkgs; [
           zig
           zls
+          nodejs
         ];
       };
     };

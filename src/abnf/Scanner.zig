@@ -48,15 +48,20 @@ fn scanToken(self: *Scanner) void {
 
         // String literals — "..."
         '"' => {
-            while (self.peek() != '"' and !self.isAtEnd()) {
-                if (self.peek() == '\n') self.line += 1;
-                _ = self.advance();
-            }
-            if (self.isAtEnd()) {
-                self.addToken(.invalid); // unterminated string
-            } else {
+            if (self.peek() == '"') {
                 _ = self.advance(); // consume closing "
-                self.addToken(.char_val);
+                self.addToken(.invalid); // empty string
+            } else {
+                while (self.peek() != '"' and !self.isAtEnd()) {
+                    if (self.peek() == '\n') self.line += 1;
+                    _ = self.advance();
+                }
+                if (self.isAtEnd()) {
+                    self.addToken(.invalid); // unterminated string
+                } else {
+                    _ = self.advance(); // consume closing "
+                    self.addToken(.char_val);
+                }
             }
         },
 
@@ -98,15 +103,20 @@ fn scanToken(self: *Scanner) void {
                         self.addToken(.invalid); // %s or %i without opening quote
                     } else {
                         _ = self.advance(); // consume opening "
-                        while (self.peek() != '"' and !self.isAtEnd()) {
-                            if (self.peek() == '\n') self.line += 1;
-                            _ = self.advance();
-                        }
-                        if (self.isAtEnd()) {
-                            self.addToken(.invalid); // unterminated string
-                        } else {
+                        if (self.peek() == '"') {
                             _ = self.advance(); // consume closing "
-                            self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
+                            self.addToken(.invalid); // empty string
+                        } else {
+                            while (self.peek() != '"' and !self.isAtEnd()) {
+                                if (self.peek() == '\n') self.line += 1;
+                                _ = self.advance();
+                            }
+                            if (self.isAtEnd()) {
+                                self.addToken(.invalid); // unterminated string
+                            } else {
+                                _ = self.advance(); // consume closing "
+                                self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
+                            }
                         }
                     }
                 },

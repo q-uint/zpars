@@ -98,6 +98,11 @@ fn scanToken(self: *Scanner) void {
 }
 
 fn scanString(self: *Scanner, tag: Token.Tag) void {
+    if (!self.isAtEnd() and self.peek() == '"') {
+        _ = self.advance(); // closing "
+        self.addToken(.invalid); // empty string
+        return;
+    }
     while (!self.isAtEnd() and self.peek() != '"') {
         if (self.peek() == '\n' or self.peek() == '\r') {
             self.addToken(.invalid);

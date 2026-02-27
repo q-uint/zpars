@@ -1,0 +1,135 @@
+{
+  "name": "zpars",
+  "displayName": "zpars",
+  "description": "Syntax highlighting for ABNF, BNF, PEG, and CFG grammars powered by Zig",
+  "version": "0.0.1",
+  "publisher": "q-uint",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "abnf",
+        "aliases": [
+          "ABNF",
+          "abnf"
+        ],
+        "extensions": [
+          ".abnf"
+        ],
+        "configuration": "./languages/abnf.json"
+      },
+      {
+        "id": "bnf",
+        "aliases": [
+          "BNF",
+          "bnf"
+        ],
+        "extensions": [
+          ".bnf"
+        ],
+        "configuration": "./languages/bnf.json"
+      },
+      {
+        "id": "peg",
+        "aliases": [
+          "PEG",
+          "peg"
+        ],
+        "extensions": [
+          ".peg"
+        ],
+        "configuration": "./languages/peg.json"
+      },
+      {
+        "id": "cfg",
+        "aliases": [
+          "CFG",
+          "cfg"
+        ],
+        "extensions": [
+          ".cfg"
+        ],
+        "configuration": "./languages/cfg.json"
+      }
+    ],
+    "semanticTokenTypes": [
+      {
+        "id": "type",
+        "description": "Rule name or identifier"
+      },
+      {
+        "id": "string",
+        "description": "String literal"
+      },
+      {
+        "id": "number",
+        "description": "Numeric value"
+      },
+      {
+        "id": "comment",
+        "description": "Comment"
+      },
+      {
+        "id": "operator",
+        "description": "Operator"
+      },
+      {
+        "id": "regexp",
+        "description": "Character class"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "scopes": {
+          "type": [
+            "entity.name.type"
+          ],
+          "string": [
+            "string.quoted"
+          ],
+          "number": [
+            "constant.numeric"
+          ],
+          "comment": [
+            "comment.line"
+          ],
+          "operator": [
+            "keyword.operator"
+          ],
+          "regexp": [
+            "string.regexp"
+          ]
+        }
+      }
+    ],
+    "configurationDefaults": {
+      "[abnf]": {
+        "editor.semanticHighlighting.enabled": true
+      },
+      "[bnf]": {
+        "editor.semanticHighlighting.enabled": true
+      },
+      "[peg]": {
+        "editor.semanticHighlighting.enabled": true
+      },
+      "[cfg]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.2",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
