@@ -126,6 +126,12 @@ $ zpars match -r version grammar.abnf "HTTP/1.1 OK"
 HTTP/1.1
 ```
 
+## Editor Support
+
+The [VSCode extension](https://open-vsx.org/extension/q-uint/zpars) provides semantic highlighting for ABNF, BNF, PEG, and CFG grammars, powered by the zpars WASM build.
+
+Install from [Open VSX](https://open-vsx.org/extension/q-uint/zpars).
+
 ## Building
 
 Requires Zig 0.15.2+.
@@ -133,6 +139,7 @@ Requires Zig 0.15.2+.
 ```
 zig build                      # build the executable
 zig build test                 # run all tests
+zig build vsx                  # build the Open VSX extension (WASM + TypeScript)
 ```
 
 ## References

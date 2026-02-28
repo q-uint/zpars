@@ -1,7 +1,14 @@
-# zpars VSCode Extension
+# zpars Open VSX Extension
 
 Syntax highlighting for ABNF, BNF, PEG, and CFG grammars, powered by the
 zpars scanners compiled to WebAssembly.
+
+Install from [Open VSX](https://open-vsx.org/extension/q-uint/zpars), or via
+the command line:
+
+```bash
+code --install-extension q-uint.zpars
+```
 
 ## Building
 
@@ -12,9 +19,12 @@ From the repository root:
 nix develop --command zig build wasm
 
 # Install dependencies and compile the extension
-cd editors/vscode
+cd editors/vsx
 nix develop ../../ --command npm install
 nix develop ../../ --command npm run compile
+
+# Or build everything in one step
+nix develop --command zig build vsx
 ```
 
 ## Testing

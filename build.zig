@@ -51,8 +51,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
-    // --- WASM target for the VSCode extension ---
-    const wasm_step = b.step("wasm", "Build WASM module for the VSCode extension");
+    // --- WASM target for the Open VSX extension ---
+    const wasm_step = b.step("wasm", "Build WASM module for the Open VSX extension");
     const wasm_lib = b.addExecutable(.{
         .name = "zpars",
         .root_module = b.createModule(.{
@@ -71,14 +71,14 @@ pub fn build(b: *std.Build) void {
         "analyze",
     };
     const install_wasm = b.addInstallArtifact(wasm_lib, .{
-        .dest_dir = .{ .override = .{ .custom = "../editors/vscode/wasm" } },
+        .dest_dir = .{ .override = .{ .custom = "../editors/vsx/wasm" } },
     });
     wasm_step.dependOn(&install_wasm.step);
 
-    // --- VSCode extension (WASM + TypeScript) ---
-    const vscode_step = b.step("vscode", "Build the VSCode extension (WASM + TypeScript)");
+    // --- Open VSX extension (WASM + TypeScript) ---
+    const vsx_step = b.step("vsx", "Build the Open VSX extension (WASM + TypeScript)");
     const npm_compile = b.addSystemCommand(&.{ "npm", "run", "compile" });
-    npm_compile.setCwd(b.path("editors/vscode"));
+    npm_compile.setCwd(b.path("editors/vsx"));
     npm_compile.step.dependOn(&install_wasm.step);
-    vscode_step.dependOn(&npm_compile.step);
+    vsx_step.dependOn(&npm_compile.step);
 }
