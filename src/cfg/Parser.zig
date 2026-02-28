@@ -169,8 +169,8 @@ fn isSymbolTag(tag: Token.Tag) bool {
 }
 
 fn findOrAddNt(self: *Parser, name: []const u8) u32 {
-    const mask = nt_hash_cap - 1;
-    var idx = std.hash.Wyhash.hash(0, name) & mask;
+    const mask: usize = nt_hash_cap - 1;
+    var idx: usize = @truncate(std.hash.Wyhash.hash(0, name) & mask);
     while (true) {
         const slot = self.nt_hash[idx];
         if (slot == nt_hash_empty) break;

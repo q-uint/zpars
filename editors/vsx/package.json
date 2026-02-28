@@ -1,8 +1,8 @@
 {
   "name": "zpars",
   "displayName": "zpars",
-  "description": "Syntax highlighting for ABNF, BNF, PEG, and CFG grammars powered by Zig",
-  "version": "0.0.1",
+  "description": "Syntax highlighting for ABNF, BNF, PEG, CFG, and S-expression formats powered by Zig",
+  "version": "0.0.2",
   "publisher": "q-uint",
   "repository": {
     "type": "git",
@@ -60,6 +60,17 @@
           ".cfg"
         ],
         "configuration": "./languages/cfg.json"
+      },
+      {
+        "id": "sexp",
+        "aliases": [
+          "S-expression",
+          "sexp"
+        ],
+        "extensions": [
+          ".sexp"
+        ],
+        "configuration": "./languages/sexp.json"
       }
     ],
     "semanticTokenTypes": [
@@ -123,6 +134,9 @@
         "editor.semanticHighlighting.enabled": true
       },
       "[cfg]": {
+        "editor.semanticHighlighting.enabled": true
+      },
+      "[sexp]": {
         "editor.semanticHighlighting.enabled": true
       }
     }

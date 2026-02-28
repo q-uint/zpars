@@ -113,4 +113,11 @@ pub fn build(b: *std.Build) void {
     npm_compile.setCwd(b.path("editors/vsx"));
     npm_compile.step.dependOn(&install_wasm.step);
     vsx_step.dependOn(&npm_compile.step);
+
+    // --- Package VSIX ---
+    const vsix_step = b.step("vsix", "Package the Open VSX extension as a .vsix");
+    const vsce_package = b.addSystemCommand(&.{ "vsce", "package" });
+    vsce_package.setCwd(b.path("editors/vsx"));
+    vsce_package.step.dependOn(&npm_compile.step);
+    vsix_step.dependOn(&vsce_package.step);
 }

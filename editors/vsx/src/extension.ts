@@ -103,12 +103,36 @@ const cfgTagMap: number[] = [
   -1, // invalid
 ];
 
+// S-expression Tag enum order (from Token.zig):
+//   0: lparen, 1: rparen, 2: lbracket, 3: rbracket,
+//   4: lbrace, 5: rbrace, 6: verbatim, 7: quoted_string,
+//   8: sexp_token, 9: hexadecimal, 10: base64, 11: decimal,
+//   12: whitespace, 13: eof, 14: invalid
+const sexpTagMap: number[] = [
+  -1, // lparen
+  -1, // rparen
+  -1, // lbracket
+  -1, // rbracket
+  -1, // lbrace
+  -1, // rbrace
+  1, // verbatim → string
+  1, // quoted_string → string
+  0, // sexp_token → type
+  2, // hexadecimal → number
+  2, // base64 → number
+  2, // decimal → number
+  -1, // whitespace
+  -1, // eof
+  -1, // invalid
+];
+
 // Language tags matching the WASM Language enum.
 const enum Language {
   abnf = 0,
   bnf = 1,
   peg = 2,
   cfg = 3,
+  sexp = 4,
 }
 
 interface WasmExports {
@@ -384,6 +408,13 @@ export async function activate(
         tagMap: cfgTagMap,
         ruleNameTag: 0,
         bracketPairs: [],
+      },
+      {
+        id: "sexp",
+        lang: Language.sexp,
+        tagMap: sexpTagMap,
+        ruleNameTag: -1,
+        bracketPairs: [[0, 1], [2, 3]], // ()/[]
       },
     ];
 
