@@ -76,7 +76,7 @@ var parser = zpars.abnf.Parser.init(tokens, grammar);
 const rules = try parser.parse();
 var validator = zpars.Validator.init(allocator, rules);
 const merged = try validator.validate();
-const matcher = zpars.Matcher.init(merged);
+const matcher = zpars.Matcher.init(allocator, merged);
 
 const r = matcher.match("version", "HTTP/1.1 OK").?;
 // r.value == "HTTP/1.1", r.rest == " OK"

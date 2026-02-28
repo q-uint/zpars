@@ -9,8 +9,21 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
+const parser_base = @import("../parser.zig");
+const Pool = @import("../pool.zig").Pool;
 
 const Parser = @This();
+
+const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{.newline}, .{
+    .name_tag = .rulename,
+    .def_tags = &.{.definition},
+});
+const peek = primitives.peek;
+const advance = primitives.advance;
+const skipTrivia = primitives.skipTrivia;
+const peekNextMeaningful = primitives.peekNextMeaningful;
+const synchronize = primitives.synchronize;
+const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
 
@@ -23,16 +36,13 @@ source: []const u8,
 pos: usize = 0,
 
 /// Pool for AST nodes.
-nodes: [max_nodes]Ast.Node = undefined,
-node_count: usize = 0,
+nodes: Pool(Ast.Node, max_nodes) = .{},
 
 /// Parsed rules.
-rules: [max_rules]Ast.Rule = undefined,
-rule_count: usize = 0,
+rules: Pool(Ast.Rule, max_rules) = .{},
 
 /// Accumulated parse diagnostics.
-diagnostics_buf: [max_diagnostics]Diagnostic = undefined,
-diagnostics_count: usize = 0,
+diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
 
 pub fn init(tokens: []const Token, source: []const u8) Parser {
     return .{
@@ -43,30 +53,28 @@ pub fn init(tokens: []const Token, source: []const u8) Parser {
 
 /// Parse all rules from the token stream.
 pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
-    self.skipNewlines();
+    self.skipTrivia();
     while (self.peek().tag != .eof) {
         const rule = self.parseRule() catch |err| switch (err) {
             error.SyntaxError => {
                 self.synchronize();
-                self.skipNewlines();
+                self.skipTrivia();
                 continue;
             },
             else => |e| return e,
         };
 
-        self.rules[self.rule_count] = rule;
-        self.rule_count += 1;
-        self.skipNewlines();
+        _ = self.rules.addOne(rule);
+        self.skipTrivia();
     }
 
-    return self.rules[0..self.rule_count];
+    return self.rules.slice();
 }
 
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics_buf[0..self.diagnostics_count];
+    return self.diagnostics.slice();
 }
 
-// --- Grammar rules -----------------------------------------------------------
 
 /// rule = rulename "::=" alternation
 fn parseRule(self: *Parser) ParseError!Ast.Rule {
@@ -79,13 +87,13 @@ fn parseRule(self: *Parser) ParseError!Ast.Rule {
     // Strip angle brackets: <name> → name
     const name = name_lex[1 .. name_lex.len - 1];
 
-    self.skipNewlines();
+    self.skipTrivia();
     if (self.peek().tag != .definition) {
         self.fail(.definition, self.peek());
         return error.SyntaxError;
     }
     _ = self.advance(); // consume ::=
-    self.skipNewlines();
+    self.skipTrivia();
 
     return .{ .name = name, .node = try self.parseAlternation(), .incremental = false };
 }
@@ -99,16 +107,16 @@ fn parseAlternation(self: *Parser) ParseError!Ast.Node {
     count = 1;
 
     while (true) {
-        self.skipNewlines();
+        self.skipTrivia();
         if (self.peek().tag != .pipe) break;
         _ = self.advance();
-        self.skipNewlines();
+        self.skipTrivia();
         buf[count] = self.parseConcatenation();
         count += 1;
     }
 
     if (count == 1) return buf[0];
-    return .{ .alternation = self.allocSlice(buf[0..count]) };
+    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
 }
 
 /// concatenation = *element
@@ -122,7 +130,7 @@ fn parseConcatenation(self: *Parser) Ast.Node {
     }
 
     if (count == 1) return buf[0];
-    return .{ .concatenation = self.allocSlice(buf[0..count]) };
+    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
 }
 
 /// element = rulename / terminal
@@ -141,57 +149,6 @@ fn parseElement(self: *Parser) Ast.Node {
     };
 }
 
-// --- Pool allocators ---------------------------------------------------------
-
-fn allocSlice(self: *Parser, items: []const Ast.Node) []const Ast.Node {
-    const start = self.node_count;
-    for (items) |item| {
-        self.nodes[self.node_count] = item;
-        self.node_count += 1;
-    }
-    return self.nodes[start..self.node_count];
-}
-
-// --- Diagnostics -------------------------------------------------------------
-
-fn fail(self: *Parser, expected: Diagnostic.Expected, token: Token) void {
-    self.diagnostics_buf[self.diagnostics_count] = .{
-        .expected = expected,
-        .found_tag = token.tag,
-        .found_start = token.start,
-        .found_len = token.len,
-        .line = token.line,
-    };
-    self.diagnostics_count += 1;
-}
-
-// --- Helpers -----------------------------------------------------------------
-
-fn peek(self: *Parser) Token {
-    return self.tokens[self.pos];
-}
-
-fn advance(self: *Parser) Token {
-    const tok = self.tokens[self.pos];
-    self.pos += 1;
-    return tok;
-}
-
-fn skipNewlines(self: *Parser) void {
-    while (self.peek().tag == .newline) self.pos += 1;
-}
-
-/// Skip tokens until the start of the next rule or EOF.
-/// A rule boundary is a `<rulename>` followed by `::=`.
-fn synchronize(self: *Parser) void {
-    while (self.peek().tag != .eof) {
-        if (self.peek().tag == .rulename) {
-            const next = self.peekNextMeaningful();
-            if (next == .definition) return;
-        }
-        self.pos += 1;
-    }
-}
 
 /// Can the current position start an element?
 fn isAtElement(self: *Parser) bool {
@@ -206,17 +163,6 @@ fn isAtElement(self: *Parser) bool {
     };
 }
 
-/// Next non-newline token tag after the current position.
-fn peekNextMeaningful(self: *Parser) Token.Tag {
-    var i = self.pos + 1;
-    while (i < self.tokens.len) : (i += 1) {
-        const tag = self.tokens[i].tag;
-        if (tag != .newline) return tag;
-    }
-    return .eof;
-}
-
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("Scanner.zig");
 
@@ -225,7 +171,7 @@ fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
     const rules = try parser.parse();
-    if (parser.diagnostics_count != 0) return error.SyntaxError;
+    if (parser.diagnostics.count != 0) return error.SyntaxError;
     return .{ .parser = parser, .rules = rules };
 }
 

@@ -124,20 +124,50 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
     }
 
     // Stage 5: productivity / cycle detection.
+    //
+    // Classic fixpoint: a rule is productive when its RHS can derive a
+    // finite terminal string.  We iterate until no new rule becomes
+    // productive.  To avoid redundant AST walks we maintain a
+    // `pending` bitset — once a rule is productive *or* has been
+    // evaluated without becoming productive in an iteration where none
+    // of its dependencies changed, we stop re-evaluating it.
+    //
+    // On each iteration only rules whose dependencies might have
+    // changed (i.e. were promoted in the *previous* pass) are
+    // re-evaluated.  We track this via `deps_changed`: a rule is
+    // eligible for re-evaluation when at least one of the rules it
+    // references was promoted since the rule was last checked.
     var productive = try self.allocator.alloc(bool, merged_rules.len);
     defer self.allocator.free(productive);
     @memset(productive, false);
+
+    // pending[i] == true means rule i still needs evaluation.
+    var pending = try self.allocator.alloc(bool, merged_rules.len);
+    defer self.allocator.free(pending);
+    @memset(pending, true);
 
     var changed = true;
     while (changed) {
         changed = false;
         for (merged_rules, 0..) |rule, i| {
-            if (productive[i]) continue;
-            if (self.isProductive(rule.node, merged_rules, &name_index, productive)) {
+            if (!pending[i]) continue;
+            if (isProductive(undefined, rule.node, merged_rules, &name_index, productive)) {
                 productive[i] = true;
                 changed = true;
+                pending[i] = false;
+                // Re-enable any rule that references this newly
+                // productive rule, so it gets a chance next pass.
+                for (merged_rules, 0..) |other, j| {
+                    if (!pending[j] and !productive[j] and
+                        nodeReferences(other.node, rule.name))
+                    {
+                        pending[j] = true;
+                    }
+                }
             }
         }
+        // If nothing changed, every still-pending rule is stuck in a
+        // cycle — stop.
     }
 
     for (merged_rules, 0..) |rule, i| {
@@ -152,7 +182,6 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
     return merged_rules;
 }
 
-// --- Helpers -----------------------------------------------------------------
 
 fn mergeAlternation(self: *Validator, a: Ast.Node, b: Ast.Node) !Ast.Node {
     var alts: std.ArrayList(Ast.Node) = .empty;
@@ -249,7 +278,6 @@ fn isProductive(
     };
 }
 
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("abnf/Scanner.zig");
 const Parser = @import("abnf/Parser.zig");

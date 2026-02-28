@@ -23,12 +23,11 @@ pub fn Compile(comptime grammar: []const u8, comptime start_rule: []const u8) ty
         const tokens = scanner.scanTokens();
         var parser = Parser.init(tokens, grammar);
         const rules = parser.parse() catch @compileError("ABNF grammar has syntax errors");
-        if (parser.diagnostics_count > 0) @compileError("ABNF grammar has syntax errors");
+        if (parser.diagnostics.count > 0) @compileError("ABNF grammar has syntax errors");
         return compileRulename(start_rule, rules, .{});
     }
 }
 
-// --- Node compilation --------------------------------------------------------
 
 fn compileNode(comptime node: Ast.Node, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     return switch (node) {
@@ -95,7 +94,6 @@ fn compileByteSeqInner(comptime bytes: []const u8) type {
     return c.Sequence(c.ByteLiteral(bytes[0]), compileByteSeqInner(bytes[1..]));
 }
 
-// --- Rule name resolution ----------------------------------------------------
 
 fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     // Cycle detection.
@@ -142,7 +140,6 @@ fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, 
     return compileAlts(matching[0..count], rules, new_visited);
 }
 
-// --- Utilities ---------------------------------------------------------------
 
 fn eqlIgnoreCase(comptime a: []const u8, comptime b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -154,7 +151,6 @@ fn eqlIgnoreCase(comptime a: []const u8, comptime b: []const u8) bool {
     return true;
 }
 
-// --- Tests -------------------------------------------------------------------
 
 test "single char_val rule (case-insensitive)" {
     const P = Compile("greeting = \"hello\"", "greeting");

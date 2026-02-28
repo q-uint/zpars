@@ -9,9 +9,7 @@
 /// Everything is resolved at comptime — zero runtime overhead.
 const std = @import("std");
 
-// ---------------------------------------------------------------------------
 // Core result type
-// ---------------------------------------------------------------------------
 
 pub fn Result(comptime T: type) type {
     return struct {
@@ -20,9 +18,7 @@ pub fn Result(comptime T: type) type {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Primitive parsers
-// ---------------------------------------------------------------------------
 
 /// Match an exact string literal.
 pub fn Literal(comptime str: []const u8) type {
@@ -79,9 +75,7 @@ pub const Eof = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // Combinators
-// ---------------------------------------------------------------------------
 
 /// Run `A` then `B`; produce a tuple of both values.
 pub fn Sequence(comptime A: type, comptime B: type) type {
@@ -172,9 +166,7 @@ pub fn Map(comptime P: type, comptime mapFn: anytype) type {
     };
 }
 
-// ---------------------------------------------------------------------------
 // ABNF support combinators
-// ---------------------------------------------------------------------------
 
 /// Match a single exact byte value.
 pub fn ByteLiteral(comptime byte: u8) type {
@@ -221,9 +213,7 @@ pub fn Capture(comptime P: type) type {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 test "Literal matches exact string" {
     const P = Literal("hello");

@@ -19,5 +19,43 @@ pub fn Token(comptime TagType: type) type {
         pub fn lexeme(self: Self, source: []const u8) []const u8 {
             return source[self.start .. self.start + self.len];
         }
+
+        /// Index of the next non-trivia (non-comment, non-newline) token
+        /// at or after `start`.
+        pub fn nextMeaningful(tokens: []const Self, start: usize) usize {
+            var i = start;
+            while (i < tokens.len) : (i += 1) {
+                if (tokens[i].tag != .comment and tokens[i].tag != .newline) return i;
+            }
+            return i;
+        }
+
+        /// Advance past all tokens that belong to a rule/definition body
+        /// (everything up to but not including the next comment, newline
+        /// that isn't a continuation, or eof).  A newline is a
+        /// continuation if it's followed by non-trivia tokens that don't
+        /// start a new rule — as determined by `isRuleStart`.
+        pub fn skipBodyTokens(
+            tokens: []const Self,
+            start: usize,
+            comptime isRuleStart: fn ([]const Self, usize) bool,
+        ) usize {
+            var i = start;
+            while (i < tokens.len) {
+                const tag = tokens[i].tag;
+                switch (tag) {
+                    .eof => return i,
+                    .comment => return i,
+                    .newline => {
+                        const next = nextMeaningful(tokens, i + 1);
+                        if (next >= tokens.len or tokens[next].tag == .eof) return i;
+                        if (isRuleStart(tokens, next)) return i;
+                        i += 1;
+                    },
+                    else => i += 1,
+                }
+            }
+            return i;
+        }
     };
 }

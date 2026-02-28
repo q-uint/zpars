@@ -66,7 +66,6 @@ pub fn Diagnostic(comptime ExpectedType: type, comptime FoundTagType: type) type
     };
 }
 
-// --- Tests -------------------------------------------------------------------
 
 const std = @import("std");
 

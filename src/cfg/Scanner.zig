@@ -12,29 +12,23 @@
 ///   - Blank lines and whitespace are skipped
 const std = @import("std");
 const Token = @import("Token.zig").Token;
+const char_flags = @import("../char_flags.zig");
 
 const Scanner = @This();
 
 pub const max_tokens = 4096;
 
-/// The full source text being scanned.
 source: []const u8,
-/// Collected tokens (bounded).
 tokens: [max_tokens]Token = undefined,
-/// Number of tokens collected so far.
 token_count: usize = 0,
-/// Start of the current lexeme being scanned.
 start: usize = 0,
-/// Current position in source (next character to read).
 current: usize = 0,
-/// Current line number (1-based).
 line: usize = 1,
 
 pub fn init(source: []const u8) Scanner {
     return .{ .source = source };
 }
 
-/// Scan the entire source and return the token list.
 pub fn scanTokens(self: *Scanner) []const Token {
     while (!self.isAtEnd()) {
         self.start = self.current;
@@ -45,62 +39,70 @@ pub fn scanTokens(self: *Scanner) []const Token {
     return self.tokens[0..self.token_count];
 }
 
+const Action = union(enum) {
+    single: Token.Tag,
+    skip,
+    handler: *const fn (*Scanner) void,
+    invalid,
+};
+
+const dispatch_table: [256]Action = blk: {
+    var t: [256]Action = @splat(.invalid);
+
+    t['|'] = .{ .single = .pipe };
+
+    t[' '] = .skip;
+    t['\t'] = .skip;
+    t['\r'] = .skip;
+
+    t['/'] = .{ .handler = scanSlash };
+    t['-'] = .{ .handler = scanDash };
+    t['"'] = .{ .handler = scanDoubleQuote };
+    t['%'] = .{ .handler = scanPercent };
+    t['\n'] = .{ .handler = scanNewlineLF };
+
+    for ('A'..('Z' + 1)) |c| t[c] = .{ .handler = scanIdentifier };
+    for ('a'..('z' + 1)) |c| t[c] = .{ .handler = scanIdentifier };
+    t['_'] = .{ .handler = scanIdentifier };
+
+    break :blk t;
+};
+
 fn scanToken(self: *Scanner) void {
     const c = self.advance();
-    switch (c) {
-        // Line comment
-        '/' => {
-            if (self.peek() == '/') {
-                // Skip rest of line
-                while (!self.isAtEnd() and self.peek() != '\n') _ = self.advance();
-            } else {
-                self.addToken(.invalid);
-            }
-        },
-
-        // Production arrow
-        '-' => {
-            if (self.peek() == '>') {
-                _ = self.advance();
-                self.addToken(.arrow);
-            } else {
-                self.addToken(.invalid);
-            }
-        },
-
-        // Alternation
-        '|' => self.addToken(.pipe),
-
-        // String literal
-        '"' => self.scanString(.string),
-
-        // Percent-prefixed tokens: %x, %s, %i
-        '%' => self.scanPercent(),
-
-        // Whitespace — skip
-        ' ', '\t', '\r' => {},
-
-        // Newlines
-        '\n' => {
-            self.line += 1;
-            self.addToken(.newline);
-        },
-
-        // Identifier (nonterminal)
-        else => {
-            if (isIdentStart(c)) {
-                self.scanIdentifier();
-            } else {
-                self.addToken(.invalid);
-            }
-        },
+    switch (dispatch_table[c]) {
+        .single => |tag| self.addToken(tag),
+        .skip => {},
+        .handler => |func| func(self),
+        .invalid => self.addToken(.invalid),
     }
+}
+
+fn scanSlash(self: *Scanner) void {
+    if (self.peek() == '/') {
+        while (!self.isAtEnd() and self.peek() != '\n') _ = self.advance();
+    } else {
+        self.addToken(.invalid);
+    }
+}
+
+fn scanDash(self: *Scanner) void {
+    if (self.peek() == '>') {
+        _ = self.advance();
+        self.addToken(.arrow);
+    } else {
+        self.addToken(.invalid);
+    }
+}
+
+fn scanDoubleQuote(self: *Scanner) void {
+    self.scanString(.string);
 }
 
 fn scanString(self: *Scanner, tag: Token.Tag) void {
     if (!self.isAtEnd() and self.peek() == '"') {
-        _ = self.advance(); // closing "
-        self.addToken(.invalid); // empty string
+        _ = self.advance();
+        self.addToken(.invalid);
         return;
     }
     while (!self.isAtEnd() and self.peek() != '"') {
@@ -113,7 +115,7 @@ fn scanString(self: *Scanner, tag: Token.Tag) void {
     if (self.isAtEnd()) {
         self.addToken(.invalid);
     } else {
-        _ = self.advance(); // closing "
+        _ = self.advance();
         self.addToken(tag);
     }
 }
@@ -125,15 +127,15 @@ fn scanPercent(self: *Scanner) void {
     }
     const c = self.peek();
     if (c == 'x' or c == 'X') {
-        _ = self.advance(); // skip x
+        _ = self.advance();
         self.scanHex();
     } else if (c == 's' and self.peekNext() == '"') {
-        _ = self.advance(); // skip s
-        _ = self.advance(); // skip "
+        _ = self.advance();
+        _ = self.advance();
         self.scanString(.string_cs);
     } else if (c == 'i' and self.peekNext() == '"') {
-        _ = self.advance(); // skip i
-        _ = self.advance(); // skip "
+        _ = self.advance();
+        _ = self.advance();
         self.scanString(.string_ci);
     } else {
         self.addToken(.invalid);
@@ -141,19 +143,19 @@ fn scanPercent(self: *Scanner) void {
 }
 
 fn scanHex(self: *Scanner) void {
-    if (self.isAtEnd() or !isHexDigit(self.peek())) {
+    if (self.isAtEnd() or !char_flags.isHexDigit(self.peek())) {
         self.addToken(.invalid);
         return;
     }
-    while (!self.isAtEnd() and isHexDigit(self.peek())) _ = self.advance();
+    while (!self.isAtEnd() and char_flags.isHexDigit(self.peek())) _ = self.advance();
 
     if (!self.isAtEnd() and self.peek() == '-') {
-        _ = self.advance(); // skip -
-        if (self.isAtEnd() or !isHexDigit(self.peek())) {
+        _ = self.advance();
+        if (self.isAtEnd() or !char_flags.isHexDigit(self.peek())) {
             self.addToken(.invalid);
             return;
         }
-        while (!self.isAtEnd() and isHexDigit(self.peek())) _ = self.advance();
+        while (!self.isAtEnd() and char_flags.isHexDigit(self.peek())) _ = self.advance();
         self.addToken(.hex_range);
     } else {
         self.addToken(.hex_byte);
@@ -161,11 +163,14 @@ fn scanHex(self: *Scanner) void {
 }
 
 fn scanIdentifier(self: *Scanner) void {
-    while (!self.isAtEnd() and isIdentCont(self.peek())) _ = self.advance();
+    while (!self.isAtEnd() and (char_flags.isIdentCont(self.peek()) or self.peek() == '-')) _ = self.advance();
     self.addToken(.identifier);
 }
 
-// === Primitive operations ===
+fn scanNewlineLF(self: *Scanner) void {
+    self.line += 1;
+    self.addToken(.newline);
+}
 
 fn advance(self: *Scanner) u8 {
     const c = self.source[self.current];
@@ -196,20 +201,6 @@ fn addToken(self: *Scanner, tag: Token.Tag) void {
     };
     self.token_count += 1;
 }
-
-fn isIdentStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
-}
-
-fn isIdentCont(c: u8) bool {
-    return isIdentStart(c) or (c >= '0' and c <= '9') or c == '-';
-}
-
-fn isHexDigit(c: u8) bool {
-    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-}
-
-// --- Tests -------------------------------------------------------------------
 
 fn expectTags(source: []const u8, expected: []const Token.Tag) !void {
     var scanner = Scanner.init(source);
@@ -284,7 +275,6 @@ test "lexeme extraction" {
     const source = "S -> \"hello\"";
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
-    // tokens: identifier("S"), arrow("->"), string("\"hello\""), eof
     try std.testing.expectEqualStrings("S", tokens[0].lexeme(source));
     try std.testing.expectEqualStrings("->", tokens[1].lexeme(source));
     try std.testing.expectEqualStrings("\"hello\"", tokens[2].lexeme(source));

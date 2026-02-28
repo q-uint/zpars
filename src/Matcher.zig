@@ -10,7 +10,7 @@
 ///     const rules = try parser.parse();
 ///     var validator = Validator.init(allocator, rules);
 ///     const merged = try validator.validate();
-///     const matcher = Matcher.init(merged);
+///     const matcher = Matcher.init(allocator, merged);
 ///     const r = matcher.match("start", "hello world").?;
 ///     // r.value == "hello", r.rest == " world"
 const std = @import("std");
@@ -28,10 +28,28 @@ pub const Result = struct {
 /// Maximum recursion depth to guard against stack overflow.
 const max_depth = 256;
 
-rules: []const Ast.Rule,
+const RuleIndex = std.hash_map.StringHashMapUnmanaged(u32);
 
-pub fn init(rules: []const Ast.Rule) Matcher {
-    return .{ .rules = rules };
+rules: []const Ast.Rule,
+rule_index: RuleIndex,
+
+pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) Matcher {
+    var index = RuleIndex{};
+    index.ensureTotalCapacity(allocator, @intCast(rules.len)) catch {};
+    for (rules, 0..) |rule, i| {
+        const key = asciiLowerAlloc(allocator, rule.name) catch rule.name;
+        // Only store first occurrence; rules are already merged by Validator.
+        _ = index.getOrPutValue(allocator, key, @intCast(i)) catch {};
+    }
+    return .{ .rules = rules, .rule_index = index };
+}
+
+fn asciiLowerAlloc(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const buf = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| {
+        buf[i] = std.ascii.toLower(c);
+    }
+    return buf;
 }
 
 /// Match `input` against the rule named `rule_name`.
@@ -40,7 +58,6 @@ pub fn match(self: *const Matcher, rule_name: []const u8, input: []const u8) ?Re
     return self.matchRulename(rule_name, input, 0);
 }
 
-// --- Core matching engine ----------------------------------------------------
 
 fn matchNode(self: *const Matcher, node: Ast.Node, input: []const u8, depth: usize) ?Result {
     if (depth > max_depth) return null;
@@ -152,153 +169,105 @@ fn matchRulename(self: *const Matcher, name: []const u8, input: []const u8, dept
     // Core rules (RFC 5234 Appendix B).
     if (matchCoreRule(name, input)) |r| return r;
 
-    // User-defined rules: find first matching definition.
-    // (Rules should already be merged by Validator, but handle multiple
-    // definitions as alternation for robustness.)
-    var first_result: ?Result = null;
-    var found = false;
-    for (self.rules) |rule| {
-        if (std.ascii.eqlIgnoreCase(rule.name, name)) {
-            found = true;
-            if (first_result == null) {
-                first_result = self.matchNode(rule.node, input, depth + 1);
-                if (first_result != null) return first_result;
-            }
-        }
+    // User-defined rules: O(1) lookup via pre-built hash map.
+    var lower_buf: [256]u8 = undefined;
+    const key = asciiLowerBuf(name, &lower_buf) orelse return null;
+    const idx = self.rule_index.get(key) orelse return null;
+    return self.matchNode(self.rules[idx].node, input, depth + 1);
+}
+
+fn asciiLowerBuf(s: []const u8, buf: *[256]u8) ?[]const u8 {
+    if (s.len > buf.len) return null;
+    for (s, 0..) |c, i| {
+        buf[i] = std.ascii.toLower(c);
     }
-    if (!found) return null; // Undefined rule.
-    return first_result;
+    return buf[0..s.len];
 }
 
 fn matchCoreRule(name: []const u8, input: []const u8) ?Result {
-    const Tag = enum {
-        ALPHA,
-        BIT,
-        CHAR,
-        CR,
-        LF,
-        CRLF,
-        CTL,
-        DIGIT,
-        DQUOTE,
-        HEXDIG,
-        HTAB,
-        LWSP,
-        OCTET,
-        SP,
-        VCHAR,
-        WSP,
+    // Special cases: multi-byte or always-true rules.
+    if (std.ascii.eqlIgnoreCase("CRLF", name)) {
+        if (input.len >= 2 and input[0] == 0x0D and input[1] == 0x0A)
+            return .{ .value = input[0..2], .rest = input[2..] };
+        return null;
+    }
+    if (std.ascii.eqlIgnoreCase("LWSP", name)) {
+        // *(WSP / CRLF WSP) — zero or more.
+        var rest = input;
+        while (rest.len > 0) {
+            if (rest[0] == 0x20 or rest[0] == 0x09) {
+                rest = rest[1..];
+            } else if (rest.len >= 3 and rest[0] == 0x0D and rest[1] == 0x0A and
+                (rest[2] == 0x20 or rest[2] == 0x09))
+            {
+                rest = rest[3..];
+            } else break;
+        }
+        return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
+    }
+    if (std.ascii.eqlIgnoreCase("OCTET", name)) {
+        if (input.len == 0) return null;
+        return .{ .value = input[0..1], .rest = input[1..] };
+    }
+
+    // Single-byte predicate rules — table-driven dispatch.
+    const pred_rules = comptime .{
+        .{ "ALPHA", std.ascii.isAlphabetic },
+        .{ "BIT", isBit },
+        .{ "CHAR", isChar },
+        .{ "CR", matchExact(0x0D) },
+        .{ "LF", matchExact(0x0A) },
+        .{ "CTL", isCtl },
+        .{ "DIGIT", std.ascii.isDigit },
+        .{ "DQUOTE", matchExact(0x22) },
+        .{ "HEXDIG", std.ascii.isHex },
+        .{ "HTAB", matchExact(0x09) },
+        .{ "SP", matchExact(0x20) },
+        .{ "VCHAR", isVchar },
+        .{ "WSP", isWsp },
     };
 
-    const core_rules = comptime .{
-        .{ "ALPHA", Tag.ALPHA },
-        .{ "BIT", Tag.BIT },
-        .{ "CHAR", Tag.CHAR },
-        .{ "CR", Tag.CR },
-        .{ "LF", Tag.LF },
-        .{ "CRLF", Tag.CRLF },
-        .{ "CTL", Tag.CTL },
-        .{ "DIGIT", Tag.DIGIT },
-        .{ "DQUOTE", Tag.DQUOTE },
-        .{ "HEXDIG", Tag.HEXDIG },
-        .{ "HTAB", Tag.HTAB },
-        .{ "LWSP", Tag.LWSP },
-        .{ "OCTET", Tag.OCTET },
-        .{ "SP", Tag.SP },
-        .{ "VCHAR", Tag.VCHAR },
-        .{ "WSP", Tag.WSP },
-    };
-
-    const tag: Tag = inline for (core_rules) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry[0], name)) break entry[1];
-    } else return null;
-
-    return switch (tag) {
-        .ALPHA => {
-            if (input.len == 0) return null;
-            if (std.ascii.isAlphabetic(input[0]))
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .BIT => {
-            if (input.len == 0) return null;
-            if (input[0] == '0' or input[0] == '1')
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .CHAR => {
-            if (input.len == 0) return null;
-            if (input[0] >= 0x01 and input[0] <= 0x7F)
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .CR => matchByte(input, 0x0D),
-        .LF => matchByte(input, 0x0A),
-        .CRLF => {
-            if (input.len >= 2 and input[0] == 0x0D and input[1] == 0x0A)
-                return .{ .value = input[0..2], .rest = input[2..] };
-            return null;
-        },
-        .CTL => {
-            if (input.len == 0) return null;
-            if (input[0] <= 0x1F or input[0] == 0x7F)
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .DIGIT => {
-            if (input.len == 0) return null;
-            if (std.ascii.isDigit(input[0]))
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .DQUOTE => matchByte(input, 0x22),
-        .HEXDIG => {
-            if (input.len == 0) return null;
-            if (std.ascii.isHex(input[0]))
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .HTAB => matchByte(input, 0x09),
-        .LWSP => {
-            // *(WSP / CRLF WSP) — zero or more.
-            var rest = input;
-            while (rest.len > 0) {
-                if (rest[0] == 0x20 or rest[0] == 0x09) {
-                    rest = rest[1..];
-                } else if (rest.len >= 3 and rest[0] == 0x0D and rest[1] == 0x0A and
-                    (rest[2] == 0x20 or rest[2] == 0x09))
-                {
-                    rest = rest[3..];
-                } else break;
-            }
-            return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
-        },
-        .OCTET => {
-            if (input.len == 0) return null;
-            return .{ .value = input[0..1], .rest = input[1..] };
-        },
-        .SP => matchByte(input, 0x20),
-        .VCHAR => {
-            if (input.len == 0) return null;
-            if (input[0] >= 0x21 and input[0] <= 0x7E)
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-        .WSP => {
-            if (input.len == 0) return null;
-            if (input[0] == 0x20 or input[0] == 0x09)
-                return .{ .value = input[0..1], .rest = input[1..] };
-            return null;
-        },
-    };
+    inline for (pred_rules) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry[0], name))
+            return matchPred(input, entry[1]);
+    }
+    return null;
 }
 
-fn matchByte(input: []const u8, expected: u8) ?Result {
-    if (input.len == 0 or input[0] != expected) return null;
-    return .{ .value = input[0..1], .rest = input[1..] };
+fn matchPred(input: []const u8, comptime pred: *const fn (u8) bool) ?Result {
+    if (input.len == 0) return null;
+    if (pred(input[0])) return .{ .value = input[0..1], .rest = input[1..] };
+    return null;
 }
 
-// --- Tests -------------------------------------------------------------------
+fn matchExact(comptime expected: u8) *const fn (u8) bool {
+    return struct {
+        fn f(c: u8) bool {
+            return c == expected;
+        }
+    }.f;
+}
+
+fn isBit(c: u8) bool {
+    return c == '0' or c == '1';
+}
+
+fn isChar(c: u8) bool {
+    return c >= 0x01 and c <= 0x7F;
+}
+
+fn isCtl(c: u8) bool {
+    return c <= 0x1F or c == 0x7F;
+}
+
+fn isVchar(c: u8) bool {
+    return c >= 0x21 and c <= 0x7E;
+}
+
+fn isWsp(c: u8) bool {
+    return c == 0x20 or c == 0x09;
+}
+
 
 const Scanner = @import("abnf/Scanner.zig");
 const Parser = @import("abnf/Parser.zig");
@@ -314,7 +283,7 @@ fn compileMatcher(allocator: std.mem.Allocator, grammar: []const u8) !struct { m
     var arena = std.heap.ArenaAllocator.init(allocator);
     var validator = Validator.init(arena.allocator(), rules);
     const merged = try validator.validate();
-    return .{ .matcher = Matcher.init(merged), .arena = arena };
+    return .{ .matcher = Matcher.init(arena.allocator(), merged), .arena = arena };
 }
 
 test "single char_val rule (case-insensitive)" {

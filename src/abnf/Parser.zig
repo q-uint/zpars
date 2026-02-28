@@ -2,8 +2,21 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
+const parser_base = @import("../parser.zig");
+const Pool = @import("../pool.zig").Pool;
 
 const Parser = @This();
+
+const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .comment, .newline }, .{
+    .name_tag = .rulename,
+    .def_tags = &.{ .equals, .equals_slash },
+});
+const peek = primitives.peek;
+const advance = primitives.advance;
+const skipTrivia = primitives.skipTrivia;
+const peekNextMeaningful = primitives.peekNextMeaningful;
+const synchronize = primitives.synchronize;
+const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow, InvalidCharacter };
 
@@ -17,20 +30,16 @@ source: []const u8,
 pos: usize = 0,
 
 /// Pool for AST nodes (alternation/concatenation slices and repetition elements).
-nodes: [max_nodes]Ast.Node = undefined,
-node_count: usize = 0,
+nodes: Pool(Ast.Node, max_nodes) = .{},
 
 /// Pool for num_val concat byte sequences.
-bytes: [max_bytes]u8 = undefined,
-byte_count: usize = 0,
+bytes: Pool(u8, max_bytes) = .{},
 
 /// Parsed rules.
-rules: [max_rules]Ast.Rule = undefined,
-rule_count: usize = 0,
+rules: Pool(Ast.Rule, max_rules) = .{},
 
 /// Accumulated parse diagnostics.
-diagnostics_buf: [max_diagnostics]Diagnostic = undefined,
-diagnostics_count: usize = 0,
+diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
 
 pub fn init(tokens: []const Token, source: []const u8) Parser {
     return .{
@@ -52,19 +61,17 @@ pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
             else => |e| return e,
         };
 
-        self.rules[self.rule_count] = rule;
-        self.rule_count += 1;
+        _ = self.rules.addOne(rule);
         self.skipTrivia();
     }
 
-    return self.rules[0..self.rule_count];
+    return self.rules.slice();
 }
 
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics_buf[0..self.diagnostics_count];
+    return self.diagnostics.slice();
 }
 
-// --- Grammar rules -----------------------------------------------------------
 
 /// rule = rulename ("=" / "=/") alternation
 fn parseRule(self: *Parser) ParseError!Ast.Rule {
@@ -100,7 +107,7 @@ fn parseAlternation(self: *Parser) ParseError!Ast.Node {
     }
 
     if (count == 1) return buf[0];
-    return .{ .alternation = self.allocSlice(buf[0..count]) };
+    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
 }
 
 /// concatenation = repetition *(repetition)
@@ -115,7 +122,7 @@ fn parseConcatenation(self: *Parser) ParseError!Ast.Node {
     }
 
     if (count == 1) return buf[0];
-    return .{ .concatenation = self.allocSlice(buf[0..count]) };
+    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
 }
 
 /// repetition = [repeat] element
@@ -152,7 +159,7 @@ fn parseRepetition(self: *Parser) ParseError!Ast.Node {
     const element = try self.parseElement();
     if (!has_repeat) return element;
 
-    const ptr = self.allocNode(element);
+    const ptr = self.nodes.addOne(element);
     return .{ .repetition = .{ .min = min, .max = max, .element = ptr } };
 }
 
@@ -222,11 +229,10 @@ fn parseOption(self: *Parser) ParseError!Ast.Node {
         return error.SyntaxError;
     }
 
-    const ptr = self.allocNode(inner);
+    const ptr = self.nodes.addOne(inner);
     return .{ .repetition = .{ .min = 0, .max = 1, .element = ptr } };
 }
 
-// --- Numeric values ----------------------------------------------------------
 
 fn parseNumVal(self: *Parser) !Ast.NumVal {
     const lex = self.advance().lexeme(self.source);
@@ -253,93 +259,21 @@ fn parseNumVal(self: *Parser) !Ast.NumVal {
             buf[count] = try std.fmt.parseInt(u8, part, base);
             count += 1;
         }
-        return .{ .concat = self.allocBytes(buf[0..count]) };
+        return .{ .concat = self.bytes.addSlice(buf[0..count]) };
     }
 
     return .{ .single = try std.fmt.parseInt(u8, digits, base) };
 }
 
-// --- Pool allocators ---------------------------------------------------------
-
-fn allocNode(self: *Parser, node: Ast.Node) *const Ast.Node {
-    self.nodes[self.node_count] = node;
-    const ptr = &self.nodes[self.node_count];
-    self.node_count += 1;
-    return ptr;
-}
-
-fn allocSlice(self: *Parser, items: []const Ast.Node) []const Ast.Node {
-    const start = self.node_count;
-    for (items) |item| {
-        self.nodes[self.node_count] = item;
-        self.node_count += 1;
-    }
-    return self.nodes[start..self.node_count];
-}
-
-fn allocBytes(self: *Parser, items: []const u8) []const u8 {
-    const start = self.byte_count;
-    for (items) |b| {
-        self.bytes[self.byte_count] = b;
-        self.byte_count += 1;
-    }
-    return self.bytes[start..self.byte_count];
-}
-
-// --- Diagnostics -------------------------------------------------------------
-
-fn fail(self: *Parser, expected: Diagnostic.Expected, token: Token) void {
-    self.diagnostics_buf[self.diagnostics_count] = .{
-        .expected = expected,
-        .found_tag = token.tag,
-        .found_start = token.start,
-        .found_len = token.len,
-        .line = token.line,
-    };
-    self.diagnostics_count += 1;
-}
-
-// --- Helpers -----------------------------------------------------------------
 
 fn parseNumber(self: *Parser) !usize {
     return std.fmt.parseInt(usize, self.advance().lexeme(self.source), 10);
-}
-
-fn peek(self: *Parser) Token {
-    return self.tokens[self.pos];
 }
 
 fn peekAt(self: *Parser, offset: usize) Token {
     const idx = self.pos + offset;
     if (idx >= self.tokens.len) return .{ .tag = .eof, .start = 0, .len = 0, .line = 0 };
     return self.tokens[idx];
-}
-
-fn advance(self: *Parser) Token {
-    const tok = self.tokens[self.pos];
-    self.pos += 1;
-    return tok;
-}
-
-fn skipTrivia(self: *Parser) void {
-    while (true) {
-        switch (self.peek().tag) {
-            .comment, .newline => self.pos += 1,
-            else => break,
-        }
-    }
-}
-
-/// Skip tokens until the start of the next rule or EOF.
-/// A rule boundary is a `rulename` followed by `=` or `=/`.
-fn synchronize(self: *Parser) void {
-    while (self.peek().tag != .eof) {
-        if (self.peek().tag == .rulename) {
-            const next = self.peekNextMeaningful();
-            if (next == .equals or next == .equals_slash) return;
-        }
-        self.pos += 1;
-    }
 }
 
 /// Can the current position start a repetition/element?
@@ -366,17 +300,6 @@ fn isAtRepetition(self: *Parser) bool {
     };
 }
 
-/// Next non-trivia token tag after the current position.
-fn peekNextMeaningful(self: *Parser) Token.Tag {
-    var i = self.pos + 1;
-    while (i < self.tokens.len) : (i += 1) {
-        const tag = self.tokens[i].tag;
-        if (tag != .comment and tag != .newline) return tag;
-    }
-    return .eof;
-}
-
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("Scanner.zig");
 
@@ -385,7 +308,7 @@ fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
     const rules = try parser.parse();
-    if (parser.diagnostics_count != 0) return error.SyntaxError;
+    if (parser.diagnostics.count != 0) return error.SyntaxError;
     return .{ .parser = parser, .rules = rules };
 }
 
@@ -518,7 +441,6 @@ test "diagnostic: missing closing bracket" {
     try expectSyntaxError("foo = [bar", .right_bracket, .eof);
 }
 
-// --- Synchronization / recovery tests ----------------------------------------
 
 test "recovery: error in first rule, second rule parsed" {
     var scanner = Scanner.init("foo = )\nbar = baz");

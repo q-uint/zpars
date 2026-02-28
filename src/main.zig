@@ -56,7 +56,6 @@ const ParsedGrammar = struct {
     peg_tokens: ?[]const zpars.peg.Token.Token = null,
 };
 
-// --- check -------------------------------------------------------------------
 
 fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
@@ -114,7 +113,6 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     stderr.flush() catch {};
 }
 
-// --- fmt ---------------------------------------------------------------------
 
 fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
@@ -169,7 +167,6 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.flush();
 }
 
-// --- match -------------------------------------------------------------------
 
 fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var rule_name: ?[]const u8 = null;
@@ -245,7 +242,7 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     stderr.flush() catch {};
 
-    const matcher = zpars.Matcher.init(merged);
+    const matcher = zpars.Matcher.init(arena.allocator(), merged);
     const result = matcher.match(rule_name.?, input.?) orelse {
         std.debug.print("no match\n", .{});
         std.process.exit(1);
@@ -259,7 +256,6 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.flush();
 }
 
-// --- helpers -----------------------------------------------------------------
 
 fn readSource(allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {
     return std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024);

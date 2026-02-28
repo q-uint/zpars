@@ -45,7 +45,7 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
 
                         // Skip past the original definition tokens.
                         tok_idx += 1; // skip identifier
-                        tok_idx = skipDefinitionTokens(tokens, tok_idx);
+                        tok_idx = Token.skipBodyTokens(tokens, tok_idx, isDefinitionStart);
 
                         // Emit any trailing comment.
                         if (tok_idx < tokens.len and tokens[tok_idx].tag == .comment) {
@@ -213,49 +213,14 @@ fn writeClassChar(c: u8, writer: anytype) !void {
     }
 }
 
-// --- Helpers -----------------------------------------------------------------
 
 fn isDefinitionStart(tokens: []const Token, idx: usize) bool {
-    // identifier followed by <-
     if (tokens[idx].tag != .identifier) return false;
-    var i = idx + 1;
-    while (i < tokens.len) : (i += 1) {
-        if (tokens[i].tag != .comment and tokens[i].tag != .newline)
-            return tokens[i].tag == .left_arrow;
-    }
-    return false;
+    const after = Token.nextMeaningful(tokens, idx + 1);
+    return after < tokens.len and tokens[after].tag == .left_arrow;
 }
 
-/// Skip past all tokens belonging to a definition body.
-fn skipDefinitionTokens(tokens: []const Token, start: usize) usize {
-    var i = start;
-    while (i < tokens.len) {
-        const tag = tokens[i].tag;
-        switch (tag) {
-            .eof => return i,
-            .comment => return i,
-            .newline => {
-                // Check if next meaningful token starts a new definition.
-                const next = nextMeaningful(tokens, i + 1);
-                if (next >= tokens.len or tokens[next].tag == .eof) return i;
-                if (isDefinitionStart(tokens, next)) return i;
-                i += 1;
-            },
-            else => i += 1,
-        }
-    }
-    return i;
-}
 
-fn nextMeaningful(tokens: []const Token, start: usize) usize {
-    var i = start;
-    while (i < tokens.len) : (i += 1) {
-        if (tokens[i].tag != .comment and tokens[i].tag != .newline) return i;
-    }
-    return i;
-}
-
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("Scanner.zig");
 const PegParser = @import("Parser.zig");

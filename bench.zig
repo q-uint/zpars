@@ -9,7 +9,6 @@ const Ast = zpars.Ast;
 
 const iterations = 1_000_000;
 
-// --- Benchmark cases ---------------------------------------------------------
 
 const Case = struct {
     name: []const u8,
@@ -56,13 +55,11 @@ const cases = [_]Case{
     },
 };
 
-// --- Comptime parsers (one per case, generated at comptime) ------------------
 
 fn ComptimeParser(comptime idx: usize) type {
     return Abnf.Compile(cases[idx].grammar, cases[idx].rule);
 }
 
-// --- Timing helpers ----------------------------------------------------------
 
 fn benchComptime(comptime idx: usize) u64 {
     const P = ComptimeParser(idx);
@@ -93,7 +90,6 @@ fn benchRuntime(comptime idx: usize, matcher: *const Matcher) u64 {
     return timer.read();
 }
 
-// --- Main --------------------------------------------------------------------
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -145,5 +141,5 @@ fn buildMatcher(allocator: std.mem.Allocator, comptime idx: usize) !Matcher {
     const rules = try parser.parse();
     var validator = Validator.init(allocator, rules);
     const merged = try validator.validate();
-    return Matcher.init(merged);
+    return Matcher.init(allocator, merged);
 }

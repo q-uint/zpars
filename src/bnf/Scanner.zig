@@ -11,24 +11,17 @@ const Scanner = @This();
 
 pub const max_tokens = 4096;
 
-/// The full source text being scanned.
 source: []const u8,
-/// Collected tokens (bounded).
 tokens: [max_tokens]Token = undefined,
-/// Number of tokens collected so far.
 token_count: usize = 0,
-/// Start of the current lexeme being scanned.
 start: usize = 0,
-/// Current position in source (next character to read).
 current: usize = 0,
-/// Current line number (1-based).
 line: usize = 1,
 
 pub fn init(source: []const u8) Scanner {
     return .{ .source = source };
 }
 
-/// Scan the entire source and return the token list.
 pub fn scanTokens(self: *Scanner) []const Token {
     while (!self.isAtEnd()) {
         self.start = self.current;
@@ -39,70 +32,70 @@ pub fn scanTokens(self: *Scanner) []const Token {
     return self.tokens[0..self.token_count];
 }
 
+const Action = union(enum) {
+    single: Token.Tag,
+    skip,
+    handler: *const fn (*Scanner) void,
+};
+
+const dispatch_table: [256]Action = blk: {
+    // BNF: everything not recognized is a terminal character.
+    var t: [256]Action = @splat(.{ .handler = scanTerminal });
+
+    t['<'] = .{ .handler = scanAngleBracket };
+    t['|'] = .{ .single = .pipe };
+    t[':'] = .{ .handler = scanColon };
+
+    t[' '] = .skip;
+    t['\t'] = .skip;
+
+    t['\r'] = .{ .handler = scanNewlineCR };
+    t['\n'] = .{ .handler = scanNewlineLF };
+
+    break :blk t;
+};
+
 fn scanToken(self: *Scanner) void {
     const c = self.advance();
-    switch (c) {
-        // Non-terminal: <name>
-        '<' => {
-            while (!self.isAtEnd() and self.peek() != '>') {
-                if (self.peek() == '\n' or self.peek() == '\r') {
-                    self.addToken(.invalid);
-                    return;
-                }
-                _ = self.advance();
-            }
-            if (self.isAtEnd()) {
-                self.addToken(.invalid);
-            } else {
-                _ = self.advance(); // consume >
-                self.addToken(.rulename);
-            }
-        },
-
-        // Alternation
-        '|' => self.addToken(.pipe),
-
-        // Definition: ::=
-        ':' => {
-            if (self.current + 1 < self.source.len and
-                self.source[self.current] == ':' and
-                self.source[self.current + 1] == '=')
-            {
-                self.current += 2;
-                self.addToken(.definition);
-            } else {
-                // Bare colon — treat as terminal
-                self.scanTerminal();
-            }
-        },
-
-        // Whitespace — skip silently.
-        ' ', '\t' => {},
-
-        // Newlines
-        '\r' => {
-            _ = self.match('\n'); // consume LF after CR (CRLF)
-            self.line += 1;
-            self.addToken(.newline);
-        },
-        '\n' => {
-            self.line += 1;
-            self.addToken(.newline);
-        },
-
-        // Everything else is a terminal character.
-        else => self.scanTerminal(),
+    switch (dispatch_table[c]) {
+        .single => |tag| self.addToken(tag),
+        .skip => {},
+        .handler => |func| func(self),
     }
 }
 
-/// Continue scanning terminal characters from the current position.
-/// The first character has already been consumed by scanToken.
+fn scanAngleBracket(self: *Scanner) void {
+    while (!self.isAtEnd() and self.peek() != '>') {
+        if (self.peek() == '\n' or self.peek() == '\r') {
+            self.addToken(.invalid);
+            return;
+        }
+        _ = self.advance();
+    }
+    if (self.isAtEnd()) {
+        self.addToken(.invalid);
+    } else {
+        _ = self.advance();
+        self.addToken(.rulename);
+    }
+}
+
+fn scanColon(self: *Scanner) void {
+    if (self.current + 1 < self.source.len and
+        self.source[self.current] == ':' and
+        self.source[self.current + 1] == '=')
+    {
+        self.current += 2;
+        self.addToken(.definition);
+    } else {
+        self.scanTerminal();
+    }
+}
+
 fn scanTerminal(self: *Scanner) void {
     while (!self.isAtEnd()) {
         const c = self.peek();
-        // Stop at meta-symbols, whitespace, and newlines.
         if (c == '<' or c == '|' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
-        // Stop at ::= (definition).
         if (c == ':' and self.current + 2 <= self.source.len and
             self.source[self.current + 1] == ':' and
             self.source[self.current + 2] == '=') break;
@@ -111,7 +104,16 @@ fn scanTerminal(self: *Scanner) void {
     self.addToken(.terminal);
 }
 
-// === Primitive operations ===
+fn scanNewlineCR(self: *Scanner) void {
+    _ = self.match('\n');
+    self.line += 1;
+    self.addToken(.newline);
+}
+
+fn scanNewlineLF(self: *Scanner) void {
+    self.line += 1;
+    self.addToken(.newline);
+}
 
 fn advance(self: *Scanner) u8 {
     const c = self.source[self.current];
@@ -144,8 +146,6 @@ fn addToken(self: *Scanner, tag: Token.Tag) void {
     };
     self.token_count += 1;
 }
-
-// --- Tests -------------------------------------------------------------------
 
 fn expectTags(source: []const u8, expected: []const Token.Tag) !void {
     var scanner = Scanner.init(source);

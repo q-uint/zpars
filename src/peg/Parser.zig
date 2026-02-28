@@ -14,8 +14,21 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
+const parser_base = @import("../parser.zig");
+const Pool = @import("../pool.zig").Pool;
 
 const Parser = @This();
+
+const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .comment, .newline }, .{
+    .name_tag = .identifier,
+    .def_tags = &.{.left_arrow},
+});
+const peek = primitives.peek;
+const advance = primitives.advance;
+const skipTrivia = primitives.skipTrivia;
+const peekNextMeaningful = primitives.peekNextMeaningful;
+const synchronize = primitives.synchronize;
+const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
 
@@ -30,24 +43,19 @@ source: []const u8,
 pos: usize = 0,
 
 /// Pool for AST nodes.
-nodes: [max_nodes]Ast.Node = undefined,
-node_count: usize = 0,
+nodes: Pool(Ast.Node, max_nodes) = .{},
 
 /// Pool for ClassRange entries.
-ranges: [max_ranges]Ast.ClassRange = undefined,
-range_count: usize = 0,
+ranges: Pool(Ast.ClassRange, max_ranges) = .{},
 
 /// Pool for decoded literal bytes.
-bytes: [max_bytes]u8 = undefined,
-byte_count: usize = 0,
+bytes: Pool(u8, max_bytes) = .{},
 
 /// Parsed rules.
-rules: [max_rules]Ast.Rule = undefined,
-rule_count: usize = 0,
+rules: Pool(Ast.Rule, max_rules) = .{},
 
 /// Accumulated parse diagnostics.
-diagnostics_buf: [max_diagnostics]Diagnostic = undefined,
-diagnostics_count: usize = 0,
+diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
 
 pub fn init(tokens: []const Token, source: []const u8) Parser {
     return .{
@@ -69,19 +77,17 @@ pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
             else => |e| return e,
         };
 
-        self.rules[self.rule_count] = rule;
-        self.rule_count += 1;
+        _ = self.rules.addOne(rule);
         self.skipTrivia();
     }
 
-    return self.rules[0..self.rule_count];
+    return self.rules.slice();
 }
 
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics_buf[0..self.diagnostics_count];
+    return self.diagnostics.slice();
 }
 
-// --- Grammar rules -----------------------------------------------------------
 
 /// Definition <- Identifier LEFTARROW Expression
 fn parseDefinition(self: *Parser) ParseError!Ast.Rule {
@@ -120,7 +126,7 @@ fn parseExpression(self: *Parser) ParseError!Ast.Node {
     }
 
     if (count == 1) return buf[0];
-    return .{ .alternation = self.allocSlice(buf[0..count]) };
+    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
 }
 
 /// Sequence <- Prefix*
@@ -136,10 +142,10 @@ fn parseSequence(self: *Parser) ParseError!Ast.Node {
 
     if (count == 0) {
         // Empty sequence — matches empty string. Represent as empty concat.
-        return .{ .concatenation = self.allocSlice(buf[0..0]) };
+        return .{ .concatenation = self.nodes.addSlice(buf[0..0]) };
     }
     if (count == 1) return buf[0];
-    return .{ .concatenation = self.allocSlice(buf[0..count]) };
+    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
 }
 
 /// Prefix <- (AND / NOT)? Suffix
@@ -149,13 +155,13 @@ fn parsePrefix(self: *Parser) ParseError!Ast.Node {
         _ = self.advance();
         self.skipTrivia();
         const inner = try self.parseSuffix();
-        return .{ .and_predicate = self.allocNode(inner) };
+        return .{ .and_predicate = self.nodes.addOne(inner) };
     }
     if (tag == .not) {
         _ = self.advance();
         self.skipTrivia();
         const inner = try self.parseSuffix();
-        return .{ .not_predicate = self.allocNode(inner) };
+        return .{ .not_predicate = self.nodes.addOne(inner) };
     }
     return self.parseSuffix();
 }
@@ -167,15 +173,15 @@ fn parseSuffix(self: *Parser) ParseError!Ast.Node {
     return switch (self.peek().tag) {
         .question => {
             _ = self.advance();
-            return .{ .repetition = .{ .min = 0, .max = 1, .element = self.allocNode(primary) } };
+            return .{ .repetition = .{ .min = 0, .max = 1, .element = self.nodes.addOne(primary) } };
         },
         .star => {
             _ = self.advance();
-            return .{ .repetition = .{ .min = 0, .max = null, .element = self.allocNode(primary) } };
+            return .{ .repetition = .{ .min = 0, .max = null, .element = self.nodes.addOne(primary) } };
         },
         .plus => {
             _ = self.advance();
-            return .{ .repetition = .{ .min = 1, .max = null, .element = self.allocNode(primary) } };
+            return .{ .repetition = .{ .min = 1, .max = null, .element = self.nodes.addOne(primary) } };
         },
         else => primary,
     };
@@ -220,7 +226,6 @@ fn parsePrimary(self: *Parser) ParseError!Ast.Node {
     };
 }
 
-// --- Literal parsing ---------------------------------------------------------
 
 fn parseLiteral(self: *Parser) Ast.Node {
     const lex = self.advance().lexeme(self.source);
@@ -234,7 +239,7 @@ fn decodeEscapes(self: *Parser, raw: []const u8) []const u8 {
     // Fast path: no backslashes.
     if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
 
-    const start = self.byte_count;
+    const start = self.bytes.count;
     var i: usize = 0;
     while (i < raw.len) {
         if (raw[i] == '\\' and i + 1 < raw.len) {
@@ -250,27 +255,23 @@ fn decodeEscapes(self: *Parser, raw: []const u8) []const u8 {
                     const result = self.decodeOctal(raw, &i);
                     if (result) |val| break :blk val;
                     // Not a valid octal sequence, treat as literal.
-                    self.bytes[self.byte_count] = '\\';
-                    self.byte_count += 1;
+                    _ = self.bytes.addOne('\\');
                     break :blk c;
                 },
                 else => blk: {
                     // Unknown escape — keep backslash.
-                    self.bytes[self.byte_count] = '\\';
-                    self.byte_count += 1;
+                    _ = self.bytes.addOne('\\');
                     break :blk c;
                 },
             };
-            self.bytes[self.byte_count] = decoded;
-            self.byte_count += 1;
+            _ = self.bytes.addOne(decoded);
             i += 1;
         } else {
-            self.bytes[self.byte_count] = raw[i];
-            self.byte_count += 1;
+            _ = self.bytes.addOne(raw[i]);
             i += 1;
         }
     }
-    return self.bytes[start..self.byte_count];
+    return self.bytes.items[start..self.bytes.count];
 }
 
 /// Try to decode an octal escape starting at raw[*i].
@@ -306,14 +307,13 @@ fn isOctalDigit(c: u8) bool {
     return c >= '0' and c <= '7';
 }
 
-// --- Character class parsing -------------------------------------------------
 
 fn parseCharClass(self: *Parser) Ast.Node {
     const lex = self.advance().lexeme(self.source);
     // Strip surrounding brackets: [content]
     const inner = lex[1 .. lex.len - 1];
 
-    const start = self.range_count;
+    const start = self.ranges.count;
     var i: usize = 0;
     while (i < inner.len) {
         const lo = self.decodeClassChar(inner, &i) orelse break;
@@ -322,21 +322,17 @@ fn parseCharClass(self: *Parser) Ast.Node {
             i += 1; // skip '-'
             const hi = self.decodeClassChar(inner, &i) orelse {
                 // Malformed range — treat '-' as literal.
-                self.ranges[self.range_count] = .{ .lo = lo, .hi = lo };
-                self.range_count += 1;
-                self.ranges[self.range_count] = .{ .lo = '-', .hi = '-' };
-                self.range_count += 1;
+                _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
+                _ = self.ranges.addOne(.{ .lo = '-', .hi = '-' });
                 break;
             };
-            self.ranges[self.range_count] = .{ .lo = lo, .hi = hi };
-            self.range_count += 1;
+            _ = self.ranges.addOne(.{ .lo = lo, .hi = hi });
         } else {
-            self.ranges[self.range_count] = .{ .lo = lo, .hi = lo };
-            self.range_count += 1;
+            _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
         }
     }
 
-    return .{ .char_class = self.ranges[start..self.range_count] };
+    return .{ .char_class = self.ranges.items[start..self.ranges.count] };
 }
 
 /// Decode one character from a character class body, advancing *i past it.
@@ -368,69 +364,6 @@ fn decodeClassChar(self: *Parser, raw: []const u8, i: *usize) ?u8 {
     return c;
 }
 
-// --- Pool allocators ---------------------------------------------------------
-
-fn allocNode(self: *Parser, node: Ast.Node) *const Ast.Node {
-    self.nodes[self.node_count] = node;
-    const ptr = &self.nodes[self.node_count];
-    self.node_count += 1;
-    return ptr;
-}
-
-fn allocSlice(self: *Parser, items: []const Ast.Node) []const Ast.Node {
-    const start = self.node_count;
-    for (items) |item| {
-        self.nodes[self.node_count] = item;
-        self.node_count += 1;
-    }
-    return self.nodes[start..self.node_count];
-}
-
-// --- Diagnostics -------------------------------------------------------------
-
-fn fail(self: *Parser, expected: Diagnostic.Expected, tok: Token) void {
-    self.diagnostics_buf[self.diagnostics_count] = .{
-        .expected = expected,
-        .found_tag = tok.tag,
-        .found_start = tok.start,
-        .found_len = tok.len,
-        .line = tok.line,
-    };
-    self.diagnostics_count += 1;
-}
-
-// --- Helpers -----------------------------------------------------------------
-
-fn peek(self: *Parser) Token {
-    return self.tokens[self.pos];
-}
-
-fn advance(self: *Parser) Token {
-    const tok = self.tokens[self.pos];
-    self.pos += 1;
-    return tok;
-}
-
-fn skipTrivia(self: *Parser) void {
-    while (true) {
-        switch (self.peek().tag) {
-            .comment, .newline => self.pos += 1,
-            else => break,
-        }
-    }
-}
-
-/// Skip tokens until the start of the next definition or EOF.
-/// A definition boundary is an `identifier` followed by `<-`.
-fn synchronize(self: *Parser) void {
-    while (self.peek().tag != .eof) {
-        if (self.peek().tag == .identifier) {
-            const next = self.peekNextMeaningful();
-            if (next == .left_arrow) return;
-        }
-        self.pos += 1;
-    }
-}
 
 /// Can the current position start a Prefix?
 fn isAtPrefix(self: *Parser) bool {
@@ -453,17 +386,6 @@ fn isAtPrimary(self: *Parser) bool {
     };
 }
 
-/// Next non-trivia token tag after the current position.
-fn peekNextMeaningful(self: *Parser) Token.Tag {
-    var i = self.pos + 1;
-    while (i < self.tokens.len) : (i += 1) {
-        const tag = self.tokens[i].tag;
-        if (tag != .comment and tag != .newline) return tag;
-    }
-    return .eof;
-}
-
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("Scanner.zig");
 
@@ -472,7 +394,7 @@ fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
     const rules = try parser.parse();
-    if (parser.diagnostics_count != 0) return error.SyntaxError;
+    if (parser.diagnostics.count != 0) return error.SyntaxError;
     return .{ .parser = parser, .rules = rules };
 }
 

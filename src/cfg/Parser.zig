@@ -10,8 +10,21 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const Cfg = @import("../Cfg.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
+const parser_base = @import("../parser.zig");
+const Pool = @import("../pool.zig").Pool;
 
 const Parser = @This();
+
+const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{.newline}, .{
+    .name_tag = .identifier,
+    .def_tags = &.{.arrow},
+});
+const peek = primitives.peek;
+const advance = primitives.advance;
+const skipTrivia = primitives.skipTrivia;
+const peekNextMeaningful = primitives.peekNextMeaningful;
+const synchronize = primitives.synchronize;
+const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
 
@@ -19,6 +32,10 @@ pub const max_rules = 256;
 pub const max_prods = 1024;
 pub const max_symbols = 4096;
 pub const max_diagnostics = 64;
+
+/// Hash table bucket count — must be a power of 2 and > max_rules.
+const nt_hash_cap = 512;
+const nt_hash_empty: u32 = std.math.maxInt(u32);
 
 tokens: []const Token,
 source: []const u8,
@@ -28,17 +45,17 @@ pos: usize = 0,
 nts: [max_rules][]const u8 = undefined,
 nt_count: usize = 0,
 
+/// Open-addressing hash table: bucket → nonterminal index (nt_hash_empty = vacant).
+nt_hash: [nt_hash_cap]u32 = @splat(nt_hash_empty),
+
 /// Symbol pool shared across all productions.
-sym_pool: [max_symbols]Cfg.Symbol = undefined,
-sym_total: usize = 0,
+symbols: Pool(Cfg.Symbol, max_symbols) = .{},
 
 /// Parsed productions.
-prods: [max_prods]Cfg.Production = undefined,
-prod_count: usize = 0,
+prods: Pool(Cfg.Production, max_prods) = .{},
 
 /// Accumulated parse diagnostics.
-diagnostics_buf: [max_diagnostics]Diagnostic = undefined,
-diagnostics_count: usize = 0,
+diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
 
 pub fn init(tokens: []const Token, source: []const u8) Parser {
     return .{
@@ -51,26 +68,26 @@ pub fn init(tokens: []const Token, source: []const u8) Parser {
 ///
 /// Productions are grouped by LHS so that `Cfg.productionsFor` works.
 pub fn parse(self: *Parser) ParseError!Cfg {
-    self.skipNewlines();
+    self.skipTrivia();
     while (self.peek().tag != .eof) {
         self.parseRule() catch |err| switch (err) {
             error.SyntaxError => {
                 self.synchronize();
-                self.skipNewlines();
+                self.skipTrivia();
                 continue;
             },
             else => |e| return e,
         };
-        self.skipNewlines();
+        self.skipTrivia();
     }
 
-    if (self.prod_count == 0) return error.SyntaxError;
+    if (self.prods.count == 0) return error.SyntaxError;
 
     // Group productions by LHS.
     var sorted: [max_prods]Cfg.Production = undefined;
     var sorted_count: usize = 0;
     for (0..self.nt_count) |nt_id| {
-        for (self.prods[0..self.prod_count]) |prod| {
+        for (self.prods.slice()) |prod| {
             if (prod.lhs == @as(u32, @intCast(nt_id))) {
                 sorted[sorted_count] = prod;
                 sorted_count += 1;
@@ -86,10 +103,9 @@ pub fn parse(self: *Parser) ParseError!Cfg {
 }
 
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics_buf[0..self.diagnostics_count];
+    return self.diagnostics.slice();
 }
 
-// --- Grammar rules -----------------------------------------------------------
 
 /// rule = identifier "->" alternation
 fn parseRule(self: *Parser) ParseError!void {
@@ -100,7 +116,7 @@ fn parseRule(self: *Parser) ParseError!void {
     const name_tok = self.advance();
     const lhs_name = name_tok.lexeme(self.source);
 
-    self.skipNewlines();
+    self.skipTrivia();
     if (self.peek().tag != .arrow) {
         self.fail(.arrow, self.peek());
         return error.SyntaxError;
@@ -120,18 +136,16 @@ fn parseRule(self: *Parser) ParseError!void {
 
 /// Parse a sequence of symbols and append as a production.
 fn parseSequence(self: *Parser, lhs_id: u32) void {
-    const sym_start = self.sym_total;
+    const sym_start = self.symbols.count;
 
     while (isSymbolTag(self.peek().tag)) {
-        self.sym_pool[self.sym_total] = self.parseSymbol();
-        self.sym_total += 1;
+        _ = self.symbols.addOne(self.parseSymbol());
     }
 
-    self.prods[self.prod_count] = .{
+    _ = self.prods.addOne(.{
         .lhs = lhs_id,
-        .rhs = self.sym_pool[sym_start..self.sym_total],
-    };
-    self.prod_count += 1;
+        .rhs = self.symbols.items[sym_start..self.symbols.count],
+    });
 }
 
 fn parseSymbol(self: *Parser) Cfg.Symbol {
@@ -155,18 +169,23 @@ fn isSymbolTag(tag: Token.Tag) bool {
     };
 }
 
-// --- Nonterminal table -------------------------------------------------------
 
 fn findOrAddNt(self: *Parser, name: []const u8) u32 {
-    for (self.nts[0..self.nt_count], 0..) |nt, i| {
-        if (std.mem.eql(u8, nt, name)) return @intCast(i);
+    const mask = nt_hash_cap - 1;
+    var idx = std.hash.Wyhash.hash(0, name) & mask;
+    while (true) {
+        const slot = self.nt_hash[idx];
+        if (slot == nt_hash_empty) break;
+        if (std.mem.eql(u8, self.nts[slot], name)) return slot;
+        idx = (idx + 1) & mask;
     }
+    const id: u32 = @intCast(self.nt_count);
     self.nts[self.nt_count] = name;
     self.nt_count += 1;
-    return @intCast(self.nt_count - 1);
+    self.nt_hash[idx] = id;
+    return id;
 }
 
-// --- Lexeme helpers ----------------------------------------------------------
 
 /// `"text"` → `text`
 fn stripQuotes(lex: []const u8) []const u8 {
@@ -208,55 +227,7 @@ fn parseHex(s: []const u8) u8 {
     return @intCast(result & 0xFF);
 }
 
-// --- Diagnostics -------------------------------------------------------------
 
-fn fail(self: *Parser, expected: Diagnostic.Expected, tok: Token) void {
-    self.diagnostics_buf[self.diagnostics_count] = .{
-        .expected = expected,
-        .found_tag = tok.tag,
-        .found_start = tok.start,
-        .found_len = tok.len,
-        .line = tok.line,
-    };
-    self.diagnostics_count += 1;
-}
-
-// --- Helpers -----------------------------------------------------------------
-
-fn peek(self: *Parser) Token {
-    return self.tokens[self.pos];
-}
-
-fn advance(self: *Parser) Token {
-    const tok = self.tokens[self.pos];
-    self.pos += 1;
-    return tok;
-}
-
-fn skipNewlines(self: *Parser) void {
-    while (self.peek().tag == .newline) self.pos += 1;
-}
-
-fn synchronize(self: *Parser) void {
-    while (self.peek().tag != .eof) {
-        if (self.peek().tag == .identifier) {
-            const next = self.peekNextMeaningful();
-            if (next == .arrow) return;
-        }
-        self.pos += 1;
-    }
-}
-
-fn peekNextMeaningful(self: *Parser) Token.Tag {
-    var i = self.pos + 1;
-    while (i < self.tokens.len) : (i += 1) {
-        const tag = self.tokens[i].tag;
-        if (tag != .newline) return tag;
-    }
-    return .eof;
-}
-
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("Scanner.zig");
 
@@ -265,7 +236,7 @@ fn parseSource(source: []const u8) ParseError!struct { parser: Parser, cfg: Cfg 
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
     const cfg = try parser.parse();
-    if (parser.diagnostics_count != 0) return error.SyntaxError;
+    if (parser.diagnostics.count != 0) return error.SyntaxError;
     return .{ .parser = parser, .cfg = cfg };
 }
 

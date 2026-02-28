@@ -49,7 +49,7 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
                     // Skip past the original rule tokens to find an
                     // optional trailing comment on the same logical line.
                     tok_idx += 1; // skip rulename
-                    tok_idx = skipRuleTokens(tokens, tok_idx);
+                    tok_idx = Token.skipBodyTokens(tokens, tok_idx, isRuleStart);
 
                     // Emit any trailing comment on this rule's line.
                     if (tok_idx < tokens.len and tokens[tok_idx].tag == .comment) {
@@ -74,45 +74,13 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
     }
 }
 
-/// Advance past all tokens that belong to a rule body (everything up to
-/// but not including the next comment, newline that isn't a continuation,
-/// or eof). A newline is a continuation if it's followed by non-trivia
-/// tokens that don't start a new rule.
-fn skipRuleTokens(tokens: []const Token, start: usize) usize {
-    var i = start;
-    while (i < tokens.len) {
-        const tag = tokens[i].tag;
-        switch (tag) {
-            .eof => return i,
-            .comment => return i,
-            .newline => {
-                // Check if this newline is a continuation (next meaningful
-                // token is part of the current rule, not a new rule).
-                const next = nextMeaningful(tokens, i + 1);
-                if (next >= tokens.len or tokens[next].tag == .eof) return i;
-                if (tokens[next].tag == .rulename) {
-                    // A rulename followed by = or =/ starts a new rule.
-                    const after = nextMeaningful(tokens, next + 1);
-                    if (after < tokens.len and
-                        (tokens[after].tag == .equals or tokens[after].tag == .equals_slash))
-                        return i;
-                }
-                // Continuation line — skip the newline and keep going.
-                i += 1;
-            },
-            else => i += 1,
-        }
-    }
-    return i;
-}
-
-/// Index of the next non-trivia token at or after `start`.
-fn nextMeaningful(tokens: []const Token, start: usize) usize {
-    var i = start;
-    while (i < tokens.len) : (i += 1) {
-        if (tokens[i].tag != .comment and tokens[i].tag != .newline) return i;
-    }
-    return i;
+/// True when the token at `idx` begins a new rule (rulename followed by
+/// `=` or `=/`).
+fn isRuleStart(tokens: []const Token, idx: usize) bool {
+    if (tokens[idx].tag != .rulename) return false;
+    const after = Token.nextMeaningful(tokens, idx + 1);
+    return after < tokens.len and
+        (tokens[after].tag == .equals or tokens[after].tag == .equals_slash);
 }
 
 /// Format a complete grammar from only the AST (no comment preservation).
@@ -240,7 +208,6 @@ fn writeHex(writer: anytype, byte: u8) !void {
     try writer.writeByte(hex_digits[byte & 0x0F]);
 }
 
-// --- Tests -------------------------------------------------------------------
 
 const Scanner = @import("Scanner.zig");
 const Parser = @import("Parser.zig");

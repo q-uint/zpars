@@ -54,7 +54,6 @@ pub fn build(b: *CnfBuilder) Cfg {
     return b.result();
 }
 
-// -- Helpers ------------------------------------------------------------------
 
 /// Append a production, copying its RHS symbols into the pool.
 fn addProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) void {
@@ -95,7 +94,6 @@ fn hasProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) bool {
     return false;
 }
 
-// -- Step 1: START ------------------------------------------------------------
 
 /// If the start symbol appears on any RHS, introduce a fresh S0 → S.
 fn startStep(b: *CnfBuilder) void {
@@ -124,7 +122,6 @@ fn startStep(b: *CnfBuilder) void {
     }
 }
 
-// -- Step 2: DEL (ε-elimination) ----------------------------------------------
 
 /// Remove ε-productions and propagate nullable combinations.
 ///
@@ -240,7 +237,6 @@ fn delStep(b: *CnfBuilder) void {
     }
 }
 
-// -- Step 3: UNIT (unit production elimination) -------------------------------
 
 /// Remove unit productions `A → B` by copying B's non-unit productions to A.
 ///
@@ -319,7 +315,6 @@ fn unitStep(b: *CnfBuilder) void {
     }
 }
 
-// -- Step 4: TERM (terminal isolation) ----------------------------------------
 
 /// In productions with |rhs| ≥ 2, replace each terminal `a` with a fresh
 /// nonterminal `T_a → a` so that long productions contain only nonterminals.
@@ -407,7 +402,6 @@ fn proxyName(t: Cfg.Terminal) []const u8 {
     };
 }
 
-// -- Step 5: BIN (binarization) -----------------------------------------------
 
 /// Break productions with |rhs| > 2 into chains of binary productions.
 ///
@@ -462,7 +456,6 @@ fn binStep(b: *CnfBuilder) void {
     }
 }
 
-// -- Result -------------------------------------------------------------------
 
 /// Produce the final Cfg with productions grouped by LHS.
 /// The start symbol's productions come first.
@@ -495,7 +488,6 @@ fn result(b: *CnfBuilder) Cfg {
     };
 }
 
-// -- Tests --------------------------------------------------------------------
 
 fn expectCnf(comptime source: []const u8, comptime expected: []const u8) !void {
     const cnf = comptime blk: {

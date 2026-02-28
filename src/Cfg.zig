@@ -118,7 +118,6 @@ pub fn format(self: Cfg, comptime _: []const u8, _: std.fmt.FormatOptions, write
     }
 }
 
-// --- Comptime parser ---------------------------------------------------------
 
 const Scanner = @import("cfg/Scanner.zig");
 const Parser = @import("cfg/Parser.zig");
@@ -154,7 +153,6 @@ pub fn parse(comptime source: []const u8) Cfg {
     }
 }
 
-// --- CNF conversion ----------------------------------------------------------
 
 const CnfBuilder = @import("cfg/CnfBuilder.zig");
 
@@ -179,7 +177,6 @@ pub fn toCnf(comptime self: Cfg) Cfg {
     }
 }
 
-// --- Tests -------------------------------------------------------------------
 
 test "basic construction and name lookup" {
     const cfg = Cfg{
@@ -277,7 +274,6 @@ test "format produces readable output" {
     try std.testing.expectEqualStrings("A → ε", fbs.getWritten());
 }
 
-// --- parse() tests -----------------------------------------------------------
 
 test "parse: basic nonterminal and string terminal" {
     const cfg = comptime Cfg.parse(
