@@ -51,6 +51,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // --- LSP server ---
+    const lsp_step = b.step("lsp", "Build the LSP server");
+    const lsp_exe = b.addExecutable(.{
+        .name = "zpars-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsp.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpars", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(lsp_exe);
+    lsp_step.dependOn(b.getInstallStep());
+
+    // --- Vim syntax files ---
+    const vim_step = b.step("vim", "Generate Vim syntax files");
+    const vim_exe = b.addExecutable(.{
+        .name = "zpars-vim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vim.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const vim_run = b.addRunArtifact(vim_exe);
+    if (b.args) |args| {
+        vim_run.addArgs(args);
+    }
+    vim_step.dependOn(&vim_run.step);
+
     // --- WASM target for the Open VSX extension ---
     const wasm_step = b.step("wasm", "Build WASM module for the Open VSX extension");
     const wasm_lib = b.addExecutable(.{
