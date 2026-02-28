@@ -11,11 +11,11 @@ const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .commen
     .name_tag = .rulename,
     .def_tags = &.{ .equals, .equals_slash },
 });
-const peek = primitives.peek;
+pub const peek = primitives.peek;
 const advance = primitives.advance;
-const skipTrivia = primitives.skipTrivia;
-const peekNextMeaningful = primitives.peekNextMeaningful;
-const synchronize = primitives.synchronize;
+pub const skipTrivia = primitives.skipTrivia;
+pub const peekNextMeaningful = primitives.peekNextMeaningful;
+pub const synchronize = primitives.synchronize;
 const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow, InvalidCharacter };
@@ -71,7 +71,6 @@ pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
     return self.diagnostics.slice();
 }
-
 
 /// rule = rulename ("=" / "=/") alternation
 fn parseRule(self: *Parser) ParseError!Ast.Rule {
@@ -233,7 +232,6 @@ fn parseOption(self: *Parser) ParseError!Ast.Node {
     return .{ .repetition = .{ .min = 0, .max = 1, .element = ptr } };
 }
 
-
 fn parseNumVal(self: *Parser) !Ast.NumVal {
     const lex = self.advance().lexeme(self.source);
     const base: u8 = switch (lex[1]) {
@@ -264,7 +262,6 @@ fn parseNumVal(self: *Parser) !Ast.NumVal {
 
     return .{ .single = try std.fmt.parseInt(u8, digits, base) };
 }
-
 
 fn parseNumber(self: *Parser) !usize {
     return std.fmt.parseInt(usize, self.advance().lexeme(self.source), 10);
@@ -299,7 +296,6 @@ fn isAtRepetition(self: *Parser) bool {
         else => false,
     };
 }
-
 
 const Scanner = @import("Scanner.zig");
 
@@ -440,7 +436,6 @@ test "diagnostic: missing closing paren" {
 test "diagnostic: missing closing bracket" {
     try expectSyntaxError("foo = [bar", .right_bracket, .eof);
 }
-
 
 test "recovery: error in first rule, second rule parsed" {
     var scanner = Scanner.init("foo = )\nbar = baz");

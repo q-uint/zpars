@@ -48,26 +48,26 @@ pub const table: [256]CharFlags = blk: {
     break :blk t;
 };
 
-pub inline fn isAlpha(c: u8) bool {
+pub fn isAlpha(c: u8) bool {
     return table[c].alpha;
 }
 
-pub inline fn isDigit(c: u8) bool {
+pub fn isDigit(c: u8) bool {
     return table[c].digit;
 }
 
-pub inline fn isHexDigit(c: u8) bool {
+pub fn isHexDigit(c: u8) bool {
     return table[c].hex;
 }
 
-pub inline fn isBit(c: u8) bool {
+pub fn isBit(c: u8) bool {
     return table[c].bit;
 }
 
-pub inline fn isIdentStart(c: u8) bool {
+pub fn isIdentStart(c: u8) bool {
     return table[c].ident_start;
 }
 
-pub inline fn isIdentCont(c: u8) bool {
+pub fn isIdentCont(c: u8) bool {
     return table[c].ident_cont;
 }

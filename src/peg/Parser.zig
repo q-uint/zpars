@@ -23,11 +23,11 @@ const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .commen
     .name_tag = .identifier,
     .def_tags = &.{.left_arrow},
 });
-const peek = primitives.peek;
+pub const peek = primitives.peek;
 const advance = primitives.advance;
-const skipTrivia = primitives.skipTrivia;
-const peekNextMeaningful = primitives.peekNextMeaningful;
-const synchronize = primitives.synchronize;
+pub const skipTrivia = primitives.skipTrivia;
+pub const peekNextMeaningful = primitives.peekNextMeaningful;
+pub const synchronize = primitives.synchronize;
 const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
@@ -87,7 +87,6 @@ pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
     return self.diagnostics.slice();
 }
-
 
 /// Definition <- Identifier LEFTARROW Expression
 fn parseDefinition(self: *Parser) ParseError!Ast.Rule {
@@ -226,7 +225,6 @@ fn parsePrimary(self: *Parser) ParseError!Ast.Node {
     };
 }
 
-
 fn parseLiteral(self: *Parser) Ast.Node {
     const lex = self.advance().lexeme(self.source);
     // Strip surrounding quotes, decode escapes.
@@ -307,7 +305,6 @@ fn isOctalDigit(c: u8) bool {
     return c >= '0' and c <= '7';
 }
 
-
 fn parseCharClass(self: *Parser) Ast.Node {
     const lex = self.advance().lexeme(self.source);
     // Strip surrounding brackets: [content]
@@ -364,7 +361,6 @@ fn decodeClassChar(self: *Parser, raw: []const u8, i: *usize) ?u8 {
     return c;
 }
 
-
 /// Can the current position start a Prefix?
 fn isAtPrefix(self: *Parser) bool {
     return switch (self.peek().tag) {
@@ -385,7 +381,6 @@ fn isAtPrimary(self: *Parser) bool {
         else => false,
     };
 }
-
 
 const Scanner = @import("Scanner.zig");
 

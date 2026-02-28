@@ -66,7 +66,6 @@ pub fn Diagnostic(comptime ExpectedType: type, comptime FoundTagType: type) type
     };
 }
 
-
 const std = @import("std");
 
 const TestExpected = enum { element, rulename };

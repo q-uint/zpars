@@ -18,11 +18,11 @@ const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{.newline
     .name_tag = .rulename,
     .def_tags = &.{.definition},
 });
-const peek = primitives.peek;
+pub const peek = primitives.peek;
 const advance = primitives.advance;
-const skipTrivia = primitives.skipTrivia;
-const peekNextMeaningful = primitives.peekNextMeaningful;
-const synchronize = primitives.synchronize;
+pub const skipTrivia = primitives.skipTrivia;
+pub const peekNextMeaningful = primitives.peekNextMeaningful;
+pub const synchronize = primitives.synchronize;
 const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
@@ -74,7 +74,6 @@ pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
 pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
     return self.diagnostics.slice();
 }
-
 
 /// rule = rulename "::=" alternation
 fn parseRule(self: *Parser) ParseError!Ast.Rule {
@@ -149,7 +148,6 @@ fn parseElement(self: *Parser) Ast.Node {
     };
 }
 
-
 /// Can the current position start an element?
 fn isAtElement(self: *Parser) bool {
     return switch (self.peek().tag) {
@@ -162,7 +160,6 @@ fn isAtElement(self: *Parser) bool {
         else => false,
     };
 }
-
 
 const Scanner = @import("Scanner.zig");
 

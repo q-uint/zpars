@@ -53,7 +53,6 @@ pub fn formatNode(node: Ast.Node, writer: anytype) anyerror!void {
     }
 }
 
-
 const Scanner = @import("Scanner.zig");
 const Parser = @import("Parser.zig");
 

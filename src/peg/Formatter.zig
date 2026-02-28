@@ -213,14 +213,11 @@ fn writeClassChar(c: u8, writer: anytype) !void {
     }
 }
 
-
 fn isDefinitionStart(tokens: []const Token, idx: usize) bool {
     if (tokens[idx].tag != .identifier) return false;
     const after = Token.nextMeaningful(tokens, idx + 1);
     return after < tokens.len and tokens[after].tag == .left_arrow;
 }
-
-
 
 const Scanner = @import("Scanner.zig");
 const PegParser = @import("Parser.zig");

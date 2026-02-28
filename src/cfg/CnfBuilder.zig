@@ -54,7 +54,6 @@ pub fn build(b: *CnfBuilder) Cfg {
     return b.result();
 }
 
-
 /// Append a production, copying its RHS symbols into the pool.
 fn addProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) void {
     const sym_start = b.sym_total;
@@ -94,7 +93,6 @@ fn hasProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) bool {
     return false;
 }
 
-
 /// If the start symbol appears on any RHS, introduce a fresh S0 → S.
 fn startStep(b: *CnfBuilder) void {
     for (b.prods[0..b.prod_count]) |prod| {
@@ -121,7 +119,6 @@ fn startStep(b: *CnfBuilder) void {
         }
     }
 }
-
 
 /// Remove ε-productions and propagate nullable combinations.
 ///
@@ -237,7 +234,6 @@ fn delStep(b: *CnfBuilder) void {
     }
 }
 
-
 /// Remove unit productions `A → B` by copying B's non-unit productions to A.
 ///
 /// A unit production is one whose RHS is a single nonterminal.
@@ -314,7 +310,6 @@ fn unitStep(b: *CnfBuilder) void {
         }
     }
 }
-
 
 /// In productions with |rhs| ≥ 2, replace each terminal `a` with a fresh
 /// nonterminal `T_a → a` so that long productions contain only nonterminals.
@@ -402,7 +397,6 @@ fn proxyName(t: Cfg.Terminal) []const u8 {
     };
 }
 
-
 /// Break productions with |rhs| > 2 into chains of binary productions.
 ///
 /// `A → B C D` becomes `A → B X0`, `X0 → C D`.
@@ -456,7 +450,6 @@ fn binStep(b: *CnfBuilder) void {
     }
 }
 
-
 /// Produce the final Cfg with productions grouped by LHS.
 /// The start symbol's productions come first.
 fn result(b: *CnfBuilder) Cfg {
@@ -487,7 +480,6 @@ fn result(b: *CnfBuilder) Cfg {
         .start = b.start,
     };
 }
-
 
 fn expectCnf(comptime source: []const u8, comptime expected: []const u8) !void {
     const cnf = comptime blk: {

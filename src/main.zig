@@ -48,14 +48,32 @@ fn detectFormat(filename: []const u8) Format {
     return .abnf;
 }
 
-/// Parsed grammar: format-independent representation after scanning + parsing.
-const ParsedGrammar = struct {
-    rules: []const zpars.Ast.Rule,
-    // For the formatter we need the token stream — store both variants.
-    abnf_tokens: ?[]const zpars.abnf.Token.Token = null,
-    peg_tokens: ?[]const zpars.peg.Token.Token = null,
-};
+fn ParseResult(comptime Scanner: type) type {
+    return struct {
+        rules: []const zpars.Ast.Rule,
+        tokens: @typeInfo(@TypeOf(Scanner.scanTokens)).@"fn".return_type.?,
+    };
+}
 
+fn parseGrammar(
+    comptime Scanner: type,
+    comptime Parser: type,
+    source: []const u8,
+    filename: []const u8,
+    stderr: anytype,
+) !ParseResult(Scanner) {
+    var scanner = Scanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, source);
+    const rules = try parser.parse();
+    const diags = parser.getDiagnostics();
+    if (diags.len > 0) {
+        for (diags) |diag| diag.format(source, filename, stderr) catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    }
+    return .{ .rules = rules, .tokens = tokens };
+}
 
 fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
@@ -72,32 +90,8 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const stderr = &stderr_writer.interface;
 
     const rules = switch (detectFormat(filename)) {
-        .abnf => blk: {
-            var scanner = zpars.abnf.Scanner.init(source);
-            const tokens = scanner.scanTokens();
-            var parser = zpars.abnf.Parser.init(tokens, source);
-            const rules = try parser.parse();
-            const diags = parser.getDiagnostics();
-            if (diags.len > 0) {
-                for (diags) |diag| diag.format(source, filename, stderr) catch {};
-                stderr.flush() catch {};
-                std.process.exit(1);
-            }
-            break :blk rules;
-        },
-        .peg => blk: {
-            var scanner = zpars.peg.Scanner.init(source);
-            const tokens = scanner.scanTokens();
-            var parser = zpars.peg.Parser.init(tokens, source);
-            const rules = try parser.parse();
-            const diags = parser.getDiagnostics();
-            if (diags.len > 0) {
-                for (diags) |diag| diag.format(source, filename, stderr) catch {};
-                stderr.flush() catch {};
-                std.process.exit(1);
-            }
-            break :blk rules;
-        },
+        .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename, stderr)).rules,
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -112,7 +106,6 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     stderr.flush() catch {};
 }
-
 
 fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
@@ -134,39 +127,20 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     switch (detectFormat(filename)) {
         .abnf => {
-            var scanner = zpars.abnf.Scanner.init(source);
-            const tokens = scanner.scanTokens();
-            var parser = zpars.abnf.Parser.init(tokens, source);
-            const rules = try parser.parse();
-            const diags = parser.getDiagnostics();
-            if (diags.len > 0) {
-                for (diags) |diag| diag.format(source, filename, stderr) catch {};
-                stderr.flush() catch {};
-                std.process.exit(1);
-            }
-            zpars.abnf.Formatter.formatGrammar(rules, tokens, source, stdout) catch {
+            const r = try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename, stderr);
+            zpars.abnf.Formatter.formatGrammar(r.rules, r.tokens, source, stdout) catch {
                 std.process.exit(1);
             };
         },
         .peg => {
-            var scanner = zpars.peg.Scanner.init(source);
-            const tokens = scanner.scanTokens();
-            var parser = zpars.peg.Parser.init(tokens, source);
-            const rules = try parser.parse();
-            const diags = parser.getDiagnostics();
-            if (diags.len > 0) {
-                for (diags) |diag| diag.format(source, filename, stderr) catch {};
-                stderr.flush() catch {};
-                std.process.exit(1);
-            }
-            zpars.peg.Formatter.formatGrammar(rules, tokens, source, stdout) catch {
+            const r = try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename, stderr);
+            zpars.peg.Formatter.formatGrammar(r.rules, r.tokens, source, stdout) catch {
                 std.process.exit(1);
             };
         },
     }
     try stdout.flush();
 }
-
 
 fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var rule_name: ?[]const u8 = null;
@@ -202,32 +176,8 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const stderr = &stderr_writer.interface;
 
     const rules = switch (detectFormat(filename.?)) {
-        .abnf => blk: {
-            var scanner = zpars.abnf.Scanner.init(source);
-            const tokens = scanner.scanTokens();
-            var parser = zpars.abnf.Parser.init(tokens, source);
-            const rules = try parser.parse();
-            const diags = parser.getDiagnostics();
-            if (diags.len > 0) {
-                for (diags) |diag| diag.format(source, filename.?, stderr) catch {};
-                stderr.flush() catch {};
-                std.process.exit(1);
-            }
-            break :blk rules;
-        },
-        .peg => blk: {
-            var scanner = zpars.peg.Scanner.init(source);
-            const tokens = scanner.scanTokens();
-            var parser = zpars.peg.Parser.init(tokens, source);
-            const rules = try parser.parse();
-            const diags = parser.getDiagnostics();
-            if (diags.len > 0) {
-                for (diags) |diag| diag.format(source, filename.?, stderr) catch {};
-                stderr.flush() catch {};
-                std.process.exit(1);
-            }
-            break :blk rules;
-        },
+        .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -255,7 +205,6 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.print("{s}\n", .{result.value});
     try stdout.flush();
 }
-
 
 fn readSource(allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {
     return std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024);

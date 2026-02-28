@@ -182,7 +182,6 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
     return merged_rules;
 }
 
-
 fn mergeAlternation(self: *Validator, a: Ast.Node, b: Ast.Node) !Ast.Node {
     var alts: std.ArrayList(Ast.Node) = .empty;
 
@@ -277,7 +276,6 @@ fn isProductive(
         .not_predicate => |inner| isProductive(undefined, inner.*, merged_rules, name_index, productive),
     };
 }
-
 
 const Scanner = @import("abnf/Scanner.zig");
 const Parser = @import("abnf/Parser.zig");

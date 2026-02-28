@@ -58,7 +58,6 @@ pub fn match(self: *const Matcher, rule_name: []const u8, input: []const u8) ?Re
     return self.matchRulename(rule_name, input, 0);
 }
 
-
 fn matchNode(self: *const Matcher, node: Ast.Node, input: []const u8, depth: usize) ?Result {
     if (depth > max_depth) return null;
 
@@ -267,7 +266,6 @@ fn isVchar(c: u8) bool {
 fn isWsp(c: u8) bool {
     return c == 0x20 or c == 0x09;
 }
-
 
 const Scanner = @import("abnf/Scanner.zig");
 const Parser = @import("abnf/Parser.zig");

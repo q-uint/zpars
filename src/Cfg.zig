@@ -118,7 +118,6 @@ pub fn format(self: Cfg, comptime _: []const u8, _: std.fmt.FormatOptions, write
     }
 }
 
-
 const Scanner = @import("cfg/Scanner.zig");
 const Parser = @import("cfg/Parser.zig");
 
@@ -153,7 +152,6 @@ pub fn parse(comptime source: []const u8) Cfg {
     }
 }
 
-
 const CnfBuilder = @import("cfg/CnfBuilder.zig");
 
 /// Convert this grammar to Chomsky Normal Form at compile time.
@@ -176,7 +174,6 @@ pub fn toCnf(comptime self: Cfg) Cfg {
         return b.build();
     }
 }
-
 
 test "basic construction and name lookup" {
     const cfg = Cfg{
@@ -273,7 +270,6 @@ test "format produces readable output" {
     try cfg.formatProduction(cfg.productions[2], fbs.writer());
     try std.testing.expectEqualStrings("A → ε", fbs.getWritten());
 }
-
 
 test "parse: basic nonterminal and string terminal" {
     const cfg = comptime Cfg.parse(

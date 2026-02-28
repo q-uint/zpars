@@ -208,7 +208,6 @@ fn writeHex(writer: anytype, byte: u8) !void {
     try writer.writeByte(hex_digits[byte & 0x0F]);
 }
 
-
 const Scanner = @import("Scanner.zig");
 const Parser = @import("Parser.zig");
 

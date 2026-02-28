@@ -28,7 +28,6 @@ pub fn Compile(comptime grammar: []const u8, comptime start_rule: []const u8) ty
     }
 }
 
-
 fn compileNode(comptime node: Ast.Node, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     return switch (node) {
         .char_val => |cv| if (cv.case_sensitive)
@@ -94,7 +93,6 @@ fn compileByteSeqInner(comptime bytes: []const u8) type {
     return c.Sequence(c.ByteLiteral(bytes[0]), compileByteSeqInner(bytes[1..]));
 }
 
-
 fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     // Cycle detection.
     inline for (visited) |v| {
@@ -140,7 +138,6 @@ fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, 
     return compileAlts(matching[0..count], rules, new_visited);
 }
 
-
 fn eqlIgnoreCase(comptime a: []const u8, comptime b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ac, bc| {
@@ -150,7 +147,6 @@ fn eqlIgnoreCase(comptime a: []const u8, comptime b: []const u8) bool {
     }
     return true;
 }
-
 
 test "single char_val rule (case-insensitive)" {
     const P = Compile("greeting = \"hello\"", "greeting");

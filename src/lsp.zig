@@ -417,7 +417,6 @@ const Server = struct {
         source: []const u8,
         arena: Allocator,
     ) ![]const DiagInfo {
-
         if (source.len == 0) return &.{};
 
         var scanner = Scanner.init(source);

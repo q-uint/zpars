@@ -19,11 +19,11 @@ const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{.newline
     .name_tag = .identifier,
     .def_tags = &.{.arrow},
 });
-const peek = primitives.peek;
+pub const peek = primitives.peek;
 const advance = primitives.advance;
-const skipTrivia = primitives.skipTrivia;
-const peekNextMeaningful = primitives.peekNextMeaningful;
-const synchronize = primitives.synchronize;
+pub const skipTrivia = primitives.skipTrivia;
+pub const peekNextMeaningful = primitives.peekNextMeaningful;
+pub const synchronize = primitives.synchronize;
 const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
@@ -106,7 +106,6 @@ pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
     return self.diagnostics.slice();
 }
 
-
 /// rule = identifier "->" alternation
 fn parseRule(self: *Parser) ParseError!void {
     if (self.peek().tag != .identifier) {
@@ -169,7 +168,6 @@ fn isSymbolTag(tag: Token.Tag) bool {
     };
 }
 
-
 fn findOrAddNt(self: *Parser, name: []const u8) u32 {
     const mask = nt_hash_cap - 1;
     var idx = std.hash.Wyhash.hash(0, name) & mask;
@@ -185,7 +183,6 @@ fn findOrAddNt(self: *Parser, name: []const u8) u32 {
     self.nt_hash[idx] = id;
     return id;
 }
-
 
 /// `"text"` → `text`
 fn stripQuotes(lex: []const u8) []const u8 {
@@ -226,8 +223,6 @@ fn parseHex(s: []const u8) u8 {
     }
     return @intCast(result & 0xFF);
 }
-
-
 
 const Scanner = @import("Scanner.zig");
 
