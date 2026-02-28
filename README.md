@@ -147,3 +147,5 @@ zig build vsx                  # build the Open VSX extension (WASM + TypeScript
 - [RFC 5234 — Augmented BNF for Syntax Specifications: ABNF](https://www.rfc-editor.org/rfc/rfc5234)
 - [RFC 7405 — Case-Sensitive String Support in ABNF](https://www.rfc-editor.org/rfc/rfc7405)
 - [Report on the Algorithmic Language ALGOL 60 (1960)](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) — original BNF definition (Section 1.1)
+- [Parsing Expression Grammars: A Recognition-Based Syntactic Foundation (2004)](https://bford.info/pub/lang/peg.pdf) — Bryan Ford's PEG paper
+- [RFC 9804 — S-Expressions](https://www.rfc-editor.org/rfc/rfc9804)

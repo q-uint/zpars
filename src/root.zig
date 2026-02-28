@@ -28,6 +28,7 @@ pub const cfg = struct {
     pub const Scanner = @import("cfg/Scanner.zig");
     pub const Token = @import("cfg/Token.zig");
 };
+pub const sexp = @import("sexp.zig");
 pub const Ast = @import("Ast.zig");
 pub const Cfg = @import("Cfg.zig");
 pub const Matcher = @import("Matcher.zig");
