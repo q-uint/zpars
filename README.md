@@ -1,16 +1,25 @@
-# zpars
-
-A grammar parser toolkit written in Zig, supporting [ABNF](https://www.rfc-editor.org/rfc/rfc5234) (RFC 5234, RFC 7405) and [BNF](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) (ALGOL 60) with comptime parser combinators.
+<p align="center">
+  <img src="icon.png" width="128" height="128" alt="zpars logo">
+  <h1 align="center">zpars</h1>
+  <p align="center">
+    A grammar parser toolkit written in Zig — ABNF, BNF, PEG, CFG, and S-expressions<br>
+    with comptime parser combinators and zero-overhead compiled grammars.
+  </p>
+  <p align="center">
+    <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/zig-0.15.2+-f7a41d?logo=zig&logoColor=white" alt="Zig 0.15.2+"></a>
+    <a href="https://open-vsx.org/extension/q-uint/zpars"><img src="https://img.shields.io/open-vsx/v/q-uint/zpars?color=c160ef" alt="Open VSX"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-blue" alt="License: MPL-2.0"></a>
+  </p>
+</p>
 
 ## Features
 
-- **ABNF Parser** — Tokenizes and parses ABNF grammars into an AST, with structured error diagnostics and error recovery on malformed input.
-- **BNF Parser** — Tokenizes and parses BNF grammars (ALGOL 60 variant) into the same shared AST.
-- **Grammar Validator** — Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
-- **Runtime Matcher** — Match input strings against any rule in a dynamically loaded grammar.
-- **Formatter** — Pretty-print parsed grammars back to canonical ABNF or BNF with aligned operators.
-- **Comptime Combinators** — Zero-overhead parser combinator library resolved entirely at comptime.
-- **ABNF-to-Combinator Compiler** — Compile ABNF grammar strings into combinator types at comptime. Define your grammar in standard ABNF and get a parser for free.
+- **Multi-format parsing** — ABNF, BNF, PEG, CFG, and S-expression grammars, each with tokenizer, parser, and error diagnostics.
+- **Validation** — Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
+- **Runtime matching** — Match input strings against any rule in a dynamically loaded grammar.
+- **Formatting** — Pretty-print grammars back to canonical form with aligned operators.
+- **Comptime combinators** — Zero-overhead parser combinator library resolved entirely at comptime.
+- **ABNF compiler** — Compile ABNF grammar strings into combinator types at comptime — define your grammar in standard ABNF and get a parser for free.
 
 ## Comptime ABNF Compiler
 
@@ -128,7 +137,7 @@ HTTP/1.1
 
 ## Editor Support
 
-The [VSCode extension](https://open-vsx.org/extension/q-uint/zpars) provides semantic highlighting for ABNF, BNF, PEG, and CFG grammars, powered by the zpars WASM build.
+The [VSCode extension](https://open-vsx.org/extension/q-uint/zpars) provides semantic highlighting for ABNF, BNF, PEG, CFG, and S-expression grammars, powered by the zpars WASM build.
 
 Install from [Open VSX](https://open-vsx.org/extension/q-uint/zpars).
 

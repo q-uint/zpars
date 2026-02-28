@@ -3,6 +3,7 @@
   "displayName": "zpars",
   "description": "Syntax highlighting for ABNF, BNF, PEG, CFG, and S-expression formats powered by Zig",
   "version": "0.0.2",
+  "icon": "icon.png",
   "publisher": "q-uint",
   "repository": {
     "type": "git",
