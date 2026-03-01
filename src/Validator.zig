@@ -205,7 +205,7 @@ fn collectRefs(self: *Validator, node: Ast.Node, refs: *CiHashMap(void)) !void {
         .repetition => |rep| try self.collectRefs(rep.element.*, refs),
         .and_predicate => |inner| try self.collectRefs(inner.*, refs),
         .not_predicate => |inner| try self.collectRefs(inner.*, refs),
-        .char_val, .num_val, .prose_val, .char_class, .any => {},
+        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => {},
     }
 }
 
@@ -229,7 +229,7 @@ fn nodeReferences(node: Ast.Node, name: []const u8) bool {
         .repetition => |rep| nodeReferences(rep.element.*, name),
         .and_predicate => |inner| nodeReferences(inner.*, name),
         .not_predicate => |inner| nodeReferences(inner.*, name),
-        .char_val, .num_val, .prose_val, .char_class, .any => false,
+        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => false,
     };
 }
 
@@ -249,7 +249,7 @@ fn isProductive(
 ) bool {
     _ = self;
     return switch (node) {
-        .char_val, .num_val, .prose_val, .char_class, .any => true,
+        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => true,
         .rulename => |name| {
             if (isCoreRule(name)) return true;
             if (name_index.get(name)) |idx| return productive[idx];

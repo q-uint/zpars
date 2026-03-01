@@ -2,7 +2,7 @@
   <img src="icon.png" width="128" height="128" alt="zpars logo">
   <h1 align="center">zpars</h1>
   <p align="center">
-    A grammar parser toolkit written in Zig — ABNF, BNF, PEG, CFG, and S-expressions<br>
+    A grammar parser toolkit written in Zig — ABNF, BNF, PEG, CFG, ERE, and S-expressions<br>
     with comptime parser combinators and zero-overhead compiled grammars.
   </p>
   <p align="center">
@@ -14,7 +14,7 @@
 
 ## Features
 
-- **Multi-format parsing** — ABNF, BNF, PEG, CFG, and S-expression grammars, each with tokenizer, parser, and error diagnostics.
+- **Multi-format parsing** — ABNF, BNF, PEG, CFG, ERE, and S-expression grammars, each with tokenizer, parser, and error diagnostics.
 - **Validation** — Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
 - **Runtime matching** — Match input strings against any rule in a dynamically loaded grammar.
 - **Formatting** — Pretty-print grammars back to canonical form with aligned operators.
@@ -157,4 +157,5 @@ zig build vsx                  # build the Open VSX extension (WASM + TypeScript
 - [RFC 7405 — Case-Sensitive String Support in ABNF](https://www.rfc-editor.org/rfc/rfc7405)
 - [Report on the Algorithmic Language ALGOL 60 (1960)](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) — original BNF definition (Section 1.1)
 - [Parsing Expression Grammars: A Recognition-Based Syntactic Foundation (2004)](https://bford.info/pub/lang/peg.pdf) — Bryan Ford's PEG paper
+- [IEEE Std 1003.1 — Extended Regular Expressions (ERE)](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html) — POSIX ERE specification (Section 9.4)
 - [RFC 9804 — S-Expressions](https://www.rfc-editor.org/rfc/rfc9804)

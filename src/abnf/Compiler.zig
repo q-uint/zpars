@@ -54,8 +54,8 @@ fn compileNode(comptime node: Ast.Node, comptime rules: []const Ast.Rule, compti
 
         .prose_val => @compileError("prose-val cannot be compiled to a parser"),
 
-        // PEG-only nodes — cannot appear in an ABNF-parsed AST.
-        .and_predicate, .not_predicate, .char_class, .any => @compileError("PEG nodes cannot be compiled by ABNF compiler"),
+        // Nodes not produced by the ABNF parser.
+        .and_predicate, .not_predicate, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => @compileError("non-ABNF nodes cannot be compiled by ABNF compiler"),
     };
 }
 

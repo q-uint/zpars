@@ -36,15 +36,16 @@ fn printUsage() void {
         \\  fmt   <file>                       Format a grammar
         \\  match -r <rule> <file> <input>     Match input against a rule
         \\
-        \\Format is auto-detected from file extension (.abnf, .peg).
+        \\Format is auto-detected from file extension (.abnf, .peg, .ere).
         \\
     , .{});
 }
 
-const Format = enum { abnf, peg };
+const Format = enum { abnf, peg, ere };
 
 fn detectFormat(filename: []const u8) Format {
     if (std.mem.endsWith(u8, filename, ".peg")) return .peg;
+    if (std.mem.endsWith(u8, filename, ".ere")) return .ere;
     return .abnf;
 }
 
@@ -92,6 +93,7 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const rules = switch (detectFormat(filename)) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename, stderr)).rules,
         .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename, stderr)).rules,
+        .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename, stderr)).rules,
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -138,6 +140,13 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 std.process.exit(1);
             };
         },
+        .ere => {
+            const r = try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename, stderr);
+            zpars.ere.Formatter.formatRule(r.rules[0], stdout) catch {
+                std.process.exit(1);
+            };
+            stdout.writeByte('\n') catch {};
+        },
     }
     try stdout.flush();
 }
@@ -163,6 +172,13 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
+    const fmt = if (filename) |f| detectFormat(f) else Format.abnf;
+
+    // ERE has a single unnamed rule — -r is optional.
+    if (fmt == .ere) {
+        if (rule_name == null) rule_name = "";
+    }
+
     if (rule_name == null or filename == null or input == null) {
         std.debug.print("usage: zpars match -r <rule> <file> <input>\n", .{});
         std.process.exit(1);
@@ -175,9 +191,10 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    const rules = switch (detectFormat(filename.?)) {
+    const rules = switch (fmt) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
         .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
+        .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -192,7 +209,7 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     stderr.flush() catch {};
 
-    const matcher = zpars.Matcher.init(arena.allocator(), merged);
+    var matcher = zpars.Matcher.init(arena.allocator(), merged);
     const result = matcher.match(rule_name.?, input.?) orelse {
         std.debug.print("no match\n", .{});
         std.process.exit(1);

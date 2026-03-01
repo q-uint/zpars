@@ -34,6 +34,12 @@ pub const Node = union(enum) {
     not_predicate: *const Node,
     /// `[a-zA-Z0-9]` — character class with ranges and singles.
     char_class: []const ClassRange,
+    /// `[^a-zA-Z0-9]` — negated character class (matches any char NOT in ranges).
+    neg_char_class: []const ClassRange,
+    /// `^` — anchor: match only at the start of input.
+    anchor_start,
+    /// `$` — anchor: match only at the end of input.
+    anchor_end,
     /// `.` — match any single character.
     any,
 };

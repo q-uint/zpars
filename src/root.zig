@@ -28,6 +28,13 @@ pub const cfg = struct {
     pub const Scanner = @import("cfg/Scanner.zig");
     pub const Token = @import("cfg/Token.zig");
 };
+pub const ere = struct {
+    pub const Diagnostic = @import("ere/Diagnostic.zig");
+    pub const Formatter = @import("ere/Formatter.zig");
+    pub const Parser = @import("ere/Parser.zig");
+    pub const Scanner = @import("ere/Scanner.zig");
+    pub const Token = @import("ere/Token.zig");
+};
 pub const sexp = @import("sexp.zig");
 pub const Ast = @import("Ast.zig");
 pub const Cfg = @import("Cfg.zig");

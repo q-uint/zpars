@@ -32,6 +32,8 @@ const RuleIndex = std.hash_map.StringHashMapUnmanaged(u32);
 
 rules: []const Ast.Rule,
 rule_index: RuleIndex,
+/// Start pointer of the input passed to `match()`, used for anchor_start.
+match_input_start: [*]const u8 = undefined,
 
 pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) Matcher {
     var index = RuleIndex{};
@@ -54,7 +56,8 @@ fn asciiLowerAlloc(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
 
 /// Match `input` against the rule named `rule_name`.
 /// Returns null if the rule is not found or the input does not match.
-pub fn match(self: *const Matcher, rule_name: []const u8, input: []const u8) ?Result {
+pub fn match(self: *Matcher, rule_name: []const u8, input: []const u8) ?Result {
+    self.match_input_start = input.ptr;
     return self.matchRulename(rule_name, input, 0);
 }
 
@@ -84,6 +87,19 @@ fn matchNode(self: *const Matcher, node: Ast.Node, input: []const u8, depth: usi
                 return .{ .value = input[0..0], .rest = input };
         },
         .char_class => |ranges| matchCharClass(ranges, input),
+        .neg_char_class => |ranges| matchNegCharClass(ranges, input),
+        .anchor_start => {
+            if (input.ptr == self.match_input_start)
+                return .{ .value = input[0..0], .rest = input }
+            else
+                return null;
+        },
+        .anchor_end => {
+            if (input.len == 0)
+                return .{ .value = input[0..0], .rest = input }
+            else
+                return null;
+        },
         .any => {
             if (input.len == 0) return null;
             return .{ .value = input[0..1], .rest = input[1..] };
@@ -99,6 +115,15 @@ fn matchCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
             return .{ .value = input[0..1], .rest = input[1..] };
     }
     return null;
+}
+
+fn matchNegCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
+    if (input.len == 0) return null;
+    const c = input[0];
+    for (ranges) |r| {
+        if (c >= r.lo and c <= r.hi) return null;
+    }
+    return .{ .value = input[0..1], .rest = input[1..] };
 }
 
 fn matchCharVal(cv: Ast.CharVal, input: []const u8) ?Result {
