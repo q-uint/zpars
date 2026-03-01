@@ -83,16 +83,19 @@ pub fn build(b: *std.Build) void {
     }
     vim_step.dependOn(&vim_run.step);
 
-    // --- WASM target for the Open VSX extension ---
+    // --- Shared WASM settings ---
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+
+    // --- WASM target for the Open VSX extension (analyze only) ---
     const wasm_step = b.step("wasm", "Build WASM module for the Open VSX extension");
     const wasm_lib = b.addExecutable(.{
         .name = "zpars",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wasm.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .wasm32,
-                .os_tag = .freestanding,
-            }),
+            .target = wasm_target,
             .optimize = .ReleaseSmall,
         }),
     });
@@ -106,6 +109,29 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = "../editors/vsx/wasm" } },
     });
     wasm_step.dependOn(&install_wasm.step);
+
+    // --- WASM target for the web demo (analyze + match) ---
+    const web_step = b.step("web", "Build WASM module for the web demo");
+    const web_wasm = b.addExecutable(.{
+        .name = "zpars",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    web_wasm.entry = .disabled;
+    web_wasm.root_module.export_symbol_names = &.{
+        "alloc",
+        "free",
+        "analyze",
+        "match",
+        "format",
+    };
+    const install_web_wasm = b.addInstallArtifact(web_wasm, .{
+        .dest_dir = .{ .override = .{ .custom = "../web" } },
+    });
+    web_step.dependOn(&install_web_wasm.step);
 
     // --- Open VSX extension (WASM + TypeScript) ---
     const vsx_step = b.step("vsx", "Build the Open VSX extension (WASM + TypeScript)");

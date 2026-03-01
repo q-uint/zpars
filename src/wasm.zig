@@ -38,6 +38,7 @@ const Language = enum(u8) {
     peg = 2,
     cfg = 3,
     sexp = 4,
+    ere = 5,
 };
 
 fn analyzeGeneric(comptime Scanner: type, comptime Parser: type, source_ptr: [*]const u8, source_len: usize) ?[*]const u8 {
@@ -260,5 +261,151 @@ export fn analyze(lang: u8, ptr: [*]const u8, len: usize) ?[*]const u8 {
         .peg => analyzeGeneric(root.peg.Scanner, root.peg.Parser, ptr, len),
         .cfg => analyzeGeneric(root.cfg.Scanner, root.cfg.Parser, ptr, len),
         .sexp => analyzeSexp(ptr, len),
+        .ere => analyzeGeneric(root.ere.Scanner, root.ere.Parser, ptr, len),
+    };
+}
+
+/// Format result: raw UTF-8 bytes of the formatted grammar.
+/// Returns null on parse error. Caller must free with free(ptr, len).
+/// The length is written as a u32 in the first 4 bytes, followed by the string.
+fn formatGeneric(
+    comptime Scanner: type,
+    comptime Parser: type,
+    comptime Formatter: type,
+    comptime with_tokens: bool,
+    source_ptr: [*]const u8,
+    source_len: usize,
+) ?[*]const u8 {
+    if (source_len == 0) return null;
+    const source = source_ptr[0..source_len];
+
+    var scanner = Scanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, source);
+    const rules = parser.parse() catch return null;
+    if (rules.len == 0) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(allocator);
+
+    // Reserve 4 bytes for length header.
+    out.appendNTimes(allocator, 0, 4) catch return null;
+
+    const writer = out.writer(allocator);
+    if (with_tokens) {
+        Formatter.formatGrammar(rules, tokens, source, writer) catch return null;
+    } else {
+        Formatter.formatGrammar(rules, writer) catch return null;
+    }
+
+    const str_len: u32 = @intCast(out.items.len - 4);
+    @memcpy(out.items[0..4], std.mem.asBytes(&str_len));
+
+    // Transfer ownership to caller.
+    const slice = out.toOwnedSlice(allocator) catch return null;
+    return slice.ptr;
+}
+
+fn formatEre(source_ptr: [*]const u8, source_len: usize) ?[*]const u8 {
+    if (source_len == 0) return null;
+    const source = source_ptr[0..source_len];
+
+    var scanner = root.ere.Scanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = root.ere.Parser.init(tokens, source);
+    const rules = parser.parse() catch return null;
+    if (rules.len == 0) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(allocator);
+
+    out.appendNTimes(allocator, 0, 4) catch return null;
+    root.ere.Formatter.formatRule(rules[0], out.writer(allocator)) catch return null;
+
+    const str_len: u32 = @intCast(out.items.len - 4);
+    @memcpy(out.items[0..4], std.mem.asBytes(&str_len));
+
+    const slice = out.toOwnedSlice(allocator) catch return null;
+    return slice.ptr;
+}
+
+export fn format(lang: u8, ptr: [*]const u8, len: usize) ?[*]const u8 {
+    const language = std.meta.intToEnum(Language, lang) catch return null;
+    return switch (language) {
+        .abnf => formatGeneric(root.abnf.Scanner, root.abnf.Parser, root.abnf.Formatter, true, ptr, len),
+        .bnf => formatGeneric(root.bnf.Scanner, root.bnf.Parser, root.bnf.Formatter, false, ptr, len),
+        .peg => formatGeneric(root.peg.Scanner, root.peg.Parser, root.peg.Formatter, true, ptr, len),
+        .ere => formatEre(ptr, len),
+        .cfg, .sexp => null,
+    };
+}
+
+/// Match result format (little-endian):
+///   byte 0       — 1 if matched, 0 if not
+///   bytes 1..4   — matched value length (u32), only present if matched
+///   bytes 5..    — matched value bytes
+///
+/// Caller must free the returned buffer.
+fn matchGeneric(
+    comptime Scanner: type,
+    comptime Parser: type,
+    grammar_ptr: [*]const u8,
+    grammar_len: usize,
+    rule_ptr: [*]const u8,
+    rule_len: usize,
+    input_ptr: [*]const u8,
+    input_len: usize,
+) ?[*]const u8 {
+    if (grammar_len == 0) return null;
+    const grammar = grammar_ptr[0..grammar_len];
+    const rule_name = rule_ptr[0..rule_len];
+    const input = input_ptr[0..input_len];
+
+    // Parse the grammar.
+    var scanner = Scanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, grammar);
+    const rules = parser.parse() catch return null;
+
+    // Validate and merge.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var validator = root.Validator.init(arena.allocator(), rules);
+    const merged = validator.validate() catch return null;
+
+    // Match.
+    var matcher = root.Matcher.init(arena.allocator(), merged);
+    const result = matcher.match(rule_name, input) orelse {
+        // No match — return single byte 0.
+        const buf = allocator.alloc(u8, 1) catch return null;
+        buf[0] = 0;
+        return buf.ptr;
+    };
+
+    // Build result buffer.
+    const val_len: u32 = @intCast(result.value.len);
+    const buf = allocator.alloc(u8, 1 + 4 + result.value.len) catch return null;
+    buf[0] = 1;
+    @memcpy(buf[1..5], std.mem.asBytes(&val_len));
+    @memcpy(buf[5 .. 5 + result.value.len], result.value);
+    return buf.ptr;
+}
+
+export fn match(
+    lang: u8,
+    grammar_ptr: [*]const u8,
+    grammar_len: usize,
+    rule_ptr: [*]const u8,
+    rule_len: usize,
+    input_ptr: [*]const u8,
+    input_len: usize,
+) ?[*]const u8 {
+    const language = std.meta.intToEnum(Language, lang) catch return null;
+    return switch (language) {
+        .abnf => matchGeneric(root.abnf.Scanner, root.abnf.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
+        .peg => matchGeneric(root.peg.Scanner, root.peg.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
+        .ere => matchGeneric(root.ere.Scanner, root.ere.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
+        .bnf, .cfg, .sexp => null,
     };
 }

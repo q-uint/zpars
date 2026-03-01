@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zpars — Grammar Validator</title>
+<style>
+  :root {
+    --bg: #1e1e2e;
+    --fg: #cdd6f4;
+    --surface: #313244;
+    --overlay: #45475a;
+    --red: #f38ba8;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --blue: #89b4fa;
+    --mauve: #cba6f7;
+    --teal: #94e2d5;
+    --text: #cdd6f4;
+    --subtext: #a6adc8;
+    --border: #585b70;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+
+  .subtitle {
+    color: var(--subtext);
+    font-size: 0.85rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .lang-selector {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .lang-btn {
+    background: var(--surface);
+    color: var(--subtext);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.35rem 0.75rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .lang-btn:hover {
+    background: var(--overlay);
+    color: var(--fg);
+  }
+
+  .lang-btn.active {
+    background: var(--mauve);
+    color: var(--bg);
+    border-color: var(--mauve);
+  }
+
+  .editor-container {
+    width: 100%;
+    max-width: 720px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+
+  .editor-wrapper {
+    display: grid;
+    min-height: 3rem;
+  }
+
+  .editor-wrapper > * {
+    grid-area: 1 / 1;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 1rem;
+    line-height: 1.6;
+    padding: 0.75rem 1rem;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+  }
+
+  .highlight-layer {
+    pointer-events: none;
+  }
+
+  .editor {
+    background: transparent;
+    color: transparent;
+    caret-color: var(--fg);
+    border: none;
+    outline: none;
+    resize: none;
+    overflow: hidden;
+  }
+
+  /* Token colors */
+  .tok-type     { color: var(--blue); }
+  .tok-string   { color: var(--green); }
+  .tok-number   { color: var(--yellow); }
+  .tok-comment  { color: var(--subtext); font-style: italic; }
+  .tok-operator { color: var(--mauve); }
+  .tok-regexp   { color: var(--teal); }
+  .tok-bracket  { color: var(--blue); }
+  .tok-default  { color: var(--fg); }
+  .tok-invalid  { color: var(--red); text-decoration: wavy underline var(--red); }
+
+  .diag-underline {
+    text-decoration: wavy underline var(--red);
+    text-decoration-skip-ink: none;
+  }
+
+  .diagnostics {
+    width: 100%;
+    max-width: 720px;
+    margin-top: 0.75rem;
+  }
+
+  .diag-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.35rem 0;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+  }
+
+  .diag-marker {
+    color: var(--red);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .diag-pos {
+    color: var(--subtext);
+    flex-shrink: 0;
+  }
+
+  .diag-msg {
+    color: var(--fg);
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+    width: 100%;
+    max-width: 720px;
+  }
+
+  .status {
+    font-size: 0.85rem;
+    color: var(--green);
+  }
+
+  .status.has-errors {
+    color: var(--red);
+  }
+
+  .format-btn {
+    background: var(--surface);
+    color: var(--subtext);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-family: inherit;
+    margin-left: auto;
+  }
+
+  .format-btn:hover {
+    background: var(--overlay);
+    color: var(--fg);
+  }
+
+  .format-btn.hidden {
+    display: none;
+  }
+
+  .match-section {
+    width: 100%;
+    max-width: 720px;
+    margin-top: 1.25rem;
+  }
+
+  .match-section.hidden {
+    display: none;
+  }
+
+  .match-header {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .match-label {
+    color: var(--subtext);
+    font-size: 0.85rem;
+  }
+
+  .rule-input {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.5rem;
+    background: var(--surface);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    outline: none;
+    width: 12rem;
+  }
+
+  .rule-input:focus {
+    border-color: var(--mauve);
+  }
+
+  .rule-input.hidden {
+    display: none;
+  }
+
+  .match-input {
+    width: 100%;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 1rem;
+    line-height: 1.6;
+    padding: 0.75rem 1rem;
+    background: var(--surface);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    resize: none;
+    overflow: hidden;
+    field-sizing: content;
+    min-height: 2.5rem;
+  }
+
+  .match-input:focus {
+    border-color: var(--mauve);
+  }
+
+  .match-result {
+    margin-top: 0.5rem;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+  }
+
+  .match-result.matched {
+    color: var(--green);
+  }
+
+  .match-result.no-match {
+    color: var(--red);
+  }
+</style>
+</head>
+<body>
+
+<h1>zpars</h1>
+<p class="subtitle">Grammar validation powered by Zig</p>
+
+<div class="lang-selector" id="lang-selector"></div>
+
+<div class="editor-container">
+  <div class="editor-wrapper">
+    <div class="highlight-layer" id="highlight"></div>
+    <textarea class="editor" id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+  </div>
+</div>
+
+<div class="diagnostics" id="diagnostics"></div>
+<div class="status-row">
+  <div class="status" id="status"></div>
+  <button class="format-btn hidden" id="format-btn">Format</button>
+</div>
+
+<div class="match-section hidden" id="match-section">
+  <div class="match-header">
+    <span class="match-label">Test input</span>
+    <input class="rule-input hidden" id="rule-input" type="text" placeholder="rule name">
+  </div>
+  <textarea class="match-input" id="match-input" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter text to match…"></textarea>
+  <div class="match-result" id="match-result"></div>
+</div>
+
+<script>
+// Languages that support matching (have Validator + Matcher).
+const MATCHABLE = new Set(["abnf", "peg", "ere"]);
+// Languages where the rule name input should be shown.
+const NEEDS_RULE = new Set(["abnf", "peg"]);
+// Languages that support formatting.
+const FORMATTABLE = new Set(["abnf", "bnf", "peg", "ere"]);
+
+const LANGUAGES = {
+  abnf: {
+    id: 0,
+    label: "ABNF",
+    tagMap: [
+      null,           // 0: left_paren
+      null,           // 1: right_paren
+      null,           // 2: left_bracket
+      null,           // 3: right_bracket
+      "tok-operator", // 4: slash
+      "tok-operator", // 5: star
+      "tok-operator", // 6: equals
+      "tok-operator", // 7: equals_slash
+      "tok-type",     // 8: rulename
+      "tok-number",   // 9: number
+      "tok-string",   // 10: char_val
+      "tok-string",   // 11: char_val_ci
+      "tok-string",   // 12: char_val_cs
+      "tok-string",   // 13: prose_val
+      "tok-number",   // 14: bin_val
+      "tok-number",   // 15: dec_val
+      "tok-number",   // 16: hex_val
+      "tok-comment",  // 17: comment
+      null,           // 18: newline
+      null,           // 19: eof
+      "tok-invalid",  // 20: invalid
+    ],
+    eofTag: 19,
+    ruleNameTag: 8,
+    example: 'greeting = "hello" SP name\nname     = 1*ALPHA\n',
+    matchExample: "hello world",
+  },
+  bnf: {
+    id: 1,
+    label: "BNF",
+    tagMap: [
+      "tok-type",     // 0: rulename
+      "tok-operator", // 1: definition
+      "tok-operator", // 2: pipe
+      "tok-string",   // 3: terminal
+      null,           // 4: newline
+      null,           // 5: eof
+      "tok-invalid",  // 6: invalid
+    ],
+    eofTag: 5,
+    example: '<expr> ::= <term> | <expr> "+" <term>\n',
+  },
+  peg: {
+    id: 2,
+    label: "PEG",
+    tagMap: [
+      "tok-type",     // 0: identifier
+      "tok-operator", // 1: left_arrow
+      "tok-operator", // 2: slash
+      "tok-operator", // 3: and
+      "tok-operator", // 4: not
+      "tok-operator", // 5: question
+      "tok-operator", // 6: star
+      "tok-operator", // 7: plus
+      null,           // 8: left_paren
+      null,           // 9: right_paren
+      "tok-operator", // 10: dot
+      "tok-string",   // 11: literal
+      "tok-regexp",   // 12: char_class
+      "tok-comment",  // 13: comment
+      null,           // 14: newline
+      null,           // 15: eof
+      "tok-invalid",  // 16: invalid
+    ],
+    eofTag: 15,
+    ruleNameTag: 0,
+    example: 'Expr    <- Term ("+" Term)*\nTerm    <- Factor ("*" Factor)*\nFactor  <- "(" Expr ")" / [0-9]+\n',
+    matchExample: "1+2*3",
+  },
+  cfg: {
+    id: 3,
+    label: "CFG",
+    tagMap: [
+      "tok-type",     // 0: identifier
+      "tok-string",   // 1: string
+      "tok-string",   // 2: string_cs
+      "tok-string",   // 3: string_ci
+      "tok-number",   // 4: hex_byte
+      "tok-number",   // 5: hex_range
+      "tok-operator", // 6: arrow
+      "tok-operator", // 7: pipe
+      null,           // 8: newline
+      null,           // 9: eof
+      "tok-invalid",  // 10: invalid
+    ],
+    eofTag: 9,
+    example: 'expr -> term | expr "+" term\nterm -> factor | term "*" factor\n',
+  },
+  sexp: {
+    id: 4,
+    label: "S-expression",
+    tagMap: [
+      null,           // 0: lparen
+      null,           // 1: rparen
+      null,           // 2: lbracket
+      null,           // 3: rbracket
+      null,           // 4: lbrace
+      null,           // 5: rbrace
+      "tok-string",   // 6: verbatim
+      "tok-string",   // 7: quoted_string
+      "tok-type",     // 8: sexp_token
+      "tok-number",   // 9: hexadecimal
+      "tok-number",   // 10: base64
+      "tok-number",   // 11: decimal
+      null,           // 12: whitespace
+      null,           // 13: eof
+      "tok-invalid",  // 14: invalid
+    ],
+    eofTag: 13,
+    example: '(certificate\n  (issuer "Example CA")\n  (subject "alice")\n  (public-key\n    (algorithm ed25519)\n    (key-data |MCowBQYDK2VwAyEA|))\n  (serial 42))\n',
+  },
+  ere: {
+    id: 5,
+    label: "ERE",
+    tagMap: [
+      "tok-string",   // 0: char
+      "tok-operator", // 1: dot
+      "tok-operator", // 2: caret
+      "tok-operator", // 3: dollar
+      "tok-operator", // 4: star
+      "tok-operator", // 5: plus
+      "tok-operator", // 6: question
+      "tok-bracket",  // 7: lbrace
+      "tok-bracket",  // 8: rbrace
+      "tok-operator", // 9: comma
+      "tok-number",   // 10: number
+      "tok-bracket",  // 11: left_paren
+      "tok-bracket",  // 12: right_paren
+      "tok-operator", // 13: pipe
+      "tok-regexp",   // 14: bracket_expr
+      null,           // 15: eof
+      "tok-invalid",  // 16: invalid
+    ],
+    eofTag: 15,
+    example: "^[a-z]+$",
+    matchExample: "hello",
+  },
+};
+
+let wasm = null;
+let currentLang = "ere";
+
+async function loadWasm() {
+  const resp = await fetch("zpars.wasm");
+  const bytes = await resp.arrayBuffer();
+  const module = await WebAssembly.compile(bytes);
+  const instance = await WebAssembly.instantiate(module);
+  return instance.exports;
+}
+
+function wasmAllocString(s) {
+  const encoded = new TextEncoder().encode(s);
+  if (encoded.length === 0) return { ptr: 0, len: 0 };
+  const ptr = wasm.alloc(encoded.length);
+  if (ptr === 0) return null;
+  new Uint8Array(wasm.memory.buffer).set(encoded, ptr);
+  return { ptr, len: encoded.length };
+}
+
+function analyzeText(text, langId) {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(text);
+  if (encoded.length === 0) return { tokens: [], diagnostics: [] };
+
+  const src = wasmAllocString(text);
+  if (!src) return { tokens: [], diagnostics: [] };
+
+  const resultPtr = wasm.analyze(langId, src.ptr, src.len);
+  wasm.free(src.ptr, src.len);
+
+  if (resultPtr === 0) return { tokens: [], diagnostics: [] };
+
+  const view = new DataView(wasm.memory.buffer);
+  const tokenCount = view.getUint32(resultPtr, true);
+  const diagCount = view.getUint32(resultPtr + 4, true);
+
+  const headerLen = 8;
+  const tokens = [];
+  for (let i = 0; i < tokenCount; i++) {
+    const off = resultPtr + headerLen + i * 12;
+    tokens.push({
+      tag: view.getUint32(off, true),
+      start: view.getUint32(off + 4, true),
+      len: view.getUint32(off + 8, true),
+    });
+  }
+
+  const tokenDataLen = tokenCount * 12;
+  const diagDataLen = diagCount * 16;
+  const msgDataStart = resultPtr + headerLen + tokenDataLen + diagDataLen;
+  const decoder = new TextDecoder();
+  const diagnostics = [];
+
+  for (let i = 0; i < diagCount; i++) {
+    const off = resultPtr + headerLen + tokenDataLen + i * 16;
+    const start = view.getUint32(off, true);
+    const len = view.getUint32(off + 4, true);
+    const msgOff = view.getUint32(off + 8, true);
+    const msgLen = view.getUint32(off + 12, true);
+    const msgBytes = new Uint8Array(wasm.memory.buffer, msgDataStart + msgOff, msgLen);
+    diagnostics.push({ start, len, message: decoder.decode(msgBytes) });
+  }
+
+  const totalMsgLen = diagnostics.reduce(
+    (sum, d) => sum + new TextEncoder().encode(d.message).length, 0
+  );
+  wasm.free(resultPtr, headerLen + tokenDataLen + diagDataLen + totalMsgLen);
+
+  return { tokens, diagnostics };
+}
+
+function matchText(grammar, ruleName, input, langId) {
+  const g = wasmAllocString(grammar);
+  if (!g) return null;
+  const r = wasmAllocString(ruleName);
+  if (!r) { if (g.len > 0) wasm.free(g.ptr, g.len); return null; }
+  const inp = wasmAllocString(input);
+  if (!inp) { if (g.len > 0) wasm.free(g.ptr, g.len); if (r.len > 0) wasm.free(r.ptr, r.len); return null; }
+
+  const resultPtr = wasm.match(langId, g.ptr, g.len, r.ptr, r.len, inp.ptr, inp.len);
+  if (g.len > 0) wasm.free(g.ptr, g.len);
+  if (r.len > 0) wasm.free(r.ptr, r.len);
+  if (inp.len > 0) wasm.free(inp.ptr, inp.len);
+
+  if (resultPtr === 0) return null;
+
+  const view = new DataView(wasm.memory.buffer);
+  const matched = view.getUint8(resultPtr) === 1;
+
+  if (!matched) {
+    wasm.free(resultPtr, 1);
+    return { matched: false };
+  }
+
+  const valLen = view.getUint32(resultPtr + 1, true);
+  const valBytes = new Uint8Array(wasm.memory.buffer, resultPtr + 5, valLen);
+  const value = new TextDecoder().decode(valBytes);
+  wasm.free(resultPtr, 1 + 4 + valLen);
+  return { matched: true, value };
+}
+
+function formatText(text, langId) {
+  const src = wasmAllocString(text);
+  if (!src) return null;
+  const resultPtr = wasm.format(langId, src.ptr, src.len);
+  if (src.len > 0) wasm.free(src.ptr, src.len);
+  if (resultPtr === 0) return null;
+  const view = new DataView(wasm.memory.buffer);
+  const strLen = view.getUint32(resultPtr, true);
+  const strBytes = new Uint8Array(wasm.memory.buffer, resultPtr + 4, strLen);
+  const formatted = new TextDecoder().decode(strBytes);
+  wasm.free(resultPtr, 4 + strLen);
+  return formatted;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function decodeSlice(encoded, start, end) {
+  return new TextDecoder().decode(encoded.slice(start, end));
+}
+
+function buildHighlight(text, tokens, diagnostics, lang) {
+  const diagSet = new Set();
+  for (const d of diagnostics) {
+    for (let i = d.start; i < d.start + Math.max(d.len, 1); i++) {
+      diagSet.add(i);
+    }
+  }
+
+  const encoded = new TextEncoder().encode(text);
+  const tagMap = lang.tagMap;
+  const eofTag = lang.eofTag;
+
+  let html = "";
+  let pos = 0;
+
+  for (const tok of tokens) {
+    if (tok.tag === eofTag) break;
+
+    if (tok.start > pos) {
+      html += escapeHtml(decodeSlice(encoded, pos, tok.start));
+    }
+
+    const slice = decodeSlice(encoded, tok.start, tok.start + tok.len);
+    const cls = tok.tag < tagMap.length ? tagMap[tok.tag] : null;
+    const hasDiag = diagSet.has(tok.start);
+    const diagCls = hasDiag ? " diag-underline" : "";
+
+    html += `<span class="${cls || "tok-default"}${diagCls}">${escapeHtml(slice)}</span>`;
+    pos = tok.start + tok.len;
+  }
+
+  if (pos < encoded.length) {
+    html += escapeHtml(decodeSlice(encoded, pos, encoded.length));
+  }
+
+  if (!html.endsWith("\n")) html += "\n";
+  return html;
+}
+
+function getFirstRuleName(tokens, lang) {
+  if (lang.ruleNameTag == null) return "";
+  const text = editor.value;
+  const encoded = new TextEncoder().encode(text);
+  for (const tok of tokens) {
+    if (tok.tag === lang.ruleNameTag) {
+      return decodeSlice(encoded, tok.start, tok.start + tok.len);
+    }
+  }
+  return "";
+}
+
+function update() {
+  const lang = LANGUAGES[currentLang];
+  const text = editor.value;
+  const { tokens, diagnostics } = analyzeText(text, lang.id);
+
+  highlight.innerHTML = buildHighlight(text, tokens, diagnostics, lang);
+
+  const diagEl = document.getElementById("diagnostics");
+  if (diagnostics.length === 0) {
+    diagEl.innerHTML = "";
+  } else {
+    diagEl.innerHTML = diagnostics.map(d => {
+      return `<div class="diag-item">
+        <span class="diag-marker">error</span>
+        <span class="diag-pos">[${d.start}]</span>
+        <span class="diag-msg">${escapeHtml(d.message)}</span>
+      </div>`;
+    }).join("");
+  }
+
+  const statusEl = document.getElementById("status");
+  if (text.length === 0) {
+    statusEl.textContent = "";
+    statusEl.className = "status";
+  } else if (diagnostics.length === 0) {
+    statusEl.textContent = `Valid ${lang.label}`;
+    statusEl.className = "status";
+  } else {
+    statusEl.textContent = `${diagnostics.length} error${diagnostics.length > 1 ? "s" : ""}`;
+    statusEl.className = "status has-errors";
+  }
+
+  // Auto-fill rule name from first rule in grammar.
+  if (NEEDS_RULE.has(currentLang) && ruleInput.value === "" && diagnostics.length === 0) {
+    ruleInput.value = getFirstRuleName(tokens, lang);
+  }
+
+  updateMatch();
+}
+
+function updateMatch() {
+  const lang = LANGUAGES[currentLang];
+  const resultEl = document.getElementById("match-result");
+
+  if (!MATCHABLE.has(currentLang)) {
+    resultEl.textContent = "";
+    return;
+  }
+
+  const grammar = editor.value;
+  const input = matchInput.value;
+  if (grammar.length === 0 || input.length === 0) {
+    resultEl.textContent = "";
+    resultEl.className = "match-result";
+    return;
+  }
+
+  const ruleName = NEEDS_RULE.has(currentLang) ? ruleInput.value : "";
+  const result = matchText(grammar, ruleName, input, lang.id);
+
+  if (!result || !result.matched) {
+    resultEl.textContent = "no match";
+    resultEl.className = "match-result no-match";
+  } else {
+    resultEl.textContent = `matched: ${result.value}`;
+    resultEl.className = "match-result matched";
+  }
+}
+
+function selectLang(name) {
+  currentLang = name;
+  const lang = LANGUAGES[name];
+  editor.value = lang.example;
+  editor.placeholder = `Enter ${lang.label}…`;
+  document.querySelectorAll(".lang-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.lang === name);
+  });
+
+  const matchable = MATCHABLE.has(name);
+  matchSection.classList.toggle("hidden", !matchable);
+  ruleInput.classList.toggle("hidden", !NEEDS_RULE.has(name));
+  ruleInput.value = "";
+  matchInput.value = lang.matchExample || "";
+  formatBtn.classList.toggle("hidden", !FORMATTABLE.has(name));
+
+  update();
+}
+
+// Build language selector buttons.
+const selectorEl = document.getElementById("lang-selector");
+for (const [name, lang] of Object.entries(LANGUAGES)) {
+  const btn = document.createElement("button");
+  btn.className = "lang-btn";
+  btn.dataset.lang = name;
+  btn.textContent = lang.label;
+  btn.addEventListener("click", () => selectLang(name));
+  selectorEl.appendChild(btn);
+}
+
+const editor = document.getElementById("editor");
+const highlight = document.getElementById("highlight");
+const matchSection = document.getElementById("match-section");
+const matchInput = document.getElementById("match-input");
+const ruleInput = document.getElementById("rule-input");
+const formatBtn = document.getElementById("format-btn");
+
+editor.addEventListener("input", update);
+matchInput.addEventListener("input", updateMatch);
+ruleInput.addEventListener("input", updateMatch);
+formatBtn.addEventListener("click", () => {
+  const lang = LANGUAGES[currentLang];
+  const formatted = formatText(editor.value, lang.id);
+  if (formatted != null) {
+    editor.value = formatted;
+    update();
+  }
+});
+
+loadWasm().then(exports => {
+  wasm = exports;
+  selectLang(currentLang);
+}).catch(err => {
+  document.getElementById("status").textContent = "Failed to load WASM: " + err;
+  document.getElementById("status").className = "status has-errors";
+});
+</script>
+<footer style="text-align:center;padding:2rem 0 1rem;color:var(--overlay)">
+  <a href="https://codeberg.org/quint/zpars" style="color:var(--fg);opacity:0.5">codeberg.org/quint/zpars</a>
+</footer>
+</body>
+</html>
