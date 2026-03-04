@@ -6,7 +6,7 @@
 ///   concatenation = *element
 ///   element       = rulename / terminal
 const std = @import("std");
-const Token = @import("Token.zig").Token;
+const Token = @import("Scanner.zig").Scanner.Token;
 const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
@@ -161,7 +161,7 @@ fn isAtElement(self: *Parser) bool {
     };
 }
 
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 
 fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);

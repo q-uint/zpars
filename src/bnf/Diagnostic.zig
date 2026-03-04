@@ -1,5 +1,5 @@
 const diagnostic = @import("../diagnostic.zig");
-const Token = @import("Token.zig").Token;
+const Token = @import("Scanner.zig").Scanner.Token;
 
 pub const Expected = enum {
     rulename,

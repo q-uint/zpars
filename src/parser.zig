@@ -19,14 +19,14 @@ pub fn ParserBase(
 ) type {
     return struct {
         fn isTrivia(tag: TokenType.Tag) bool {
-            for (trivia_tags) |t| {
+            inline for (trivia_tags) |t| {
                 if (tag == t) return true;
             }
             return false;
         }
 
         fn isDef(tag: TokenType.Tag) bool {
-            for (sync_config.def_tags) |t| {
+            inline for (sync_config.def_tags) |t| {
                 if (tag == t) return true;
             }
             return false;

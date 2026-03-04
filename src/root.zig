@@ -5,14 +5,14 @@ pub const abnf = struct {
     pub const Formatter = @import("abnf/Formatter.zig");
     pub const Parser = @import("abnf/Parser.zig");
     pub const Scanner = @import("abnf/Scanner.zig");
+    pub const Tokenizer = @import("abnf/Tokenizer.zig");
     pub const Token = @import("abnf/Token.zig");
 };
 pub const bnf = struct {
     pub const Diagnostic = @import("bnf/Diagnostic.zig");
     pub const Formatter = @import("bnf/Formatter.zig");
     pub const Parser = @import("bnf/Parser.zig");
-    pub const Scanner = @import("bnf/Scanner.zig");
-    pub const Token = @import("bnf/Token.zig");
+    pub const Scanner = @import("bnf/Scanner.zig").Scanner;
 };
 pub const peg = struct {
     pub const Diagnostic = @import("peg/Diagnostic.zig");
