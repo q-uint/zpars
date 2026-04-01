@@ -85,16 +85,34 @@
   }
 
   .editor-wrapper {
-    display: grid;
+    display: flex;
     min-height: 3rem;
   }
 
-  .editor-wrapper > * {
+  .line-numbers {
+    padding: 0.75rem 0.5rem 0.75rem 0.75rem;
+    text-align: right;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 1rem;
+    line-height: 1.6;
+    color: var(--subtext);
+    opacity: 0.5;
+    user-select: none;
+    white-space: pre;
+  }
+
+  .editor-overlay {
+    display: grid;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .editor-overlay > * {
     grid-area: 1 / 1;
     font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
     font-size: 1rem;
     line-height: 1.6;
-    padding: 0.75rem 1rem;
+    padding: 0.75rem 1rem 0.75rem 0.5rem;
     white-space: pre-wrap;
     word-wrap: break-word;
     overflow-wrap: break-word;
@@ -286,8 +304,11 @@
 
 <div class="editor-container">
   <div class="editor-wrapper">
-    <div class="highlight-layer" id="highlight"></div>
-    <textarea class="editor" id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+    <div class="line-numbers" id="line-numbers">1</div>
+    <div class="editor-overlay">
+      <div class="highlight-layer" id="highlight"></div>
+      <textarea class="editor" id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+    </div>
   </div>
 </div>
 
@@ -308,9 +329,9 @@
 
 <script>
 // Languages that support matching (have Validator + Matcher).
-const MATCHABLE = new Set(["abnf", "peg", "ere"]);
+const MATCHABLE = new Set(["abnf", "bnf", "peg", "ere"]);
 // Languages where the rule name input should be shown.
-const NEEDS_RULE = new Set(["abnf", "peg"]);
+const NEEDS_RULE = new Set(["abnf", "bnf", "peg"]);
 // Languages that support formatting.
 const FORMATTABLE = new Set(["abnf", "bnf", "peg", "ere"]);
 
@@ -359,7 +380,9 @@ const LANGUAGES = {
       "tok-invalid",  // 6: invalid
     ],
     eofTag: 5,
-    example: '<expr> ::= <term> | <expr> "+" <term>\n',
+    ruleNameTag: 0,
+    example: '<bit> ::= 0 | 1\n',
+    matchExample: "0",
   },
   peg: {
     id: 2,
@@ -385,7 +408,7 @@ const LANGUAGES = {
     ],
     eofTag: 15,
     ruleNameTag: 0,
-    example: 'Expr    <- Term ("+" Term)*\nTerm    <- Factor ("*" Factor)*\nFactor  <- "(" Expr ")" / [0-9]+\n',
+    example: 'Expr   <- Term ("+" Term)*\nTerm   <- Factor ("*" Factor)*\nFactor <- "(" Expr ")" / [0-9]+\n',
     matchExample: "1+2*3",
   },
   cfg: {
@@ -627,10 +650,21 @@ function getFirstRuleName(tokens, lang) {
   const encoded = new TextEncoder().encode(text);
   for (const tok of tokens) {
     if (tok.tag === lang.ruleNameTag) {
-      return decodeSlice(encoded, tok.start, tok.start + tok.len);
+      let name = decodeSlice(encoded, tok.start, tok.start + tok.len);
+      if (name.startsWith("<") && name.endsWith(">")) {
+        name = name.slice(1, -1);
+      }
+      return name;
     }
   }
   return "";
+}
+
+function updateLineNumbers(text) {
+  const lineCount = Math.max(1, (text.match(/\n/g) || []).length + 1);
+  const nums = [];
+  for (let i = 1; i <= lineCount; i++) nums.push(i);
+  document.getElementById("line-numbers").textContent = nums.join("\n");
 }
 
 function update() {
@@ -638,6 +672,7 @@ function update() {
   const text = editor.value;
   const { tokens, diagnostics } = analyzeText(text, lang.id);
 
+  updateLineNumbers(text);
   highlight.innerHTML = buildHighlight(text, tokens, diagnostics, lang);
 
   const diagEl = document.getElementById("diagnostics");

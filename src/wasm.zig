@@ -406,6 +406,7 @@ export fn match(
         .abnf => matchGeneric(root.abnf.Scanner, root.abnf.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
         .peg => matchGeneric(root.peg.Scanner, root.peg.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
         .ere => matchGeneric(root.ere.Scanner, root.ere.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
-        .bnf, .cfg, .sexp => null,
+        .bnf => matchGeneric(root.bnf.Scanner, root.bnf.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
+        .cfg, .sexp => null,
     };
 }

@@ -91,10 +91,12 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
         break :arb result;
     };
 
+    const MaskInt = std.meta.Int(.unsigned, @max(rule_count, 1));
+
     const Action = union(enum) {
         single: GeneratedTag,
         skip,
-        handler: u8, // rule index
+        handler: MaskInt,
         catch_all,
         invalid,
     };
@@ -107,14 +109,32 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
 
         for (config.skip) |b| t[b] = .skip;
 
-        for (0..rule_count) |i| {
-            for (0..256) |b| {
+        for (0..256) |b| {
+            if (skip_set[b]) continue;
+
+            var mask: MaskInt = 0;
+            var count: usize = 0;
+            for (0..rule_count) |i| {
                 if (first_bytes[i][b]) {
-                    if (isSingleByte(rules[i].node))
-                        t[b] = .{ .single = @enumFromInt(i) }
-                    else
-                        t[b] = .{ .handler = @intCast(i) };
+                    mask |= @as(MaskInt, 1) << @intCast(i);
+                    count += 1;
                 }
+            }
+
+            if (count == 0) continue;
+
+            if (count == 1) {
+                for (0..rule_count) |i| {
+                    if (first_bytes[i][b]) {
+                        if (isSingleByte(rules[i].node))
+                            t[b] = .{ .single = @enumFromInt(i) }
+                        else
+                            t[b] = .{ .handler = mask };
+                        break;
+                    }
+                }
+            } else {
+                t[b] = .{ .handler = mask };
             }
         }
 
@@ -164,20 +184,27 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
             switch (dispatch_table[c]) {
                 .single => |tag| self.addToken(tag),
                 .skip => {},
-                .handler => |idx| {
-                    // Rewind so the matcher sees the full token including
-                    // the first byte that was already consumed.
+                .handler => |mask| {
                     self.current = self.start;
+                    var best_end: usize = self.start;
+                    var best_tag: Tag = .invalid;
                     inline for (0..rule_count) |i| {
-                        if (idx == i) {
-                            if (rule_matchers[i].match(self.source, &self.current)) {
-                                self.addToken(@enumFromInt(i));
-                            } else {
-                                self.current = self.start + 1;
-                                self.addToken(.invalid);
+                        if (mask & (@as(MaskInt, 1) << i) != 0) {
+                            var pos = self.start;
+                            if (rule_matchers[i].match(self.source, &pos)) {
+                                if (pos > best_end) {
+                                    best_end = pos;
+                                    best_tag = @enumFromInt(i);
+                                }
                             }
-                            return;
                         }
+                    }
+                    if (best_end > self.start) {
+                        self.current = best_end;
+                        self.addToken(best_tag);
+                    } else {
+                        self.current = self.start + 1;
+                        self.addToken(.invalid);
                     }
                 },
                 .catch_all => {
@@ -432,4 +459,46 @@ fn eqlIgnoreCase(comptime a: []const u8, comptime b: []const u8) bool {
         if (al != bl) return false;
     }
     return true;
+}
+
+const testing = std.testing;
+
+fn expectTags(comptime S: type, source: []const u8, expected: []const S.Tag) !void {
+    var scanner = S.init(source);
+    const tokens = scanner.scanTokens();
+    const actual = try testing.allocator.alloc(S.Tag, tokens.len);
+    defer testing.allocator.free(actual);
+    for (tokens, 0..) |t, i| actual[i] = t.tag;
+    try testing.expectEqualSlices(S.Tag, expected, actual);
+}
+
+test "first-byte conflict: longest match wins" {
+    const S = CompileScanner(
+        \\equals       = "="
+        \\equals_slash = "=/"
+    , .{});
+    try expectTags(S, "=/", &.{ .equals_slash, .eof });
+    try expectTags(S, "=", &.{ .equals, .eof });
+}
+
+test "first-byte conflict: declaration order breaks ties" {
+    const S = CompileScanner(
+        \\keyword = "if"
+        \\ident   = 1*(%x61-7A)
+    , .{});
+    // Both match "if" (2 bytes). "keyword" is declared first, so it wins.
+    try expectTags(S, "if", &.{ .keyword, .eof });
+    // "foo" only matches ident.
+    try expectTags(S, "foo", &.{ .ident, .eof });
+}
+
+test "first-byte conflict: multiple prefixed rules" {
+    const S = CompileScanner(
+        \\hex = "%x" 1*(%x30-39 / %x41-46 / %x61-66)
+        \\dec = "%d" 1*(%x30-39)
+        \\bin = "%b" 1*(%x30-31)
+    , .{});
+    try expectTags(S, "%xFF", &.{ .hex, .eof });
+    try expectTags(S, "%d42", &.{ .dec, .eof });
+    try expectTags(S, "%b01", &.{ .bin, .eof });
 }
