@@ -1,0 +1,10 @@
+Value   <- Spacing (Object / Array / String / Number / True / False / Null) Spacing
+Object  <- "{" Spacing (Pair ("," Spacing Pair)*)? "}" Spacing
+Pair    <- String Spacing ":" Spacing Value
+Array   <- "[" Spacing (Value ("," Spacing Value)*)? "]" Spacing
+String  <- '"' (!'"' !'\\' . / '\\' ["\\/bfnrt])* '"'
+Number  <- "-"? ("0" / [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+\-]? [0-9]+)?
+True    <- "true"
+False   <- "false"
+Null    <- "null"
+Spacing <- [ \t\n\r]*

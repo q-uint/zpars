@@ -1,0 +1,7 @@
+URI       <- Scheme ":" "//" Authority Path
+Scheme    <- [a-zA-Z] [a-zA-Z0-9+\-.]*
+Authority <- Host (":" Port)?
+Host      <- [a-zA-Z0-9.\-]+
+Port      <- [0-9]+
+Path      <- ("/" Segment)*
+Segment   <- [a-zA-Z0-9\-._~]*

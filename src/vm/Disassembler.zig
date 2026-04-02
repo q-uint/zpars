@@ -40,6 +40,7 @@ pub fn dump(self: *const Disassembler, writer: anytype) !void {
             .jump => try writer.print("jump    -> {d}\n", .{inst.data.offset}),
             .call => try writer.print("call    -> {d}\n", .{inst.data.offset}),
             .ret => try writer.writeAll("ret\n"),
+            .save => try writer.print("save    {d}\n", .{inst.data.slot}),
             .match => try writer.writeAll("match\n"),
         }
     }
@@ -163,6 +164,28 @@ test "disassemble charset" {
         \\   2: set     [a-z]
         \\   3: commit  -> 1
         \\   4: match
+        \\
+    , stream.getWritten());
+}
+
+test "disassemble capture" {
+    var scanner = EreScanner.init("a(b)c");
+    const tokens = scanner.scanTokens();
+    var parser = EreParser.init(tokens, "a(b)c");
+    const rules = try parser.parse();
+    var compiler = Compiler.compile(rules);
+
+    var buf: [1024]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets());
+    try dis.dump(stream.writer());
+    try testing.expectEqualStrings(
+        \\   0: char    'a'
+        \\   1: save    0
+        \\   2: char    'b'
+        \\   3: save    1
+        \\   4: char    'c'
+        \\   5: match
         \\
     , stream.getWritten());
 }

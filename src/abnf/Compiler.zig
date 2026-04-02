@@ -55,7 +55,7 @@ fn compileNode(comptime node: Ast.Node, comptime rules: []const Ast.Rule, compti
         .prose_val => @compileError("prose-val cannot be compiled to a parser"),
 
         // Nodes not produced by the ABNF parser.
-        .and_predicate, .not_predicate, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => @compileError("non-ABNF nodes cannot be compiled by ABNF compiler"),
+        .and_predicate, .not_predicate, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .capture => @compileError("non-ABNF nodes cannot be compiled by ABNF compiler"),
     };
 }
 

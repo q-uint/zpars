@@ -187,7 +187,7 @@ fn parseAtom(self: *Parser) ParseError!Ast.Node {
                 return error.SyntaxError;
             }
             _ = self.advance();
-            return expr;
+            return .{ .capture = self.nodes.addOne(expr) };
         },
         .bracket_expr => self.parseBracketExpr(),
         else => {

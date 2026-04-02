@@ -44,6 +44,11 @@ fn formatNode(node: Ast.Node, ctx: Context, writer: anytype) anyerror!void {
         .anchor_start => try writer.writeByte('^'),
         .anchor_end => try writer.writeByte('$'),
         .rulename => |name| try writer.writeAll(name),
+        .capture => |inner| {
+            try writer.writeByte('(');
+            try formatNode(inner.*, .top, writer);
+            try writer.writeByte(')');
+        },
         // Nodes not produced by the ERE parser.
         .num_val, .prose_val, .and_predicate, .not_predicate => unreachable,
     }

@@ -42,6 +42,8 @@ pub const Node = union(enum) {
     anchor_end,
     /// `.` — match any single character.
     any,
+    /// Capture group: records start/end positions of the inner match.
+    capture: *const Node,
 };
 
 /// A character class range entry (e.g. `a-z` or a single `_`).

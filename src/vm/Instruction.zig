@@ -27,6 +27,9 @@ pub const Opcode = enum(u8) {
     call,
     /// Pop return address and jump to it.
     ret,
+    /// Record the current input position in capture slot N.
+    /// Even slots mark the start of a capture, odd slots mark the end.
+    save,
     /// Accept the match and halt.
     match,
 };
@@ -62,6 +65,7 @@ pub const Inst = struct {
         byte: u8,
         offset: u32,
         charset: u16,
+        slot: u16,
         none: void,
     };
 };

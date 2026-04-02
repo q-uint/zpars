@@ -19,6 +19,9 @@ charset_len: u16 = 0,
 patches: [max_patches]Patch = undefined,
 patch_len: u32 = 0,
 
+/// Number of capture groups emitted (each uses two slots).
+capture_count: u16 = 0,
+
 rules: []const Ast.Rule = &.{},
 
 const Patch = struct {
@@ -131,6 +134,13 @@ fn compileNode(self: *Compiler, node: Ast.Node) void {
             self.compileNode(inner.*);
             self.emit(.{ .op = .fail_twice });
             self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
+        },
+        .capture => |inner| {
+            const slot = self.capture_count * 2;
+            self.capture_count += 1;
+            self.emit(.{ .op = .save, .data = .{ .slot = slot } });
+            self.compileNode(inner.*);
+            self.emit(.{ .op = .save, .data = .{ .slot = slot + 1 } });
         },
         .anchor_start, .anchor_end, .prose_val => {
             // Not supported in VM yet.
@@ -255,4 +265,8 @@ pub fn getCode(self: *const Compiler) []const I.Inst {
 
 pub fn getCharsets(self: *const Compiler) []const I.Charset {
     return self.charsets[0..self.charset_len];
+}
+
+pub fn getCaptureCount(self: *const Compiler) u16 {
+    return self.capture_count;
 }

@@ -44,11 +44,12 @@ fn printUsage() void {
     , .{});
 }
 
-const Format = enum { abnf, peg, ere };
+const Format = enum { abnf, bnf, peg, ere };
 
 fn detectFormat(filename: []const u8) Format {
     if (std.mem.endsWith(u8, filename, ".peg")) return .peg;
     if (std.mem.endsWith(u8, filename, ".ere")) return .ere;
+    if (std.mem.endsWith(u8, filename, ".bnf")) return .bnf;
     return .abnf;
 }
 
@@ -95,6 +96,7 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const rules = switch (detectFormat(filename)) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename, stderr)).rules,
+        .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename, stderr)).rules,
         .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename, stderr)).rules,
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename, stderr)).rules,
     };
@@ -134,6 +136,12 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .abnf => {
             const r = try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename, stderr);
             zpars.abnf.Formatter.formatGrammar(r.rules, r.tokens, source, stdout) catch {
+                std.process.exit(1);
+            };
+        },
+        .bnf => {
+            const r = try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename, stderr);
+            zpars.bnf.Formatter.formatGrammar(r.rules, stdout) catch {
                 std.process.exit(1);
             };
         },
@@ -196,6 +204,7 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const rules = switch (fmt) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
+        .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename.?, stderr)).rules,
         .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
@@ -255,6 +264,7 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const rules = switch (detectFormat(filename.?)) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
+        .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename.?, stderr)).rules,
         .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
@@ -281,7 +291,15 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
         if (vm.execute()) |pos| {
             if (trace_enabled) try stdout.print("--- end ---\n", .{});
-            try stdout.print("match: {d} bytes\n", .{pos});
+            try stdout.print("match: {d} bytes \"{s}\"\n", .{ pos, inp[0..pos] });
+            const cap_count = compiler.getCaptureCount();
+            for (0..cap_count) |ci| {
+                if (vm.getCaptureSlice(@intCast(ci))) |slice| {
+                    try stdout.print("  group {d}: \"{s}\"\n", .{ ci, slice });
+                } else {
+                    try stdout.print("  group {d}: (none)\n", .{ci});
+                }
+            }
         } else {
             if (trace_enabled) try stdout.print("--- end ---\n", .{});
             try stdout.print("no match\n", .{});

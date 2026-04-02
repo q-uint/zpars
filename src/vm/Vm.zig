@@ -8,6 +8,7 @@ const I = @import("Instruction.zig");
 const Vm = @This();
 
 const max_stack = 1024;
+const max_captures = 64;
 
 const Entry = union(enum) {
     /// Backtrack point: saved position and instruction to jump to on failure.
@@ -17,12 +18,23 @@ const Entry = union(enum) {
     },
     /// Return address for rule calls.
     ret: u32,
+    /// Undo log for a save instruction: restore old value on backtrack.
+    save: struct {
+        slot: u16,
+        old: ?usize,
+    },
+};
+
+pub const Span = struct {
+    start: usize,
+    end: usize,
 };
 
 code: []const I.Inst,
 charsets: []const I.Charset,
 input: []const u8,
 trace: ?Trace = null,
+captures: [max_captures]?usize = .{null} ** max_captures,
 
 pub const Writer = @TypeOf(@as(std.fs.File.Writer, undefined).interface);
 
@@ -115,6 +127,13 @@ pub fn execute(self: *Vm) ?usize {
                 sp -= 1;
                 pc = stack[sp].ret;
             },
+            .save => {
+                const slot = inst.data.slot;
+                stack[sp] = .{ .save = .{ .slot = slot, .old = self.captures[slot] } };
+                sp += 1;
+                self.captures[slot] = pos;
+                pc += 1;
+            },
             .match => {
                 return pos;
             },
@@ -136,9 +155,25 @@ fn backtrack(self: *Vm, stack: *[max_stack]Entry, sp: *usize, pc: *u32, pos: *us
                 return true;
             },
             .ret => {},
+            .save => |s| {
+                self.captures[s.slot] = s.old;
+            },
         }
     }
     return false;
+}
+
+/// Return the span for capture group `i`, or null if not captured.
+pub fn getCapture(self: *const Vm, i: u16) ?Span {
+    const start = self.captures[i * 2] orelse return null;
+    const end = self.captures[i * 2 + 1] orelse return null;
+    return .{ .start = start, .end = end };
+}
+
+/// Return the matched slice for capture group `i`, or null if not captured.
+pub fn getCaptureSlice(self: *const Vm, i: u16) ?[]const u8 {
+    const span = self.getCapture(i) orelse return null;
+    return self.input[span.start..span.end];
 }
 
 fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
@@ -177,6 +212,7 @@ fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
         .jump => w.print("jump -> {d}", .{inst.data.offset}) catch {},
         .call => w.print("call -> {d}", .{inst.data.offset}) catch {},
         .ret => w.writeAll("ret") catch {},
+        .save => w.print("save {d}", .{inst.data.slot}) catch {},
         .match => w.writeAll("match") catch {},
     }
     w.writeByte('\n') catch {};
@@ -317,4 +353,53 @@ test "peg: not predicate" {
     try expectPegMatch(
         \\Line <- (!"\n" .)* "\n"
     , "hello\n", 6);
+}
+
+test "capture: single group" {
+    var compiler = compileEre("a(bc)d");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "abcd");
+    try testing.expectEqual(@as(?usize, 4), vm.execute());
+    try testing.expectEqualStrings("bc", vm.getCaptureSlice(0).?);
+}
+
+test "capture: multiple groups" {
+    var compiler = compileEre("(a+)(b+)");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "aaabb");
+    try testing.expectEqual(@as(?usize, 5), vm.execute());
+    try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
+    try testing.expectEqualStrings("bb", vm.getCaptureSlice(1).?);
+}
+
+test "capture: alternation picks correct branch" {
+    var compiler = compileEre("(ab)|(cd)");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "cd");
+    try testing.expectEqual(@as(?usize, 2), vm.execute());
+    // First group did not match.
+    try testing.expectEqual(@as(?Span, null), vm.getCapture(0));
+    // Second group matched.
+    try testing.expectEqualStrings("cd", vm.getCaptureSlice(1).?);
+}
+
+test "capture: nested groups" {
+    var compiler = compileEre("((a)(b))");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "ab");
+    try testing.expectEqual(@as(?usize, 2), vm.execute());
+    try testing.expectEqualStrings("ab", vm.getCaptureSlice(0).?);
+    try testing.expectEqualStrings("a", vm.getCaptureSlice(1).?);
+    try testing.expectEqualStrings("b", vm.getCaptureSlice(2).?);
+}
+
+test "capture: group with repetition" {
+    var compiler = compileEre("(a+)b");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "aaab");
+    try testing.expectEqual(@as(?usize, 4), vm.execute());
+    try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
+}
+
+test "capture: no match clears captures" {
+    var compiler = compileEre("(a)b");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "ac");
+    try testing.expectEqual(@as(?usize, null), vm.execute());
+    // Capture should be null after failed match (undone by backtrack).
+    try testing.expectEqual(@as(?Span, null), vm.getCapture(0));
 }

@@ -104,6 +104,7 @@ fn matchNode(self: *const Matcher, node: Ast.Node, input: []const u8, depth: usi
             if (input.len == 0) return null;
             return .{ .value = input[0..1], .rest = input[1..] };
         },
+        .capture => |inner| self.matchNode(inner.*, input, depth + 1),
     };
 }
 
