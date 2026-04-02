@@ -32,6 +32,7 @@ pub const Span = struct {
 
 code: []const I.Inst,
 charsets: []const I.Charset,
+string_data: []const u8,
 input: []const u8,
 trace: ?Trace = null,
 captures: [max_captures]?usize = .{null} ** max_captures,
@@ -42,8 +43,8 @@ pub const Trace = struct {
     writer: *Writer,
 };
 
-pub fn init(code: []const I.Inst, charsets: []const I.Charset, input: []const u8) Vm {
-    return .{ .code = code, .charsets = charsets, .input = input };
+pub fn init(code: []const I.Inst, charsets: []const I.Charset, string_data: []const u8, input: []const u8) Vm {
+    return .{ .code = code, .charsets = charsets, .string_data = string_data, .input = input };
 }
 
 /// Run the VM. Returns the position after the match, or null on failure.
@@ -60,6 +61,19 @@ pub fn execute(self: *Vm) ?usize {
             .char => {
                 if (pos < self.input.len and self.input[pos] == inst.data.byte) {
                     pos += 1;
+                    pc += 1;
+                } else {
+                    if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                    return null;
+                }
+            },
+            .string => {
+                const ref = inst.data.string;
+                const str = self.string_data[ref.offset..][0..ref.len];
+                if (pos + ref.len <= self.input.len and
+                    std.mem.eql(u8, self.input[pos..][0..ref.len], str))
+                {
+                    pos += ref.len;
                     pc += 1;
                 } else {
                     if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
@@ -202,6 +216,11 @@ fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
             else
                 w.print("char 0x{x:0>2}", .{b}) catch {};
         },
+        .string => {
+            const ref = inst.data.string;
+            const str = self.string_data[ref.offset..][0..ref.len];
+            w.print("string \"{s}\"", .{str}) catch {};
+        },
         .any => w.writeAll("any") catch {},
         .set => w.print("set [#{d}]", .{inst.data.charset}) catch {},
         .neg_set => w.print("neg_set [#{d}]", .{inst.data.charset}) catch {},
@@ -243,14 +262,14 @@ fn compilePeg(source: []const u8) Compiler {
 
 fn expectMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
     var compiler = compileEre(source);
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), input);
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
     const result = vm.execute();
     try testing.expectEqual(expected, result);
 }
 
 fn expectPegMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
     var compiler = compilePeg(source);
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), input);
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
     const result = vm.execute();
     try testing.expectEqual(expected, result);
 }
@@ -357,14 +376,14 @@ test "peg: not predicate" {
 
 test "capture: single group" {
     var compiler = compileEre("a(bc)d");
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "abcd");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "abcd");
     try testing.expectEqual(@as(?usize, 4), vm.execute());
     try testing.expectEqualStrings("bc", vm.getCaptureSlice(0).?);
 }
 
 test "capture: multiple groups" {
     var compiler = compileEre("(a+)(b+)");
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "aaabb");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaabb");
     try testing.expectEqual(@as(?usize, 5), vm.execute());
     try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
     try testing.expectEqualStrings("bb", vm.getCaptureSlice(1).?);
@@ -372,7 +391,7 @@ test "capture: multiple groups" {
 
 test "capture: alternation picks correct branch" {
     var compiler = compileEre("(ab)|(cd)");
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "cd");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "cd");
     try testing.expectEqual(@as(?usize, 2), vm.execute());
     // First group did not match.
     try testing.expectEqual(@as(?Span, null), vm.getCapture(0));
@@ -382,7 +401,7 @@ test "capture: alternation picks correct branch" {
 
 test "capture: nested groups" {
     var compiler = compileEre("((a)(b))");
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "ab");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "ab");
     try testing.expectEqual(@as(?usize, 2), vm.execute());
     try testing.expectEqualStrings("ab", vm.getCaptureSlice(0).?);
     try testing.expectEqualStrings("a", vm.getCaptureSlice(1).?);
@@ -391,14 +410,14 @@ test "capture: nested groups" {
 
 test "capture: group with repetition" {
     var compiler = compileEre("(a+)b");
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "aaab");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaab");
     try testing.expectEqual(@as(?usize, 4), vm.execute());
     try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
 }
 
 test "capture: no match clears captures" {
     var compiler = compileEre("(a)b");
-    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), "ac");
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "ac");
     try testing.expectEqual(@as(?usize, null), vm.execute());
     // Capture should be null after failed match (undone by backtrack).
     try testing.expectEqual(@as(?Span, null), vm.getCapture(0));

@@ -1,3 +1,21 @@
+// zpars build configuration.
+//
+// Build steps:
+//   zig build              Build the CLI executable
+//   zig build run          Run the CLI (pass args with -- after)
+//   zig build test         Run all tests (library + CLI)
+//   zig build bench        Run benchmarks (ReleaseFast)
+//   zig build lsp          Build the LSP server
+//   zig build vim          Generate Vim syntax files
+//   zig build wasm         Build WASM module for the Open VSX extension
+//   zig build web          Build WASM module for the web demo
+//   zig build vsx          Build the full Open VSX extension (WASM + TypeScript)
+//   zig build vsix         Package the extension as a .vsix
+//
+// The library module ("zpars") is rooted at src/root.zig and re-exported
+// as a dependency for the CLI (src/main.zig), LSP, benchmarks, and WASM
+// targets. Tests cover both the library and the CLI entry point.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {

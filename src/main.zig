@@ -272,12 +272,13 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var compiler = zpars.vm.Compiler.compile(rules);
     const code = compiler.getCode();
     const charsets = compiler.getCharsets();
+    const string_data = compiler.getStringData();
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const dis = zpars.vm.Disassembler.init(code, charsets);
+    const dis = zpars.vm.Disassembler.init(code, charsets, string_data);
     try dis.dump(stdout);
 
     if (input) |inp| {
@@ -285,7 +286,7 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (trace_enabled) try stdout.print("--- trace ---\n", .{});
         try stdout.flush();
 
-        var vm = zpars.vm.Vm.init(code, charsets, inp);
+        var vm = zpars.vm.Vm.init(code, charsets, string_data, inp);
         if (trace_enabled) {
             vm.trace = .{ .writer = stdout };
         }

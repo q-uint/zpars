@@ -6,9 +6,10 @@ const Disassembler = @This();
 
 code: []const I.Inst,
 charsets: []const I.Charset,
+string_data: []const u8,
 
-pub fn init(code: []const I.Inst, charsets: []const I.Charset) Disassembler {
-    return .{ .code = code, .charsets = charsets };
+pub fn init(code: []const I.Inst, charsets: []const I.Charset, string_data: []const u8) Disassembler {
+    return .{ .code = code, .charsets = charsets, .string_data = string_data };
 }
 
 pub fn dump(self: *const Disassembler, writer: anytype) !void {
@@ -21,6 +22,11 @@ pub fn dump(self: *const Disassembler, writer: anytype) !void {
                     try writer.print("char    '{c}'\n", .{b})
                 else
                     try writer.print("char    0x{x:0>2}\n", .{b});
+            },
+            .string => {
+                const ref = inst.data.string;
+                const str = self.string_data[ref.offset..][0..ref.len];
+                try writer.print("string  \"{s}\"\n", .{str});
             },
             .any => try writer.writeAll("any\n"),
             .set => {
@@ -95,13 +101,11 @@ test "disassemble literal" {
 
     var buf: [1024]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
-    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets());
+    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
     try dis.dump(stream.writer());
     try testing.expectEqualStrings(
-        \\   0: char    'a'
-        \\   1: char    'b'
-        \\   2: char    'c'
-        \\   3: match
+        \\   0: string  "abc"
+        \\   1: match
         \\
     , stream.getWritten());
 }
@@ -115,7 +119,7 @@ test "disassemble alternation" {
 
     var buf: [1024]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
-    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets());
+    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
     try dis.dump(stream.writer());
     try testing.expectEqualStrings(
         \\   0: choice  -> 3
@@ -136,7 +140,7 @@ test "disassemble star" {
 
     var buf: [1024]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
-    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets());
+    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
     try dis.dump(stream.writer());
     try testing.expectEqualStrings(
         \\   0: choice  -> 3
@@ -156,7 +160,7 @@ test "disassemble charset" {
 
     var buf: [1024]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
-    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets());
+    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
     try dis.dump(stream.writer());
     try testing.expectEqualStrings(
         \\   0: set     [a-z]
@@ -177,7 +181,7 @@ test "disassemble capture" {
 
     var buf: [1024]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
-    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets());
+    const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
     try dis.dump(stream.writer());
     try testing.expectEqualStrings(
         \\   0: char    'a'

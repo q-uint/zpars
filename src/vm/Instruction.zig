@@ -6,6 +6,8 @@
 pub const Opcode = enum(u8) {
     /// Match a single literal byte or fail.
     char,
+    /// Match a sequence of literal bytes or fail.
+    string,
     /// Match any single byte or fail.
     any,
     /// Match a byte within a 256-bit charset or fail.
@@ -66,6 +68,12 @@ pub const Inst = struct {
         offset: u32,
         charset: u16,
         slot: u16,
+        string: StringRef,
         none: void,
+    };
+
+    pub const StringRef = packed struct {
+        offset: u16,
+        len: u8,
     };
 };

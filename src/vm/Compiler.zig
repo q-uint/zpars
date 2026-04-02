@@ -3,11 +3,14 @@ const std = @import("std");
 const Ast = @import("../Ast.zig");
 const I = @import("Instruction.zig");
 
+const Optimizer = @import("Optimizer.zig");
+
 const Compiler = @This();
 
-const max_code = 4096;
+pub const max_code = 4096;
 const max_charsets = 256;
 const max_patches = 512;
+pub const max_string_data = 4096;
 
 code: [max_code]I.Inst = undefined,
 code_len: u32 = 0,
@@ -15,12 +18,17 @@ code_len: u32 = 0,
 charsets: [max_charsets]I.Charset = undefined,
 charset_len: u16 = 0,
 
+string_data: [max_string_data]u8 = undefined,
+string_data_len: u16 = 0,
+
 /// Pending call patches: instruction addresses that need a rule resolved.
 patches: [max_patches]Patch = undefined,
 patch_len: u32 = 0,
 
 /// Number of capture groups emitted (each uses two slots).
 capture_count: u16 = 0,
+
+optimize_enabled: bool = true,
 
 rules: []const Ast.Rule = &.{},
 
@@ -32,37 +40,46 @@ const Patch = struct {
 };
 
 pub fn compile(rules: []const Ast.Rule) Compiler {
+    return compileOpts(rules, .{});
+}
+
+pub const Options = struct {
+    optimize: bool = true,
+};
+
+pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Compiler {
     var c = Compiler{};
     c.rules = rules;
+    c.optimize_enabled = opts.optimize;
 
     if (rules.len == 0) {
         c.emit(.{ .op = .match });
-        return c;
-    }
-
-    // For a single rule (e.g. ERE), compile its node directly.
-    if (rules.len == 1) {
+    } else if (rules.len == 1) {
+        // Single rule (e.g. ERE): compile its node directly.
         c.compileNode(rules[0].node);
         c.emit(.{ .op = .match });
         c.patchCalls(&.{0}, rules);
-        return c;
+    } else {
+        // Multi-rule grammar: emit call to first rule, then match,
+        // then compile each rule as a callable block.
+        const entry_call = c.emitPlaceholder();
+        c.emit(.{ .op = .match });
+
+        var rule_addrs: [256]u32 = undefined;
+        for (rules, 0..) |rule, i| {
+            rule_addrs[i] = c.code_len;
+            c.compileNode(rule.node);
+            c.emit(.{ .op = .ret });
+        }
+
+        // Patch the entry call to point at the first rule.
+        c.code[entry_call] = .{ .op = .call, .data = .{ .offset = rule_addrs[0] } };
+        c.patchCalls(&rule_addrs, rules);
     }
 
-    // Multi-rule grammar: emit call to first rule, then match,
-    // then compile each rule as a callable block.
-    const entry_call = c.emitPlaceholder();
-    c.emit(.{ .op = .match });
-
-    var rule_addrs: [256]u32 = undefined;
-    for (rules, 0..) |rule, i| {
-        rule_addrs[i] = c.code_len;
-        c.compileNode(rule.node);
-        c.emit(.{ .op = .ret });
+    if (c.optimize_enabled) {
+        Optimizer.optimize(&c);
     }
-
-    // Patch the entry call to point at the first rule.
-    c.code[entry_call] = .{ .op = .call, .data = .{ .offset = rule_addrs[0] } };
-    c.patchCalls(&rule_addrs, rules);
     return c;
 }
 
@@ -235,15 +252,23 @@ fn addCharset(self: *Compiler, ranges: []const Ast.ClassRange) u16 {
             cs[word] |= @as(u64, 1) << bit;
         }
     }
-    const idx = self.charset_len;
-    self.charsets[idx] = cs;
-    self.charset_len += 1;
-    return idx;
+    return self.findOrAddCharset(cs);
 }
 
 fn addCharsetFromRaw(self: *Compiler, ranges: []const [2]u8) u16 {
+    return self.findOrAddCharset(I.charsetFromRanges(ranges));
+}
+
+fn findOrAddCharset(self: *Compiler, cs: I.Charset) u16 {
+    for (self.charsets[0..self.charset_len], 0..) |existing, i| {
+        if (existing[0] == cs[0] and existing[1] == cs[1] and
+            existing[2] == cs[2] and existing[3] == cs[3])
+        {
+            return @intCast(i);
+        }
+    }
     const idx = self.charset_len;
-    self.charsets[idx] = I.charsetFromRanges(ranges);
+    self.charsets[idx] = cs;
     self.charset_len += 1;
     return idx;
 }
@@ -265,6 +290,10 @@ pub fn getCode(self: *const Compiler) []const I.Inst {
 
 pub fn getCharsets(self: *const Compiler) []const I.Charset {
     return self.charsets[0..self.charset_len];
+}
+
+pub fn getStringData(self: *const Compiler) []const u8 {
+    return self.string_data[0..self.string_data_len];
 }
 
 pub fn getCaptureCount(self: *const Compiler) u16 {

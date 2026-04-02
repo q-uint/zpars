@@ -154,7 +154,7 @@ $ zpars vm -t pattern.ere "abcbd"
    ...
 ```
 
-The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 13 opcodes: `char`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, and `match`.
+The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 14 opcodes: `char`, `string`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, and `match`.
 
 Try the example grammars:
 
