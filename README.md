@@ -3,7 +3,7 @@
   <h1 align="center">zpars</h1>
   <p align="center">
     A grammar parser toolkit written in Zig — ABNF, BNF, PEG, CFG, ERE, and S-expressions<br>
-    with comptime parser combinators, a bytecode VM, and an AArch64 JIT compiler.
+    with comptime parser combinators, a bytecode VM, and native JIT compilers for AArch64 and x86_64.
   </p>
   <p align="center">
     <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/zig-0.15.2+-f7a41d?logo=zig&logoColor=white" alt="Zig 0.15.2+"></a>
@@ -22,7 +22,7 @@
 - **ABNF compiler** — Compile ABNF grammar strings into combinator types at comptime — define your grammar in standard ABNF and get a parser for free.
 - **Grammar VM** — Bytecode virtual machine inspired by LPeg. Compiles any grammar to instructions and executes with backtracking and capture groups.
 - **Peephole optimizer** — Optimizes compiled bytecode with charset-to-char reduction, consecutive char fusion into string instructions, common prefix factoring, and optional char fusion.
-- **AArch64 JIT compiler** — Compiles bytecode to native ARM64 machine code, eliminating interpreter dispatch overhead.
+- **JIT compilers** — Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
 - **Benchmarks** — 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
 ## Comptime ABNF Compiler
@@ -168,9 +168,9 @@ The optimizer runs after compilation, rewriting bytecode in-place before executi
 - **Common prefix factoring** — Factors shared prefixes out of alternation branches (e.g. `https|http` shares `http`).
 - **Optional char fusion** — Collapses `choice`/`char`/`commit` sequences for `a?` patterns into a single `optional_char` instruction.
 
-### AArch64 JIT Compiler
+### JIT Compilers
 
-The JIT compiler translates VM bytecode to native ARM64 machine code, removing interpreter dispatch overhead entirely. It uses the same API as the interpreter VM:
+The JIT compiler translates VM bytecode to native machine code, removing interpreter dispatch overhead entirely. Both AArch64 (ARM64) and x86_64 backends are supported, selected automatically at compile time. The JIT uses the same API as the interpreter VM:
 
 ```zig
 const zpars = @import("zpars");

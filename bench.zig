@@ -213,7 +213,6 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    // -- Comptime vs Runtime (tree-walker) benchmarks --
     try stdout.print("\n  Comptime vs Runtime (tree-walker)\n", .{});
     try stdout.print("  {s:<16} {s:>14} {s:>14} {s:>10}\n", .{
         "case", "comptime", "runtime", "ratio",
@@ -248,7 +247,6 @@ pub fn main() !void {
 
     try stdout.print("\n  ({d} iterations per case)\n", .{iterations});
 
-    // -- VM optimized vs unoptimized benchmarks --
     try stdout.print("\n  VM optimized vs unoptimized\n", .{});
     try stdout.print("  {s:<16} {s:>14} {s:>14} {s:>10} {s:>8} {s:>8}\n", .{
         "case", "optimized", "unoptimized", "speedup", "opt #", "unopt #",
@@ -281,7 +279,6 @@ pub fn main() !void {
         });
     }
 
-    // -- VM interpreter vs JIT benchmarks --
     try stdout.print("\n  VM interpreter vs JIT\n", .{});
     try stdout.print("  {s:<16} {s:>14} {s:>14} {s:>10}\n", .{
         "case", "interpreter", "jit", "speedup",

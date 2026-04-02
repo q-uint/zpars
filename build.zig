@@ -69,7 +69,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
-    // --- LSP server ---
     const lsp_step = b.step("lsp", "Build the LSP server");
     const lsp_exe = b.addExecutable(.{
         .name = "zpars-lsp",
@@ -85,7 +84,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lsp_exe);
     lsp_step.dependOn(b.getInstallStep());
 
-    // --- Vim syntax files ---
     const vim_step = b.step("vim", "Generate Vim syntax files");
     const vim_exe = b.addExecutable(.{
         .name = "zpars-vim",
@@ -101,13 +99,11 @@ pub fn build(b: *std.Build) void {
     }
     vim_step.dependOn(&vim_run.step);
 
-    // --- Shared WASM settings ---
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
 
-    // --- WASM target for the Open VSX extension (analyze only) ---
     const wasm_step = b.step("wasm", "Build WASM module for the Open VSX extension");
     const wasm_lib = b.addExecutable(.{
         .name = "zpars",
@@ -128,7 +124,6 @@ pub fn build(b: *std.Build) void {
     });
     wasm_step.dependOn(&install_wasm.step);
 
-    // --- WASM target for the web demo (analyze + match) ---
     const web_step = b.step("web", "Build WASM module for the web demo");
     const web_wasm = b.addExecutable(.{
         .name = "zpars",
@@ -151,14 +146,12 @@ pub fn build(b: *std.Build) void {
     });
     web_step.dependOn(&install_web_wasm.step);
 
-    // --- Open VSX extension (WASM + TypeScript) ---
     const vsx_step = b.step("vsx", "Build the Open VSX extension (WASM + TypeScript)");
     const npm_compile = b.addSystemCommand(&.{ "npm", "run", "compile" });
     npm_compile.setCwd(b.path("editors/vsx"));
     npm_compile.step.dependOn(&install_wasm.step);
     vsx_step.dependOn(&npm_compile.step);
 
-    // --- Package VSIX ---
     const vsix_step = b.step("vsix", "Package the Open VSX extension as a .vsix");
     const vsce_package = b.addSystemCommand(&.{ "vsce", "package" });
     vsce_package.setCwd(b.path("editors/vsx"));
