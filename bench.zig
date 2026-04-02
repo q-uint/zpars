@@ -8,6 +8,7 @@ const Validator = zpars.Validator;
 const Ast = zpars.Ast;
 const VmCompiler = zpars.vm.Compiler;
 const Vm = zpars.vm.Vm;
+const Jit = zpars.vm.Jit;
 const EreScanner = zpars.ere.Scanner;
 const EreParser = zpars.ere.Parser;
 
@@ -186,6 +187,23 @@ fn benchVm(compiler: *const VmCompiler, input: []const u8) u64 {
     return timer.read();
 }
 
+fn benchJit(compiler: *const VmCompiler, input: []const u8) u64 {
+    var inp: []const u8 = input;
+    std.mem.doNotOptimizeAway(&inp);
+
+    var jit = Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), inp) catch unreachable;
+    defer jit.deinit();
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    for (0..iterations) |_| {
+        const r = jit.execute();
+        std.mem.doNotOptimizeAway(&r);
+    }
+
+    return timer.read();
+}
+
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -260,6 +278,36 @@ pub fn main() !void {
             speedup,
             opt.code_len,
             unopt.code_len,
+        });
+    }
+
+    // -- VM interpreter vs JIT benchmarks --
+    try stdout.print("\n  VM interpreter vs JIT\n", .{});
+    try stdout.print("  {s:<16} {s:>14} {s:>14} {s:>10}\n", .{
+        "case", "interpreter", "jit", "speedup",
+    });
+    try stdout.print("  {s:-<16} {s:->14} {s:->14} {s:->10}\n", .{
+        "", "", "", "",
+    });
+
+    for (vm_cases) |case| {
+        const comp = compileEre(case.pattern, true);
+
+        const vm_ns = benchVm(&comp, case.input);
+        const jit_ns = benchJit(&comp, case.input);
+
+        const vm_per_op = vm_ns / iterations;
+        const jit_per_op = jit_ns / iterations;
+        const speedup: f64 = if (jit_per_op > 0)
+            @as(f64, @floatFromInt(vm_per_op)) / @as(f64, @floatFromInt(jit_per_op))
+        else
+            0;
+
+        try stdout.print("  {s:<16} {d:>11} ns {d:>11} ns {d:>9.2}x\n", .{
+            case.name,
+            vm_per_op,
+            jit_per_op,
+            speedup,
         });
     }
 

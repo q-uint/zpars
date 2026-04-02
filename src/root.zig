@@ -40,6 +40,7 @@ pub const vm = struct {
     pub const Compiler = @import("vm/Compiler.zig");
     pub const Disassembler = @import("vm/Disassembler.zig");
     pub const Instruction = @import("vm/Instruction.zig");
+    pub const Jit = @import("vm/Jit.zig");
     pub const Vm = @import("vm/Vm.zig");
 };
 pub const Ast = @import("Ast.zig");
