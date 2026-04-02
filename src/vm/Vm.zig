@@ -109,6 +109,12 @@ pub fn execute(self: *Vm) ?usize {
                     return null;
                 }
             },
+            .optional_char => {
+                if (pos < self.input.len and self.input[pos] == inst.data.byte) {
+                    pos += 1;
+                }
+                pc += 1;
+            },
             .choice => {
                 stack[sp] = .{ .choice = .{ .pos = pos, .pc = inst.data.offset } };
                 sp += 1;
@@ -224,6 +230,13 @@ fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
         .any => w.writeAll("any") catch {},
         .set => w.print("set [#{d}]", .{inst.data.charset}) catch {},
         .neg_set => w.print("neg_set [#{d}]", .{inst.data.charset}) catch {},
+        .optional_char => {
+            const b = inst.data.byte;
+            if (b >= 0x20 and b < 0x7F)
+                w.print("opt_char '{c}'", .{b}) catch {}
+            else
+                w.print("opt_char 0x{x:0>2}", .{b}) catch {};
+        },
         .choice => w.print("choice -> {d}", .{inst.data.offset}) catch {},
         .commit => w.print("commit -> {d}", .{inst.data.offset}) catch {},
         .fail => w.writeAll("fail") catch {},

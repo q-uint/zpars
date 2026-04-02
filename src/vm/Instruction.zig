@@ -32,6 +32,9 @@ pub const Opcode = enum(u8) {
     /// Record the current input position in capture slot N.
     /// Even slots mark the start of a capture, odd slots mark the end.
     save,
+    /// Match a single literal byte if present, without backtracking.
+    /// Equivalent to choice/char/commit but without stack operations.
+    optional_char,
     /// Accept the match and halt.
     match,
 };

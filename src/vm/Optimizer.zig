@@ -9,6 +9,7 @@ const Compiler = @import("Compiler.zig");
 pub fn optimize(c: *Compiler) void {
     singleCharSetToChar(c.code[0..c.code_len], c.charsets[0..c.charset_len]);
     fuseConsecutiveChars(c);
+    fuseOptionalChar(c);
 }
 
 /// Replace `set` instructions whose charset has exactly one bit set
@@ -95,6 +96,63 @@ fn fuseConsecutiveChars(c: *Compiler) void {
     c.code_len = new_len;
 
     // Repatch all offset-bearing instructions.
+    for (c.code[0..c.code_len]) |*inst| {
+        switch (inst.op) {
+            .jump, .call, .choice, .commit => {
+                inst.data = .{ .offset = remap[inst.data.offset] };
+            },
+            else => {},
+        }
+    }
+}
+
+/// Fuse `choice[+3], char, commit[+1]` into a single `optional_char`.
+/// This pattern is emitted for `e?` when `e` is a single char.
+fn fuseOptionalChar(c: *Compiler) void {
+    const code = c.code[0..c.code_len];
+
+    var keep = [_]bool{true} ** Compiler.max_code;
+    var any_fused = false;
+
+    var i: u32 = 0;
+    while (i + 2 < c.code_len) {
+        if (code[i].op == .choice and
+            code[i + 1].op == .char and
+            code[i + 2].op == .commit and
+            code[i].data.offset == i + 3 and
+            code[i + 2].data.offset == i + 3)
+        {
+            // Replace choice with optional_char, mark char and commit for removal.
+            code[i] = .{ .op = .optional_char, .data = .{ .byte = code[i + 1].data.byte } };
+            keep[i + 1] = false;
+            keep[i + 2] = false;
+            any_fused = true;
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+
+    if (!any_fused) return;
+
+    // Build remap table and compact, same as fuseConsecutiveChars.
+    var remap = [_]u32{0} ** Compiler.max_code;
+    var new_len: u32 = 0;
+    for (0..c.code_len) |old| {
+        remap[old] = new_len;
+        if (keep[old]) new_len += 1;
+    }
+    remap[c.code_len] = new_len;
+
+    var dst: u32 = 0;
+    for (0..c.code_len) |old| {
+        if (keep[old]) {
+            c.code[dst] = code[old];
+            dst += 1;
+        }
+    }
+    c.code_len = new_len;
+
     for (c.code[0..c.code_len]) |*inst| {
         switch (inst.op) {
             .jump, .call, .choice, .commit => {
@@ -199,6 +257,35 @@ test "string fusion preserves offsets" {
     try testing.expectEqual(@as(u32, 3), code[0].data.offset);
     // commit should jump past the end
     try testing.expectEqual(@as(u32, 4), code[2].data.offset);
+}
+
+test "optional char fused" {
+    // "a?" should produce optional_char instead of choice/char/commit.
+    const compiler = compileEre("a?");
+    const code = compiler.getCode();
+    try testing.expectEqual(I.Opcode.optional_char, code[0].op);
+    try testing.expectEqual(@as(u8, 'a'), code[0].data.byte);
+    try testing.expectEqual(I.Opcode.match, code[1].op);
+    try testing.expectEqual(@as(u32, 2), compiler.code_len);
+}
+
+test "optional char not fused for star" {
+    // "a*" uses choice/char/commit but commit jumps back, not forward.
+    const compiler = compileEre("a*");
+    const code = compiler.getCode();
+    // Should remain choice/char/commit, not fused.
+    try testing.expectEqual(I.Opcode.choice, code[0].op);
+}
+
+test "optional char preserves surrounding offsets" {
+    // "a?b" should become: optional_char 'a', char 'b', match
+    const compiler = compileEre("a?b");
+    const code = compiler.getCode();
+    try testing.expectEqual(I.Opcode.optional_char, code[0].op);
+    try testing.expectEqual(@as(u8, 'a'), code[0].data.byte);
+    try testing.expectEqual(I.Opcode.char, code[1].op);
+    try testing.expectEqual(@as(u8, 'b'), code[1].data.byte);
+    try testing.expectEqual(I.Opcode.match, code[2].op);
 }
 
 test "optimizer disabled" {

@@ -39,6 +39,13 @@ pub fn dump(self: *const Disassembler, writer: anytype) !void {
                 try self.printCharset(writer, inst.data.charset);
                 try writer.writeByte('\n');
             },
+            .optional_char => {
+                const b = inst.data.byte;
+                if (b >= 0x20 and b < 0x7F)
+                    try writer.print("opt_char '{c}'\n", .{b})
+                else
+                    try writer.print("opt_char 0x{x:0>2}\n", .{b});
+            },
             .choice => try writer.print("choice  -> {d}\n", .{inst.data.offset}),
             .commit => try writer.print("commit  -> {d}\n", .{inst.data.offset}),
             .fail => try writer.writeAll("fail\n"),
