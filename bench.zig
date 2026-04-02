@@ -144,6 +144,18 @@ const vm_cases = [_]VmCase{
         .input = "abcdefghijklmnop",
     },
     .{
+        // common prefix factoring: "https|http" shares "http" prefix
+        .name = "prefix factor",
+        .pattern = "https|http",
+        .input = "https",
+    },
+    .{
+        // common prefix with both suffixes non-empty
+        .name = "prefix both",
+        .pattern = "httpAB|httpCD",
+        .input = "httpCD",
+    },
+    .{
         // repetition over charset (no fusion, baseline)
         .name = "charset repeat",
         .pattern = "[a-z]+",

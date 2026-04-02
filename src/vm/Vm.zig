@@ -347,6 +347,19 @@ test "interval repetition" {
     try expectMatch("a{2,4}", "aaaaa", 4);
 }
 
+test "alternation with common prefix" {
+    try expectMatch("https|http", "https", 5);
+    try expectMatch("https|http", "http", 4);
+    try expectMatch("https|http", "httq", null);
+    try expectMatch("httpAB|httpCD", "httpAB", 6);
+    try expectMatch("httpAB|httpCD", "httpCD", 6);
+    try expectMatch("httpAB|httpCD", "httpXX", null);
+    try expectMatch("httpAB|httpCD", "http", null);
+    try expectMatch("ab|a", "ab", 2);
+    try expectMatch("ab|a", "a", 1);
+    try expectMatch("ab|a", "x", null);
+}
+
 test "peg: single rule" {
     try expectPegMatch("Main <- \"hello\"", "hello", 5);
     try expectPegMatch("Main <- \"hello\"", "world", null);
