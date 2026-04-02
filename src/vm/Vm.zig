@@ -1,0 +1,320 @@
+/// Grammar parsing VM.
+///
+/// Executes bytecode produced by the Compiler. Uses a backtracking
+/// stack for ordered choice and a call stack for rule invocations.
+const std = @import("std");
+const I = @import("Instruction.zig");
+
+const Vm = @This();
+
+const max_stack = 1024;
+
+const Entry = union(enum) {
+    /// Backtrack point: saved position and instruction to jump to on failure.
+    choice: struct {
+        pos: usize,
+        pc: u32,
+    },
+    /// Return address for rule calls.
+    ret: u32,
+};
+
+code: []const I.Inst,
+charsets: []const I.Charset,
+input: []const u8,
+trace: ?Trace = null,
+
+pub const Writer = @TypeOf(@as(std.fs.File.Writer, undefined).interface);
+
+pub const Trace = struct {
+    writer: *Writer,
+};
+
+pub fn init(code: []const I.Inst, charsets: []const I.Charset, input: []const u8) Vm {
+    return .{ .code = code, .charsets = charsets, .input = input };
+}
+
+/// Run the VM. Returns the position after the match, or null on failure.
+pub fn execute(self: *Vm) ?usize {
+    var pc: u32 = 0;
+    var pos: usize = 0;
+    var stack: [max_stack]Entry = undefined;
+    var sp: usize = 0;
+
+    while (pc < self.code.len) {
+        const inst = self.code[pc];
+        self.traceStep(pc, pos, sp, inst);
+        switch (inst.op) {
+            .char => {
+                if (pos < self.input.len and self.input[pos] == inst.data.byte) {
+                    pos += 1;
+                    pc += 1;
+                } else {
+                    if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                    return null;
+                }
+            },
+            .any => {
+                if (pos < self.input.len) {
+                    pos += 1;
+                    pc += 1;
+                } else {
+                    if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                    return null;
+                }
+            },
+            .set => {
+                const cs = self.charsets[inst.data.charset];
+                if (pos < self.input.len and I.charsetContains(cs, self.input[pos])) {
+                    pos += 1;
+                    pc += 1;
+                } else {
+                    if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                    return null;
+                }
+            },
+            .neg_set => {
+                const cs = self.charsets[inst.data.charset];
+                if (pos < self.input.len and !I.charsetContains(cs, self.input[pos])) {
+                    pos += 1;
+                    pc += 1;
+                } else {
+                    if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                    return null;
+                }
+            },
+            .choice => {
+                stack[sp] = .{ .choice = .{ .pos = pos, .pc = inst.data.offset } };
+                sp += 1;
+                pc += 1;
+            },
+            .commit => {
+                // Pop the backtrack entry (discard it) and jump.
+                sp -= 1;
+                pc = inst.data.offset;
+            },
+            .fail => {
+                if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                return null;
+            },
+            .fail_twice => {
+                // Pop one entry then fail.
+                sp -= 1;
+                if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                return null;
+            },
+            .jump => {
+                pc = inst.data.offset;
+            },
+            .call => {
+                stack[sp] = .{ .ret = pc + 1 };
+                sp += 1;
+                pc = inst.data.offset;
+            },
+            .ret => {
+                sp -= 1;
+                pc = stack[sp].ret;
+            },
+            .match => {
+                return pos;
+            },
+        }
+    }
+    return null;
+}
+
+fn backtrack(self: *Vm, stack: *[max_stack]Entry, sp: *usize, pc: *u32, pos: *usize) bool {
+    while (sp.* > 0) {
+        sp.* -= 1;
+        switch (stack[sp.*]) {
+            .choice => |c| {
+                if (self.trace) |t| {
+                    t.writer.print("      backtrack -> pc={d} pos={d}\n", .{ c.pc, c.pos }) catch {};
+                }
+                pc.* = c.pc;
+                pos.* = c.pos;
+                return true;
+            },
+            .ret => {},
+        }
+    }
+    return false;
+}
+
+fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
+    const t = self.trace orelse return;
+    const w = t.writer;
+    // pc, stack depth, position, remaining input preview
+    w.print("{d:>4}: sp={d:<3} pos={d:<3} ", .{ pc, sp, pos }) catch return;
+    // input context: show up to 16 bytes from current position
+    w.writeByte('"') catch return;
+    const remaining = self.input[pos..];
+    const preview = remaining[0..@min(remaining.len, 16)];
+    for (preview) |b| {
+        if (b >= 0x20 and b < 0x7F)
+            w.writeByte(b) catch return
+        else
+            w.print("\\x{x:0>2}", .{b}) catch return;
+    }
+    if (remaining.len > 16) w.writeAll("...") catch {};
+    w.writeAll("\" ") catch return;
+    // opcode
+    switch (inst.op) {
+        .char => {
+            const b = inst.data.byte;
+            if (b >= 0x20 and b < 0x7F)
+                w.print("char '{c}'", .{b}) catch {}
+            else
+                w.print("char 0x{x:0>2}", .{b}) catch {};
+        },
+        .any => w.writeAll("any") catch {},
+        .set => w.print("set [#{d}]", .{inst.data.charset}) catch {},
+        .neg_set => w.print("neg_set [#{d}]", .{inst.data.charset}) catch {},
+        .choice => w.print("choice -> {d}", .{inst.data.offset}) catch {},
+        .commit => w.print("commit -> {d}", .{inst.data.offset}) catch {},
+        .fail => w.writeAll("fail") catch {},
+        .fail_twice => w.writeAll("fail_twice") catch {},
+        .jump => w.print("jump -> {d}", .{inst.data.offset}) catch {},
+        .call => w.print("call -> {d}", .{inst.data.offset}) catch {},
+        .ret => w.writeAll("ret") catch {},
+        .match => w.writeAll("match") catch {},
+    }
+    w.writeByte('\n') catch {};
+}
+
+const testing = std.testing;
+const Compiler = @import("Compiler.zig");
+const EreScanner = @import("../ere/Scanner.zig");
+const EreParser = @import("../ere/Parser.zig");
+const PegScanner = @import("../peg/Scanner.zig");
+const PegParser = @import("../peg/Parser.zig");
+
+fn compileEre(source: []const u8) Compiler {
+    var scanner = EreScanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = EreParser.init(tokens, source);
+    const rules = parser.parse() catch return Compiler{};
+    return Compiler.compile(rules);
+}
+
+fn compilePeg(source: []const u8) Compiler {
+    var scanner = PegScanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = PegParser.init(tokens, source);
+    const rules = parser.parse() catch return Compiler{};
+    return Compiler.compile(rules);
+}
+
+fn expectMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
+    var compiler = compileEre(source);
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), input);
+    const result = vm.execute();
+    try testing.expectEqual(expected, result);
+}
+
+fn expectPegMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
+    var compiler = compilePeg(source);
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), input);
+    const result = vm.execute();
+    try testing.expectEqual(expected, result);
+}
+
+test "literal match" {
+    try expectMatch("abc", "abc", 3);
+    try expectMatch("abc", "abx", null);
+    try expectMatch("abc", "ab", null);
+}
+
+test "alternation" {
+    try expectMatch("a|b", "a", 1);
+    try expectMatch("a|b", "b", 1);
+    try expectMatch("a|b", "c", null);
+}
+
+test "star repetition" {
+    try expectMatch("a*", "", 0);
+    try expectMatch("a*", "aaa", 3);
+    try expectMatch("a*b", "aaab", 4);
+    try expectMatch("a*b", "b", 1);
+}
+
+test "plus repetition" {
+    try expectMatch("a+", "", null);
+    try expectMatch("a+", "aaa", 3);
+}
+
+test "optional" {
+    try expectMatch("a?b", "ab", 2);
+    try expectMatch("a?b", "b", 1);
+}
+
+test "character class" {
+    try expectMatch("[a-z]+", "hello", 5);
+    try expectMatch("[a-z]+", "HELLO", null);
+    try expectMatch("[0-9]+", "42", 2);
+}
+
+test "negated character class" {
+    try expectMatch("[^0-9]+", "abc", 3);
+    try expectMatch("[^0-9]+", "123", null);
+}
+
+test "dot wildcard" {
+    try expectMatch("a.c", "abc", 3);
+    try expectMatch("a.c", "aXc", 3);
+    try expectMatch("a.c", "ac", null);
+}
+
+test "grouped alternation" {
+    try expectMatch("(ab|cd)e", "abe", 3);
+    try expectMatch("(ab|cd)e", "cde", 3);
+    try expectMatch("(ab|cd)e", "ace", null);
+}
+
+test "interval repetition" {
+    try expectMatch("a{2,4}", "a", null);
+    try expectMatch("a{2,4}", "aa", 2);
+    try expectMatch("a{2,4}", "aaa", 3);
+    try expectMatch("a{2,4}", "aaaa", 4);
+    try expectMatch("a{2,4}", "aaaaa", 4);
+}
+
+test "peg: single rule" {
+    try expectPegMatch("Main <- \"hello\"", "hello", 5);
+    try expectPegMatch("Main <- \"hello\"", "world", null);
+}
+
+test "peg: rule references" {
+    try expectPegMatch(
+        \\Main  <- Greeting " " Name
+        \\Greeting <- "hi" / "hello"
+        \\Name <- [a-z]+
+    , "hi world", 8);
+    try expectPegMatch(
+        \\Main  <- Greeting " " Name
+        \\Greeting <- "hi" / "hello"
+        \\Name <- [a-z]+
+    , "hello world", 11);
+}
+
+test "peg: recursive rules" {
+    try expectPegMatch(
+        \\Expr   <- Term ("+" Term)*
+        \\Term   <- Factor ("*" Factor)*
+        \\Factor <- "(" Expr ")" / [0-9]+
+    , "1+2*3", 5);
+    try expectPegMatch(
+        \\Expr   <- Term ("+" Term)*
+        \\Term   <- Factor ("*" Factor)*
+        \\Factor <- "(" Expr ")" / [0-9]+
+    , "(1+2)*3", 7);
+}
+
+test "peg: not predicate" {
+    try expectPegMatch(
+        \\Line <- (!"\n" .)*
+    , "hello world", 11);
+    try expectPegMatch(
+        \\Line <- (!"\n" .)* "\n"
+    , "hello\n", 6);
+}

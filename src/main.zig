@@ -21,6 +21,8 @@ pub fn main() !void {
         try runFmt(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "match")) {
         try runMatch(allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "vm")) {
+        try runVm(allocator, args[2..]);
     } else {
         printUsage();
         std.process.exit(1);
@@ -35,6 +37,7 @@ fn printUsage() void {
         \\  check <file>                       Validate a grammar
         \\  fmt   <file>                       Format a grammar
         \\  match -r <rule> <file> <input>     Match input against a rule
+        \\  vm    [-t] <file> [<input>]         Disassemble (and optionally run) via VM
         \\
         \\Format is auto-detected from file extension (.abnf, .peg, .ere).
         \\
@@ -220,6 +223,71 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const stdout = &stdout_writer.interface;
 
     try stdout.print("{s}\n", .{result.value});
+    try stdout.flush();
+}
+
+fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var filename: ?[]const u8 = null;
+    var input: ?[]const u8 = null;
+    var trace_enabled = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-t")) {
+            trace_enabled = true;
+        } else if (filename == null) {
+            filename = arg;
+        } else if (input == null) {
+            input = arg;
+        }
+    }
+
+    if (filename == null) {
+        std.debug.print("usage: zpars vm [-t] <file> [<input>]\n", .{});
+        std.process.exit(1);
+    }
+
+    const source = try readSource(allocator, filename.?);
+    defer allocator.free(source);
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const rules = switch (detectFormat(filename.?)) {
+        .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
+        .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
+    };
+
+    var compiler = zpars.vm.Compiler.compile(rules);
+    const code = compiler.getCode();
+    const charsets = compiler.getCharsets();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    const dis = zpars.vm.Disassembler.init(code, charsets);
+    try dis.dump(stdout);
+
+    if (input) |inp| {
+        try stdout.print("\ninput: \"{s}\"\n", .{inp});
+        if (trace_enabled) try stdout.print("--- trace ---\n", .{});
+        try stdout.flush();
+
+        var vm = zpars.vm.Vm.init(code, charsets, inp);
+        if (trace_enabled) {
+            vm.trace = .{ .writer = stdout };
+        }
+        if (vm.execute()) |pos| {
+            if (trace_enabled) try stdout.print("--- end ---\n", .{});
+            try stdout.print("match: {d} bytes\n", .{pos});
+        } else {
+            if (trace_enabled) try stdout.print("--- end ---\n", .{});
+            try stdout.print("no match\n", .{});
+        }
+    }
+
     try stdout.flush();
 }
 
