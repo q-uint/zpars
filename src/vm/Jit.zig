@@ -45,6 +45,8 @@ pub const JitCtx = extern struct {
     stack_ptr: u64,
     jump_table_ptr: u64,
     code_base_ptr: u64,
+    helper_string_match: u64,
+    helper_charset_match: u64,
 };
 code: []const I.Inst,
 charsets: []const I.Charset,
@@ -99,6 +101,8 @@ pub fn execute(self: *Jit) ?usize {
         .stack_ptr = @intFromPtr(&self.stack_buf),
         .jump_table_ptr = @intFromPtr(&self.jump_table),
         .code_base_ptr = @intFromPtr(self.native_code.ptr),
+        .helper_string_match = @intFromPtr(&helperStringMatch),
+        .helper_charset_match = @intFromPtr(&helperCharsetMatch),
     };
 
     const jit_fn: *const fn (*const JitCtx) callconv(.c) u64 =

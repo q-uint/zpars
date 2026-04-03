@@ -49,7 +49,9 @@ const stk_csp: i32 = 0;
 const stk_sdp: i32 = 8;
 const stk_jtp: i32 = 16;
 const stk_cbp: i32 = 24;
-const stk_size: i32 = 40; // 32 data + 8 alignment
+const stk_hsm: i32 = 32; // helper_string_match
+const stk_hcm: i32 = 40; // helper_charset_match
+const stk_size: i32 = 48;
 
 // Condition codes for Jcc
 const CC = struct {
@@ -362,32 +364,29 @@ fn patchRel32(buf: *Buf, rel32_off: u32, target_off: u32) void {
     buf.patchI32At(rel32_off, rel);
 }
 
-pub fn compile(self: *Jit) !void {
-    const est = (self.code.len + 1) * 128 + 4096;
-    const size = std.mem.alignForward(usize, est, page_size);
+pub const GenerateResult = struct {
+    native_len: usize,
+    jump_table: [4096]u64,
+};
 
-    self.native_code = try std.posix.mmap(
-        null,
-        size,
-        std.c.PROT.READ | std.c.PROT.WRITE,
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
+pub fn estimateSize(code_len: usize) usize {
+    return (code_len + 1) * 128 + 4096;
+}
 
-    var buf = Buf{ .ptr = self.native_code.ptr, .len = 0 };
+pub fn generate(code: []const I.Inst, output: [*]u8) GenerateResult {
+    var buf = Buf{ .ptr = output, .len = 0 };
     var fixups: [8192]Fixup = undefined;
     var fcount: usize = 0;
     var bc_map: [4096]u32 = undefined;
 
     emitPrologue(&buf);
 
-    for (self.code, 0..) |inst, i| {
+    for (code, 0..) |inst, i| {
         bc_map[i] = buf.off();
         emitInst(&buf, inst, &fixups, &fcount);
     }
-    if (self.code.len < 4096)
-        bc_map[self.code.len] = buf.off();
+    if (code.len < 4096)
+        bc_map[code.len] = buf.off();
 
     const bt_off = buf.off();
     emitBacktrackHandler(&buf, &fixups, &fcount);
@@ -408,11 +407,32 @@ pub fn compile(self: *Jit) !void {
         patchRel32(&buf, f.rel32_off, tgt_off);
     }
 
-    for (0..self.code.len) |i| {
-        self.jump_table[i] = bc_map[i];
+    var result = GenerateResult{
+        .native_len = buf.len,
+        .jump_table = [_]u64{0} ** 4096,
+    };
+    for (0..code.len) |i| {
+        result.jump_table[i] = bc_map[i];
     }
+    return result;
+}
 
-    self.native_len = buf.len;
+pub fn compile(self: *Jit) !void {
+    const est = estimateSize(self.code.len);
+    const size = std.mem.alignForward(usize, est, page_size);
+
+    self.native_code = try std.posix.mmap(
+        null,
+        size,
+        std.c.PROT.READ | std.c.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+
+    const result = generate(self.code, self.native_code.ptr);
+    self.native_len = result.native_len;
+    self.jump_table = result.jump_table;
 
     try std.posix.mprotect(
         @alignCast(self.native_code[0..size]),
@@ -443,6 +463,10 @@ fn emitPrologue(buf: *Buf) void {
     emitMovMR(buf, rsp_r, stk_jtp, t0); // [rsp+16] = jump_table_ptr
     emitMovRM(buf, t0, rdi_r, 56);
     emitMovMR(buf, rsp_r, stk_cbp, t0); // [rsp+24] = code_base_ptr
+    emitMovRM(buf, t0, rdi_r, 64);
+    emitMovMR(buf, rsp_r, stk_hsm, t0); // [rsp+32] = helper_string_match
+    emitMovRM(buf, t0, rdi_r, 72);
+    emitMovMR(buf, rsp_r, stk_hcm, t0); // [rsp+40] = helper_charset_match
 
     emitXorRR32(buf, pos);
     emitXorRR32(buf, bsp);
@@ -520,7 +544,7 @@ fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup,
     emitMovRM(buf, rdi_r, rsp_r, stk_csp);
     emitMovRI32(buf, rsi_r, @intCast(charset));
     emitMovRR(buf, t2, t0);
-    emitMovRI64(buf, t0, @intFromPtr(&Jit.helperCharsetMatch));
+    emitMovRM(buf, t0, rsp_r, stk_hcm);
     emitCallR(buf, t0);
     emitTestRR(buf, t0, t0);
     addFixup(fixups, fcount, emitJccRel32(buf, if (negate) CC.nz else CC.z), .backtrack);
@@ -626,7 +650,7 @@ fn emitInst(
             emitMovRM(buf, t1, rsp_r, stk_sdp);
             emitMovRI32(buf, r8_r, ref.offset);
             emitMovRI32(buf, r9_r, @intCast(ref.len));
-            emitMovRI64(buf, t0, @intFromPtr(&Jit.helperStringMatch));
+            emitMovRM(buf, t0, rsp_r, stk_hsm);
             emitCallR(buf, t0);
             emitTestRR(buf, t0, t0);
             addFixup(fixups, fcount, emitJccRel32(buf, CC.z), .backtrack);

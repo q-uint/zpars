@@ -17,10 +17,14 @@ pub fn main() !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "check")) {
         try runCheck(allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "compile")) {
+        try runCompile(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "fmt")) {
         try runFmt(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "match")) {
         try runMatch(allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "run")) {
+        try runAot(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "vm")) {
         try runVm(allocator, args[2..]);
     } else {
@@ -34,10 +38,12 @@ fn printUsage() void {
         \\usage: zpars <command> [options]
         \\
         \\commands:
-        \\  check <file>                       Validate a grammar
-        \\  fmt   <file>                       Format a grammar
-        \\  match -r <rule> <file> <input>     Match input against a rule
-        \\  vm    [-t] <file> [<input>]         Disassemble (and optionally run) via VM
+        \\  check   <file>                     Validate a grammar
+        \\  compile <file> -o <output>         Compile grammar to native .zpar blob
+        \\  fmt     <file>                     Format a grammar
+        \\  match   -r <rule> <file> <input>   Match input against a rule
+        \\  run     <blob> <input>             Run a compiled .zpar blob
+        \\  vm      [-t] <file> [<input>]      Disassemble (and optionally run) via VM
         \\
         \\Format is auto-detected from file extension (.abnf, .peg, .ere).
         \\
@@ -307,6 +313,91 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
+    try stdout.flush();
+}
+
+fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var filename: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-o")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: -o requires an output path\n", .{});
+                std.process.exit(1);
+            }
+            output = args[i];
+        } else if (filename == null) {
+            filename = args[i];
+        }
+    }
+
+    if (filename == null or output == null) {
+        std.debug.print("usage: zpars compile <file> -o <output>\n", .{});
+        std.process.exit(1);
+    }
+
+    const source = try readSource(allocator, filename.?);
+    defer allocator.free(source);
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const rules = switch (detectFormat(filename.?)) {
+        .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
+        .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename.?, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
+        .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
+    };
+
+    var compiler = zpars.vm.Compiler.compile(rules);
+
+    var blob = try zpars.vm.Aot.compileToBlob(
+        allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        compiler.getCaptureCount(),
+    );
+    defer zpars.vm.Aot.freeBlob(allocator, &blob);
+
+    const file = try std.fs.cwd().createFile(output.?, .{});
+    defer file.close();
+    const data = try zpars.vm.Aot.serializeBlob(allocator, blob);
+    defer allocator.free(data);
+    try file.writeAll(data);
+}
+
+fn runAot(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 2) {
+        std.debug.print("usage: zpars run <blob> <input>\n", .{});
+        std.process.exit(1);
+    }
+
+    const blob_path = args[0];
+    const input = args[1];
+
+    const blob_data = try readSource(allocator, blob_path);
+    defer allocator.free(blob_data);
+
+    var blob = zpars.vm.Aot.deserializeBlob(allocator, blob_data) catch |err| {
+        std.debug.print("error reading blob: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer zpars.vm.Aot.freeBlob(allocator, &blob);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    if (zpars.vm.AotRuntime.run(blob, input)) |pos| {
+        try stdout.print("match: {d} bytes \"{s}\"\n", .{ pos, input[0..pos] });
+    } else {
+        try stdout.print("no match\n", .{});
+    }
     try stdout.flush();
 }
 

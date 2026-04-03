@@ -37,6 +37,8 @@ pub const ere = struct {
 };
 pub const sexp = @import("sexp.zig");
 pub const vm = struct {
+    pub const Aot = @import("vm/Aot.zig");
+    pub const AotRuntime = @import("vm/AotRuntime.zig");
     pub const Compiler = @import("vm/Compiler.zig");
     pub const Disassembler = @import("vm/Disassembler.zig");
     pub const Instruction = @import("vm/Instruction.zig");

@@ -18,6 +18,10 @@ const StackEntry = Jit.StackEntry;
 // x26 = stack_ptr     (pointer to backtrack StackEntry array)
 // x27 = jump_table_ptr
 // x28 = code_base_ptr (start of native code, for indirect jumps)
+//
+// Stack-stored (no callee-saved regs left):
+//   [sp+0]  = helper_string_match
+//   [sp+8]  = helper_charset_match
 
 const Reg = u5;
 
@@ -237,32 +241,29 @@ fn addFixup(
     count.* += 1;
 }
 
-pub fn compile(self: *Jit) !void {
-    const est = (self.code.len + 1) * 80 + 2048;
-    const size = std.mem.alignForward(usize, est, page_size);
+pub const GenerateResult = struct {
+    native_len: usize,
+    jump_table: [4096]u64,
+};
 
-    self.native_code = try std.posix.mmap(
-        null,
-        size,
-        std.c.PROT.READ | std.c.PROT.WRITE,
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
+pub fn estimateSize(code_len: usize) usize {
+    return (code_len + 1) * 80 + 2048;
+}
 
-    var buf = Buf{ .ptr = self.native_code.ptr, .len = 0 };
+pub fn generate(code: []const I.Inst, output: [*]u8) GenerateResult {
+    var buf = Buf{ .ptr = output, .len = 0 };
     var fixups: [8192]Fixup = undefined;
     var fcount: usize = 0;
     var bc_map: [4096]u32 = undefined;
 
     emitPrologue(&buf);
 
-    for (self.code, 0..) |inst, i| {
+    for (code, 0..) |inst, i| {
         bc_map[i] = buf.off();
         emitInst(&buf, inst, &fixups, &fcount);
     }
-    if (self.code.len < 4096)
-        bc_map[self.code.len] = buf.off();
+    if (code.len < 4096)
+        bc_map[code.len] = buf.off();
 
     const bt_off = buf.off();
     emitBacktrackHandler(&buf, &fixups, &fcount);
@@ -290,11 +291,32 @@ pub fn compile(self: *Jit) !void {
         buf.patchAt(f.code_off, inst);
     }
 
-    for (0..self.code.len) |i| {
-        self.jump_table[i] = bc_map[i];
+    var result = GenerateResult{
+        .native_len = buf.len,
+        .jump_table = [_]u64{0} ** 4096,
+    };
+    for (0..code.len) |i| {
+        result.jump_table[i] = bc_map[i];
     }
+    return result;
+}
 
-    self.native_len = buf.len;
+pub fn compile(self: *Jit) !void {
+    const est = estimateSize(self.code.len);
+    const size = std.mem.alignForward(usize, est, page_size);
+
+    self.native_code = try std.posix.mmap(
+        null,
+        size,
+        std.c.PROT.READ | std.c.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+
+    const result = generate(self.code, self.native_code.ptr);
+    self.native_len = result.native_len;
+    self.jump_table = result.jump_table;
 
     try std.posix.mprotect(
         @alignCast(self.native_code[0..size]),
@@ -309,6 +331,8 @@ fn emitPrologue(buf: *Buf) void {
     buf.emit(encStpPre(csp, sdp, sp_reg, -16));
     buf.emit(encStpPre(cap, skp, sp_reg, -16));
     buf.emit(encStpPre(jtp, cbp, sp_reg, -16));
+    // Allocate 16 bytes for helper function pointers.
+    buf.emit(encSub(sp_reg, sp_reg, 16));
 
     // x0 = pointer to JitCtx. Load fields into callee-saved regs.
     buf.emit(encLdr(inp, 0, 0)); // x21 = ctx->input_ptr
@@ -319,12 +343,18 @@ fn emitPrologue(buf: *Buf) void {
     buf.emit(encLdr(skp, 0, 40)); // x26 = ctx->stack_ptr
     buf.emit(encLdr(jtp, 0, 48)); // x27 = ctx->jump_table_ptr
     buf.emit(encLdr(cbp, 0, 56)); // x28 = ctx->code_base_ptr
+    // Store helper function pointers on the stack.
+    buf.emit(encLdr(t0, 0, 64)); // helper_string_match
+    buf.emit(encStr(t0, sp_reg, 0)); // [sp+0]
+    buf.emit(encLdr(t0, 0, 72)); // helper_charset_match
+    buf.emit(encStr(t0, sp_reg, 8)); // [sp+8]
 
     buf.emit(encMovz(pos, 0, 0));
     buf.emit(encMovz(bsp, 0, 0));
 }
 
 fn emitEpilogue(buf: *Buf) void {
+    buf.emit(encAdd(sp_reg, sp_reg, 16)); // deallocate helper slots
     buf.emit(encLdpPost(jtp, cbp, sp_reg, 16));
     buf.emit(encLdpPost(cap, skp, sp_reg, 16));
     buf.emit(encLdpPost(csp, sdp, sp_reg, 16));
@@ -393,7 +423,7 @@ fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup,
     buf.emit(encMov(0, csp));
     buf.emit(encMovz(1, @intCast(charset), 0));
     buf.emit(encMov(2, t0));
-    emitImm64(buf, t0, @intFromPtr(&Jit.helperCharsetMatch));
+    buf.emit(encLdr(t0, sp_reg, 8)); // helper_charset_match from stack
     buf.emit(encBlr(t0));
     addFixup(fixups, fcount, buf.off(), .backtrack, if (negate) .cbnz else .cbz, 0, 0);
     buf.emit(encNop());
@@ -502,7 +532,7 @@ fn emitInst(
             buf.emit(encMov(3, sdp));
             buf.emit(encMovz(4, ref.offset, 0));
             buf.emit(encMovz(5, @intCast(ref.len), 0));
-            emitImm64(buf, t0, @intFromPtr(&Jit.helperStringMatch));
+            buf.emit(encLdr(t0, sp_reg, 0)); // helper_string_match from stack
             buf.emit(encBlr(t0));
             addFixup(fixups, fcount, buf.off(), .backtrack, .cbz, 0, 0);
             buf.emit(encNop());

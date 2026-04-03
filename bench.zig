@@ -9,11 +9,12 @@ const Ast = zpars.Ast;
 const VmCompiler = zpars.vm.Compiler;
 const Vm = zpars.vm.Vm;
 const Jit = zpars.vm.Jit;
+const Aot = zpars.vm.Aot;
+const AotRuntime = zpars.vm.AotRuntime;
 const EreScanner = zpars.ere.Scanner;
 const EreParser = zpars.ere.Parser;
 
 const iterations = 1_000_000;
-
 
 const Case = struct {
     name: []const u8,
@@ -60,11 +61,9 @@ const cases = [_]Case{
     },
 };
 
-
 fn ComptimeParser(comptime idx: usize) type {
     return Abnf.Compile(cases[idx].grammar, cases[idx].rule);
 }
-
 
 fn benchComptime(comptime idx: usize) u64 {
     const P = ComptimeParser(idx);
@@ -94,7 +93,6 @@ fn benchRuntime(comptime idx: usize, matcher: *Matcher) u64 {
 
     return timer.read();
 }
-
 
 // VM benchmark cases using ERE patterns.
 // These exercise all three optimization passes:
@@ -204,6 +202,37 @@ fn benchJit(compiler: *const VmCompiler, input: []const u8) u64 {
     return timer.read();
 }
 
+fn benchAot(allocator: std.mem.Allocator, compiler: *const VmCompiler, input: []const u8) u64 {
+    var inp: []const u8 = input;
+    std.mem.doNotOptimizeAway(&inp);
+
+    var blob = Aot.compileToBlob(
+        allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        compiler.getCaptureCount(),
+    ) catch unreachable;
+    defer Aot.freeBlob(allocator, &blob);
+
+    // Serialize and deserialize to simulate loading from file.
+    const data = Aot.serializeBlob(allocator, blob) catch unreachable;
+    defer allocator.free(data);
+    var blob2 = Aot.deserializeBlob(allocator, data) catch unreachable;
+    defer Aot.freeBlob(allocator, &blob2);
+
+    var engine = AotRuntime.Engine.init(blob2) catch unreachable;
+    defer engine.deinit();
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    for (0..iterations) |_| {
+        const r = engine.execute(inp);
+        std.mem.doNotOptimizeAway(&r);
+    }
+
+    return timer.read();
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -305,6 +334,35 @@ pub fn main() !void {
             vm_per_op,
             jit_per_op,
             speedup,
+        });
+    }
+
+    try stdout.print("\n  JIT vs AOT (pre-compiled blob)\n", .{});
+    try stdout.print("  {s:<16} {s:>14} {s:>14} {s:>10}\n", .{
+        "case", "jit", "aot", "ratio",
+    });
+    try stdout.print("  {s:-<16} {s:->14} {s:->14} {s:->10}\n", .{
+        "", "", "", "",
+    });
+
+    for (vm_cases) |case| {
+        const comp = compileEre(case.pattern, true);
+
+        const jit_ns = benchJit(&comp, case.input);
+        const aot_ns = benchAot(gpa.allocator(), &comp, case.input);
+
+        const jit_per_op = jit_ns / iterations;
+        const aot_per_op = aot_ns / iterations;
+        const ratio: f64 = if (jit_per_op > 0)
+            @as(f64, @floatFromInt(aot_per_op)) / @as(f64, @floatFromInt(jit_per_op))
+        else
+            0;
+
+        try stdout.print("  {s:<16} {d:>11} ns {d:>11} ns {d:>9.2}x\n", .{
+            case.name,
+            jit_per_op,
+            aot_per_op,
+            ratio,
         });
     }
 

@@ -3,7 +3,7 @@
   <h1 align="center">zpars</h1>
   <p align="center">
     A grammar parser toolkit written in Zig — ABNF, BNF, PEG, CFG, ERE, and S-expressions<br>
-    with comptime parser combinators, a bytecode VM, and native JIT compilers for AArch64 and x86_64.
+    with comptime parser combinators, a bytecode VM, native JIT compilers, and AOT compilation for AArch64 and x86_64.
   </p>
   <p align="center">
     <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/zig-0.15.2+-f7a41d?logo=zig&logoColor=white" alt="Zig 0.15.2+"></a>
@@ -23,6 +23,7 @@
 - **Grammar VM** — Bytecode virtual machine inspired by LPeg. Compiles any grammar to instructions and executes with backtracking and capture groups.
 - **Peephole optimizer** — Optimizes compiled bytecode with charset-to-char reduction, consecutive char fusion into string instructions, common prefix factoring, and optional char fusion.
 - **JIT compilers** — Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
+- **AOT compilation** — Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
 - **Benchmarks** — 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
 ## Comptime ABNF Compiler
@@ -187,6 +188,41 @@ defer jit.deinit();
 const result = jit.execute();
 ```
 
+### AOT Compilation
+
+The AOT compiler produces standalone `.zpar` binary blobs containing native machine code and all static data. Unlike the JIT (which compiles at runtime), AOT compiles once and produces a portable blob that can be loaded and executed without the grammar compiler:
+
+```
+$ zpars compile examples/calc.peg -o calc.zpar
+$ zpars run calc.zpar "1+2*3"
+match: 5 bytes "1+2*3"
+```
+
+The blob format includes the native code, charset tables, string data, and jump tables. At runtime, the code is mmap'd as executable and called directly -- the only overhead is a single mmap syscall at load time.
+
+Use the AOT API programmatically:
+
+```zig
+const zpars = @import("zpars");
+
+var compiler = zpars.vm.Compiler.compile(rules);
+var blob = try zpars.vm.Aot.compileToBlob(
+    allocator,
+    compiler.getCode(),
+    compiler.getCharsets(),
+    compiler.getStringData(),
+    compiler.getCaptureCount(),
+);
+defer zpars.vm.Aot.freeBlob(allocator, &blob);
+
+// Serialize to bytes for storage.
+const data = try zpars.vm.Aot.serializeBlob(allocator, blob);
+
+// Later: deserialize and run.
+var blob2 = try zpars.vm.Aot.deserializeBlob(allocator, data);
+const result = zpars.vm.AotRuntime.run(blob2, "1+2*3");
+```
+
 Try the example grammars:
 
 ```
@@ -200,10 +236,12 @@ zpars vm examples/bit.bnf "01010011"            # binary byte
 ## CLI
 
 ```
-zpars check <file>                       # validate a grammar
-zpars fmt   <file>                       # format a grammar
-zpars match -r <rule> <file> <input>     # match input against a rule
-zpars vm    [-t] <file> [<input>]        # disassemble and run via VM
+zpars check   <file>                     # validate a grammar
+zpars compile <file> -o <output>         # compile grammar to native .zpar blob
+zpars fmt     <file>                     # format a grammar
+zpars match   -r <rule> <file> <input>   # match input against a rule
+zpars run     <blob> <input>             # run a compiled .zpar blob
+zpars vm      [-t] <file> [<input>]      # disassemble and run via VM
 ```
 
 ### check
