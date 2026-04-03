@@ -432,6 +432,20 @@ fn reportValidation(items: []const zpars.Validator.Validation, filename: []const
                 ) catch {};
                 has_errors = true;
             },
+            .left_recursive_rule => {
+                stderr.print(
+                    "{s}: error: rule '{s}' is left-recursive (calls itself without consuming input)\n",
+                    .{ filename, v.rule_name },
+                ) catch {};
+                has_errors = true;
+            },
+            .zero_width_loop => {
+                stderr.print(
+                    "{s}: error: rule '{s}' contains an unbounded repetition whose body can match empty\n",
+                    .{ filename, v.rule_name },
+                ) catch {};
+                has_errors = true;
+            },
         }
     }
     return has_errors;

@@ -25,6 +25,16 @@ diagnostics: std.ArrayList(Validation) = .empty,
 /// Name of the start rule (exempt from "unused" check).
 /// When null, the first rule is assumed to be the start rule.
 start_rule: ?[]const u8 = null,
+config: Config = .{},
+
+pub const Config = struct {
+    duplicate_rule: bool = true,
+    undefined_rule: bool = true,
+    unused_rule: bool = true,
+    unproductive_rule: bool = true,
+    left_recursive_rule: bool = true,
+    zero_width_loop: bool = true,
+};
 
 pub const Validation = struct {
     kind: Kind,
@@ -38,6 +48,8 @@ pub const Validation = struct {
         undefined_rule,
         unused_rule,
         unproductive_rule,
+        left_recursive_rule,
+        zero_width_loop,
     };
 };
 
@@ -67,7 +79,7 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
     for (self.rules) |rule| {
         const entry = try name_index.getOrPut(rule.name);
         if (entry.found_existing) {
-            if (!rule.incremental) {
+            if (self.config.duplicate_rule and !rule.incremental) {
                 try self.diagnostics.append(self.allocator, .{
                     .kind = .duplicate_rule,
                     .rule_name = rule.name,
@@ -87,95 +99,129 @@ pub fn validate(self: *Validator) ![]const Ast.Rule {
 
     const merged_rules = try merged.toOwnedSlice(self.allocator);
 
-    // Stage 2: collect all referenced rule names.
-    var refs = CiHashMap(void).init(self.allocator);
-    defer refs.deinit();
-    for (merged_rules) |rule| {
-        try self.collectRefs(rule.node, &refs);
-    }
-
-    // Stage 3: check for undefined references.
-    var ref_iter = refs.keyIterator();
-    while (ref_iter.next()) |ref_name| {
-        if (name_index.contains(ref_name.*)) continue;
-        if (isCoreRule(ref_name.*)) continue;
-        // Find the first rule that references this undefined name.
-        const owner = self.findReferencer(merged_rules, ref_name.*);
-        try self.diagnostics.append(self.allocator, .{
-            .kind = .undefined_rule,
-            .rule_name = owner orelse ref_name.*,
-            .ref_name = ref_name.*,
-        });
-    }
-
-    // Stage 4: unused rules (skip the start rule).
-    for (merged_rules, 0..) |rule, i| {
-        if (self.start_rule) |start| {
-            if (std.ascii.eqlIgnoreCase(rule.name, start)) continue;
-        } else {
-            if (i == 0) continue;
+    // Stages 2-4: reference-based checks (undefined, unused).
+    // Collect refs only when at least one of these checks is enabled.
+    if (self.config.undefined_rule or self.config.unused_rule) {
+        var refs = CiHashMap(void).init(self.allocator);
+        defer refs.deinit();
+        for (merged_rules) |rule| {
+            try self.collectRefs(rule.node, &refs);
         }
-        if (!refs.contains(rule.name)) {
-            try self.diagnostics.append(self.allocator, .{
-                .kind = .unused_rule,
-                .rule_name = rule.name,
-            });
+
+        if (self.config.undefined_rule) {
+            var ref_iter = refs.keyIterator();
+            while (ref_iter.next()) |ref_name| {
+                if (name_index.contains(ref_name.*)) continue;
+                if (isCoreRule(ref_name.*)) continue;
+                const owner = self.findReferencer(merged_rules, ref_name.*);
+                try self.diagnostics.append(self.allocator, .{
+                    .kind = .undefined_rule,
+                    .rule_name = owner orelse ref_name.*,
+                    .ref_name = ref_name.*,
+                });
+            }
+        }
+
+        if (self.config.unused_rule) {
+            for (merged_rules, 0..) |rule, i| {
+                if (self.start_rule) |start| {
+                    if (std.ascii.eqlIgnoreCase(rule.name, start)) continue;
+                } else {
+                    if (i == 0) continue;
+                }
+                if (!refs.contains(rule.name)) {
+                    try self.diagnostics.append(self.allocator, .{
+                        .kind = .unused_rule,
+                        .rule_name = rule.name,
+                    });
+                }
+            }
         }
     }
 
     // Stage 5: productivity / cycle detection.
-    //
-    // Classic fixpoint: a rule is productive when its RHS can derive a
-    // finite terminal string.  We iterate until no new rule becomes
-    // productive.  To avoid redundant AST walks we maintain a
-    // `pending` bitset — once a rule is productive *or* has been
-    // evaluated without becoming productive in an iteration where none
-    // of its dependencies changed, we stop re-evaluating it.
-    //
-    // On each iteration only rules whose dependencies might have
-    // changed (i.e. were promoted in the *previous* pass) are
-    // re-evaluated.  We track this via `deps_changed`: a rule is
-    // eligible for re-evaluation when at least one of the rules it
-    // references was promoted since the rule was last checked.
-    var productive = try self.allocator.alloc(bool, merged_rules.len);
-    defer self.allocator.free(productive);
-    @memset(productive, false);
+    if (self.config.unproductive_rule) {
+        var productive = try self.allocator.alloc(bool, merged_rules.len);
+        defer self.allocator.free(productive);
+        @memset(productive, false);
 
-    // pending[i] == true means rule i still needs evaluation.
-    var pending = try self.allocator.alloc(bool, merged_rules.len);
-    defer self.allocator.free(pending);
-    @memset(pending, true);
+        var pending = try self.allocator.alloc(bool, merged_rules.len);
+        defer self.allocator.free(pending);
+        @memset(pending, true);
 
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (merged_rules, 0..) |rule, i| {
-            if (!pending[i]) continue;
-            if (isProductive(undefined, rule.node, merged_rules, &name_index, productive)) {
-                productive[i] = true;
-                changed = true;
-                pending[i] = false;
-                // Re-enable any rule that references this newly
-                // productive rule, so it gets a chance next pass.
-                for (merged_rules, 0..) |other, j| {
-                    if (!pending[j] and !productive[j] and
-                        nodeReferences(other.node, rule.name))
-                    {
-                        pending[j] = true;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (merged_rules, 0..) |rule, i| {
+                if (!pending[i]) continue;
+                if (isProductive(rule.node, merged_rules, &name_index, productive)) {
+                    productive[i] = true;
+                    changed = true;
+                    pending[i] = false;
+                    for (merged_rules, 0..) |other, j| {
+                        if (!pending[j] and !productive[j] and
+                            nodeReferences(other.node, rule.name))
+                        {
+                            pending[j] = true;
+                        }
                     }
                 }
             }
         }
-        // If nothing changed, every still-pending rule is stuck in a
-        // cycle — stop.
+
+        for (merged_rules, 0..) |rule, i| {
+            if (!productive[i]) {
+                try self.diagnostics.append(self.allocator, .{
+                    .kind = .unproductive_rule,
+                    .rule_name = rule.name,
+                });
+            }
+        }
     }
 
-    for (merged_rules, 0..) |rule, i| {
-        if (!productive[i]) {
-            try self.diagnostics.append(self.allocator, .{
-                .kind = .unproductive_rule,
-                .rule_name = rule.name,
-            });
+    // Stages 6-8: nullable-based checks (left recursion, zero-width loops).
+    // The nullable fixpoint only runs when at least one check needs it.
+    if (self.config.left_recursive_rule or self.config.zero_width_loop) {
+        var nullable = try self.allocator.alloc(bool, merged_rules.len);
+        defer self.allocator.free(nullable);
+        @memset(nullable, false);
+
+        var nullable_changed = true;
+        while (nullable_changed) {
+            nullable_changed = false;
+            for (merged_rules, 0..) |rule, i| {
+                if (nullable[i]) continue;
+                if (isNullable(rule.node, merged_rules, &name_index, nullable)) {
+                    nullable[i] = true;
+                    nullable_changed = true;
+                }
+            }
+        }
+
+        if (self.config.left_recursive_rule) {
+            const visited = try self.allocator.alloc(bool, merged_rules.len);
+            defer self.allocator.free(visited);
+            for (merged_rules, 0..) |rule, i| {
+                @memset(visited, false);
+                collectLeftReachable(rule.node, merged_rules, &name_index, nullable, visited);
+                if (visited[i]) {
+                    try self.diagnostics.append(self.allocator, .{
+                        .kind = .left_recursive_rule,
+                        .rule_name = rule.name,
+                    });
+                }
+            }
+        }
+
+        if (self.config.zero_width_loop) {
+            for (merged_rules) |rule| {
+                if (hasZeroWidthLoop(rule.node, merged_rules, &name_index, nullable)) {
+                    try self.diagnostics.append(self.allocator, .{
+                        .kind = .zero_width_loop,
+                        .rule_name = rule.name,
+                    });
+                }
+            }
         }
     }
 
@@ -243,13 +289,11 @@ fn isCoreRule(name: []const u8) bool {
 }
 
 fn isProductive(
-    self: *Validator,
     node: Ast.Node,
     merged_rules: []const Ast.Rule,
     name_index: *const CiHashMap(usize),
     productive: []const bool,
 ) bool {
-    _ = self;
     return switch (node) {
         .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => true,
         .rulename => |name| {
@@ -259,12 +303,12 @@ fn isProductive(
             return false;
         },
         .alternation => |items| for (items) |item| {
-            if (isProductive(undefined, item, merged_rules, name_index, productive))
+            if (isProductive(item, merged_rules, name_index, productive))
                 return true;
         } else false,
         .concatenation => |items| {
             for (items) |item| {
-                if (!isProductive(undefined, item, merged_rules, name_index, productive))
+                if (!isProductive(item, merged_rules, name_index, productive))
                     return false;
             }
             return true;
@@ -272,16 +316,168 @@ fn isProductive(
         .repetition => |rep| {
             // *0 (min=0) is always productive (can match zero times).
             if (rep.min == 0) return true;
-            return isProductive(undefined, rep.element.*, merged_rules, name_index, productive);
+            return isProductive(rep.element.*, merged_rules, name_index, productive);
         },
-        .and_predicate => |inner| isProductive(undefined, inner.*, merged_rules, name_index, productive),
-        .not_predicate => |inner| isProductive(undefined, inner.*, merged_rules, name_index, productive),
-        .capture => |inner| isProductive(undefined, inner.*, merged_rules, name_index, productive),
+        .and_predicate => |inner| isProductive(inner.*, merged_rules, name_index, productive),
+        .not_predicate => |inner| isProductive(inner.*, merged_rules, name_index, productive),
+        .capture => |inner| isProductive(inner.*, merged_rules, name_index, productive),
+    };
+}
+
+/// Can this node succeed without consuming any input?
+fn isNullable(
+    node: Ast.Node,
+    merged_rules: []const Ast.Rule,
+    name_index: *const CiHashMap(usize),
+    nullable: []const bool,
+) bool {
+    return switch (node) {
+        // Terminals always consume input.
+        .char_val => |cv| cv.value.len == 0,
+        .num_val => |nv| switch (nv) {
+            .concat => |c| c.len == 0,
+            .single, .range => false,
+        },
+        .char_class, .neg_char_class, .any => false,
+        // Anchors and predicates succeed without consuming.
+        .anchor_start, .anchor_end => true,
+        .and_predicate, .not_predicate => true,
+        .prose_val => false,
+        .rulename => |name| {
+            // Conservatively treat all core rules as non-nullable.
+            // LWSP = *(WSP / CRLF WSP) is technically nullable, so a
+            // left-recursive path through LWSP would be missed. This is
+            // acceptable: core rule semantics are fixed by RFC 5234.
+            if (isCoreRule(name)) return false;
+            if (name_index.get(name)) |idx| return nullable[idx];
+            return false;
+        },
+        .alternation => |items| for (items) |item| {
+            if (isNullable(item, merged_rules, name_index, nullable))
+                return true;
+        } else false,
+        .concatenation => |items| {
+            for (items) |item| {
+                if (!isNullable(item, merged_rules, name_index, nullable))
+                    return false;
+            }
+            return true;
+        },
+        .repetition => |rep| {
+            if (rep.min == 0) return true;
+            return isNullable(rep.element.*, merged_rules, name_index, nullable);
+        },
+        .capture => |inner| isNullable(inner.*, merged_rules, name_index, nullable),
+    };
+}
+
+/// Mark all rules that are reachable from `node` before any input is
+/// consumed (i.e. through nullable prefixes) in `visited`.
+fn collectLeftReachable(
+    node: Ast.Node,
+    merged_rules: []const Ast.Rule,
+    name_index: *const CiHashMap(usize),
+    nullable: []const bool,
+    visited: []bool,
+) void {
+    switch (node) {
+        .rulename => |name| {
+            const idx = name_index.get(name) orelse return;
+            if (visited[idx]) return;
+            visited[idx] = true;
+            // Recurse into the rule body.
+            collectLeftReachable(
+                merged_rules[idx].node,
+                merged_rules,
+                name_index,
+                nullable,
+                visited,
+            );
+        },
+        .alternation => |items| {
+            for (items) |item| {
+                collectLeftReachable(item, merged_rules, name_index, nullable, visited);
+            }
+        },
+        .concatenation => |items| {
+            for (items) |item| {
+                collectLeftReachable(item, merged_rules, name_index, nullable, visited);
+                if (!isNullable(item, merged_rules, name_index, nullable)) break;
+            }
+        },
+        .repetition => |rep| {
+            if (rep.min > 0) {
+                collectLeftReachable(rep.element.*, merged_rules, name_index, nullable, visited);
+            }
+            // min==0 means the repetition can be skipped entirely,
+            // so the element is not on the forced left path.
+        },
+        .and_predicate, .not_predicate => {
+            // Predicates are lookaheads: they test but never consume
+            // input or descend into the referenced rule, so they do
+            // not contribute to left-recursion.
+        },
+        .capture => |inner| {
+            collectLeftReachable(inner.*, merged_rules, name_index, nullable, visited);
+        },
+        .char_val,
+        .num_val,
+        .prose_val,
+        .char_class,
+        .neg_char_class,
+        .any,
+        .anchor_start,
+        .anchor_end,
+        => {},
+    }
+}
+
+/// Does this node contain an unbounded repetition whose body is nullable?
+fn hasZeroWidthLoop(
+    node: Ast.Node,
+    merged_rules: []const Ast.Rule,
+    name_index: *const CiHashMap(usize),
+    nullable: []const bool,
+) bool {
+    return switch (node) {
+        .repetition => |rep| {
+            // Unbounded (max == null) and body can match empty.
+            if (rep.max == null and
+                isNullable(rep.element.*, merged_rules, name_index, nullable))
+            {
+                return true;
+            }
+            // Also check recursively inside the body.
+            return hasZeroWidthLoop(rep.element.*, merged_rules, name_index, nullable);
+        },
+        .alternation => |items| for (items) |item| {
+            if (hasZeroWidthLoop(item, merged_rules, name_index, nullable))
+                return true;
+        } else false,
+        .concatenation => |items| for (items) |item| {
+            if (hasZeroWidthLoop(item, merged_rules, name_index, nullable))
+                return true;
+        } else false,
+        .and_predicate => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
+        .not_predicate => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
+        .capture => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
+        .char_val,
+        .num_val,
+        .prose_val,
+        .char_class,
+        .neg_char_class,
+        .any,
+        .anchor_start,
+        .anchor_end,
+        .rulename,
+        => false,
     };
 }
 
 const Scanner = @import("abnf/Scanner.zig");
 const Parser = @import("abnf/Parser.zig");
+const PegScanner = @import("peg/Scanner.zig");
+const PegParser = @import("peg/Parser.zig");
 
 fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
     rules: []const Ast.Rule,
@@ -290,6 +486,20 @@ fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
+    const rules = try parser.parse();
+    try std.testing.expectEqual(0, parser.getDiagnostics().len);
+    var validator = Validator.init(allocator, rules);
+    const merged = try validator.validate();
+    return .{ .rules = merged, .diagnostics = try validator.diagnostics.toOwnedSlice(allocator) };
+}
+
+fn pegParseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
+    rules: []const Ast.Rule,
+    diagnostics: []const Validation,
+} {
+    var scanner = PegScanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = PegParser.init(tokens, source);
     const rules = try parser.parse();
     try std.testing.expectEqual(0, parser.getDiagnostics().len);
     var validator = Validator.init(allocator, rules);
@@ -451,4 +661,137 @@ test "mixed-case undefined reference reports correct owner" {
     try std.testing.expectEqual(.undefined_rule, result.diagnostics[0].kind);
     try std.testing.expectEqualStrings("foo", result.diagnostics[0].rule_name);
     try std.testing.expectEqualStrings("Missing", result.diagnostics[0].ref_name.?);
+}
+
+test "direct left recursion detected" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "a = a \"x\" / \"y\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    var count: usize = 0;
+    for (result.diagnostics) |d| {
+        if (d.kind == .left_recursive_rule) count += 1;
+    }
+    try std.testing.expectEqual(1, count);
+}
+
+test "indirect left recursion detected" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "a = b \"x\"\nb = a \"y\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    var count: usize = 0;
+    for (result.diagnostics) |d| {
+        if (d.kind == .left_recursive_rule) count += 1;
+    }
+    // Both a and b are left-recursive.
+    try std.testing.expectEqual(2, count);
+}
+
+test "right recursion is not left recursion" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "a = \"x\" a / \"y\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .left_recursive_rule);
+    }
+}
+
+test "left recursion through nullable prefix" {
+    const allocator = std.testing.allocator;
+    // *"x" can match zero chars, so `a` is reachable at position 0.
+    const result = try parseAndValidate(allocator, "a = *\"x\" a / \"y\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    var count: usize = 0;
+    for (result.diagnostics) |d| {
+        if (d.kind == .left_recursive_rule) count += 1;
+    }
+    try std.testing.expectEqual(1, count);
+}
+
+test "zero-width loop detected" {
+    const allocator = std.testing.allocator;
+    // b = *"x" is nullable; a = *b loops forever.
+    const result = try parseAndValidate(allocator, "a = 1*b\nb = *\"x\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    var count: usize = 0;
+    for (result.diagnostics) |d| {
+        if (d.kind == .zero_width_loop) count += 1;
+    }
+    try std.testing.expectEqual(1, count);
+}
+
+test "bounded repetition of nullable body is not zero-width loop" {
+    const allocator = std.testing.allocator;
+    // 3*5b where b is nullable — bounded, will terminate.
+    const result = try parseAndValidate(allocator, "a = 3*5b\nb = *\"x\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .zero_width_loop);
+    }
+}
+
+test "non-nullable repetition body is not zero-width loop" {
+    const allocator = std.testing.allocator;
+    const result = try parseAndValidate(allocator, "a = *\"x\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .zero_width_loop);
+    }
+}
+
+test "predicate-guarded self-reference is not left-recursive" {
+    const allocator = std.testing.allocator;
+    // !a is a lookahead guard, not a recursive descent into a.
+    const result = try pegParseAndValidate(allocator, "a <- !a 'x'");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .left_recursive_rule);
+    }
+}
+
+test "and-predicate self-reference is not left-recursive" {
+    const allocator = std.testing.allocator;
+    const result = try pegParseAndValidate(allocator, "a <- &a 'x'");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    for (result.diagnostics) |d| {
+        try std.testing.expect(d.kind != .left_recursive_rule);
+    }
+}
+
+test "disabled check suppresses diagnostic" {
+    const allocator = std.testing.allocator;
+    // "a = a" is direct left recursion, but with the check disabled
+    // the validator must not emit a left_recursive_rule diagnostic.
+    const result = try parseAndValidate(allocator, "a = a \"x\" / \"y\"");
+    defer allocator.free(result.rules);
+    defer allocator.free(result.diagnostics);
+    // Sanity: default config does flag it.
+    var found = false;
+    for (result.diagnostics) |d| {
+        if (d.kind == .left_recursive_rule) found = true;
+    }
+    try std.testing.expect(found);
+
+    // Now with the check disabled.
+    var scanner = Scanner.init("a = a \"x\" / \"y\"");
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, "a = a \"x\" / \"y\"");
+    const rules = try parser.parse();
+    var validator = Validator.init(allocator, rules);
+    validator.config.left_recursive_rule = false;
+    const merged = try validator.validate();
+    defer allocator.free(merged);
+    const diags = try validator.diagnostics.toOwnedSlice(allocator);
+    defer allocator.free(diags);
+    for (diags) |d| {
+        try std.testing.expect(d.kind != .left_recursive_rule);
+    }
 }
