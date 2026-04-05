@@ -28,6 +28,10 @@ patch_len: u32 = 0,
 /// Number of capture groups emitted (each uses two slots).
 capture_count: u16 = 0,
 
+/// Number of distinct rules that were assigned a memo id. The memo
+/// table in the VM is sized as memo_rule_count * (input.len + 1).
+memo_rule_count: u16 = 0,
+
 optimize_enabled: bool = true,
 
 rules: []const Ast.Rule = &.{},
@@ -45,6 +49,11 @@ pub fn compile(rules: []const Ast.Rule) Compiler {
 
 pub const Options = struct {
     optimize: bool = true,
+    /// When true, capture-free rules are assigned memo ids and their
+    /// call sites are rewritten to `memo_call`. Only the packrat VM
+    /// path understands `memo_call`; JIT/AOT do not, so leave off for
+    /// those backends.
+    memoize: bool = false,
 };
 
 pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Compiler {
@@ -66,21 +75,65 @@ pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Compiler {
         c.emit(.{ .op = .match });
 
         var rule_addrs: [256]u32 = undefined;
+        var rule_ends: [256]u32 = undefined;
         for (rules, 0..) |rule, i| {
             rule_addrs[i] = c.code_len;
             c.compileNode(rule.node);
             c.emit(.{ .op = .ret });
+            rule_ends[i] = c.code_len;
         }
 
         // Patch the entry call to point at the first rule.
         c.code[entry_call] = .{ .op = .call, .data = .{ .offset = rule_addrs[0] } };
         c.patchCalls(&rule_addrs, rules);
+
+        if (opts.memoize) {
+            c.rewriteMemoCalls(rule_addrs[0..rules.len], rule_ends[0..rules.len]);
+        }
     }
 
     if (c.optimize_enabled) {
         Optimizer.optimize(&c);
     }
     return c;
+}
+
+/// After rule addresses are patched, assign a memo id to every rule
+/// whose body contains no `save` instruction, and rewrite each `call`
+/// targeting such a rule into a `memo_call` carrying that id. Rules
+/// with captures keep plain `call` semantics (v1 does not snapshot
+/// capture slots across memo hits).
+fn rewriteMemoCalls(self: *Compiler, rule_addrs: []const u32, rule_ends: []const u32) void {
+    var memo_id: [256]?u16 = [_]?u16{null} ** 256;
+    for (rule_addrs, rule_ends, 0..) |start, end, i| {
+        var has_save = false;
+        for (self.code[start..end]) |inst| {
+            if (inst.op == .save) {
+                has_save = true;
+                break;
+            }
+        }
+        if (!has_save) {
+            memo_id[i] = self.memo_rule_count;
+            self.memo_rule_count += 1;
+        }
+    }
+
+    for (self.code[0..self.code_len]) |*inst| {
+        if (inst.op != .call) continue;
+        const target = inst.data.offset;
+        for (rule_addrs, 0..) |addr, i| {
+            if (addr == target) {
+                if (memo_id[i]) |id| {
+                    inst.* = .{
+                        .op = .memo_call,
+                        .data = .{ .memo = .{ .rule_id = id, .offset = target } },
+                    };
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// Resolve all pending rulename call patches.
@@ -298,4 +351,8 @@ pub fn getStringData(self: *const Compiler) []const u8 {
 
 pub fn getCaptureCount(self: *const Compiler) u16 {
     return self.capture_count;
+}
+
+pub fn getMemoRuleCount(self: *const Compiler) u16 {
+    return self.memo_rule_count;
 }

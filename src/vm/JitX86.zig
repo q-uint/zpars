@@ -617,6 +617,11 @@ fn emitInst(
             addFixup(fixups, fcount, emitJmpRel32(buf), FixupTarget.bytecodePC(inst.data.offset));
             patchRel32(buf, lea_disp_off, buf.off());
         },
+        .memo_call => {
+            // Packrat memoization is a VM-only path. Compile with
+            // Options{ .memoize = false } when targeting the JIT.
+            unreachable;
+        },
         .ret => {
             emitDec(buf, bsp);
             emitMovRR(buf, t0, bsp);

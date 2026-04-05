@@ -307,3 +307,4 @@ zig build vsx                  # build the Open VSX extension (WASM + TypeScript
 - [IEEE Std 1003.1 — Extended Regular Expressions (ERE)](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html) — POSIX ERE specification (Section 9.4)
 - [RFC 9804 — S-Expressions](https://www.rfc-editor.org/rfc/rfc9804)
 - [A Text Pattern-Matching Tool based on Parsing Expression Grammars (2009)](http://www.inf.puc-rio.br/~roberto/docs/peg.pdf) — Ierusalimschy's LPeg parsing machine
+- [Packrat Parsers Can Support Left Recursion (2008)](https://web.cs.ucla.edu/~todd/research/pepm08.pdf) — Warth et al.'s seed-growing algorithm for left recursion in PEGs

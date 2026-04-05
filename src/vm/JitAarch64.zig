@@ -499,6 +499,11 @@ fn emitInst(
             addFixup(fixups, fcount, buf.off(), FixupTarget.bytecodePC(inst.data.offset), .b, 0, 0);
             buf.emit(encNop());
         },
+        .memo_call => {
+            // Packrat memoization is a VM-only path. Compile with
+            // Options{ .memoize = false } when targeting the JIT.
+            unreachable;
+        },
         .ret => {
             buf.emit(encSub(bsp, bsp, 1));
             buf.emit(encLsl(t1, bsp, 5));

@@ -35,6 +35,12 @@ pub const Opcode = enum(u8) {
     /// Match a single literal byte if present, without backtracking.
     /// Equivalent to choice/char/commit but without stack operations.
     optional_char,
+    /// Memoized rule call. Looks up (rule_id, pos) in the memo table.
+    /// On hit-success, skips the call and advances pos. On hit-fail,
+    /// triggers backtracking. On miss, pushes a memo frame and jumps
+    /// to the rule entry exactly like a regular `call`. The final
+    /// `ret` writes the result back to the table.
+    memo_call,
     /// Accept the match and halt.
     match,
 };
@@ -72,11 +78,17 @@ pub const Inst = struct {
         charset: u16,
         slot: u16,
         string: StringRef,
+        memo: MemoCall,
         none: void,
     };
 
     pub const StringRef = packed struct {
         offset: u16,
         len: u8,
+    };
+
+    pub const MemoCall = struct {
+        rule_id: u16,
+        offset: u32,
     };
 };

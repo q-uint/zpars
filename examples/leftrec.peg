@@ -1,0 +1,16 @@
+# Left-recursive grammar for left-associative addition.
+#
+# This is the natural way to express left-associativity: the recursive
+# call sits on the left of the alternative. Standard PEG semantics
+# reject this because a naive top-down parser enters an infinite
+# descent at the same input position.
+#
+# Current behaviour in zpars:
+#   - `zpars check`  flags Expr as left-recursive (validator diagnostic).
+#   - `zpars vm`     blows the VM call stack.
+#   - Matcher        bails out at max_depth and returns no match.
+#
+# A future Warth-style seed-growing packrat implementation should
+# accept this grammar and parse "1+2+3" as ((1+2)+3).
+Expr <- Expr "+" Num / Num
+Num  <- [0-9]+

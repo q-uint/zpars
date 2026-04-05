@@ -102,6 +102,9 @@ fn fuseConsecutiveChars(c: *Compiler) void {
             .jump, .call, .choice, .commit => {
                 inst.data = .{ .offset = remap[inst.data.offset] };
             },
+            .memo_call => {
+                inst.data.memo.offset = remap[inst.data.memo.offset];
+            },
             else => {},
         }
     }
@@ -158,6 +161,9 @@ fn fuseOptionalChar(c: *Compiler) void {
         switch (inst.op) {
             .jump, .call, .choice, .commit => {
                 inst.data = .{ .offset = remap[inst.data.offset] };
+            },
+            .memo_call => {
+                inst.data.memo.offset = remap[inst.data.memo.offset];
             },
             else => {},
         }
@@ -243,6 +249,11 @@ fn factorOnePrefixPass(c: *Compiler) bool {
                 .jump, .call, .choice, .commit => {
                     if (inst.data.offset >= old_end) {
                         inst.data.offset += 1;
+                    }
+                },
+                .memo_call => {
+                    if (inst.data.memo.offset >= old_end) {
+                        inst.data.memo.offset += 1;
                     }
                 },
                 else => {},

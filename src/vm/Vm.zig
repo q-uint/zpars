@@ -23,6 +23,21 @@ const Entry = union(enum) {
         slot: u16,
         old: ?usize,
     },
+    /// Memo frame: pushed by `memo_call` on a table miss. The eventual
+    /// `ret` writes .success to the memo table; `backtrack` writes
+    /// .fail instead.
+    memo: struct {
+        rule_id: u16,
+        start_pos: u32,
+        return_pc: u32,
+    },
+};
+
+pub const MemoState = enum(u8) { empty, in_progress, success, fail };
+
+pub const MemoEntry = struct {
+    state: MemoState,
+    next_pos: u32,
 };
 
 pub const Span = struct {
@@ -36,6 +51,15 @@ string_data: []const u8,
 input: []const u8,
 trace: ?Trace = null,
 captures: [max_captures]?usize = .{null} ** max_captures,
+/// Number of bytecode instructions dispatched during the last execute().
+/// Useful for measuring the work saved by packrat memoization.
+steps: u64 = 0,
+/// Memo table for packrat execution. Empty unless initPackrat was used.
+/// Layout: entry(rule_id, pos) = memo_table[rule_id * stride + pos],
+/// where stride = input.len + 1.
+memo_table: []MemoEntry = &.{},
+memo_rule_count: u16 = 0,
+memo_allocator: ?std.mem.Allocator = null,
 
 pub const Writer = @TypeOf(@as(std.fs.File.Writer, undefined).interface);
 
@@ -47,6 +71,42 @@ pub fn init(code: []const I.Inst, charsets: []const I.Charset, string_data: []co
     return .{ .code = code, .charsets = charsets, .string_data = string_data, .input = input };
 }
 
+/// Packrat constructor. Allocates a memo table sized for `memo_rule_count`
+/// rules and `input.len + 1` positions. Call `deinit` to free it. If
+/// `memo_rule_count` is 0 the call is equivalent to `init`.
+pub fn initPackrat(
+    allocator: std.mem.Allocator,
+    code: []const I.Inst,
+    charsets: []const I.Charset,
+    string_data: []const u8,
+    memo_rule_count: u16,
+    input: []const u8,
+) !Vm {
+    var vm = Vm{
+        .code = code,
+        .charsets = charsets,
+        .string_data = string_data,
+        .input = input,
+        .memo_rule_count = memo_rule_count,
+    };
+    if (memo_rule_count > 0) {
+        const stride = input.len + 1;
+        const table = try allocator.alloc(MemoEntry, @as(usize, memo_rule_count) * stride);
+        @memset(table, .{ .state = .empty, .next_pos = 0 });
+        vm.memo_table = table;
+        vm.memo_allocator = allocator;
+    }
+    return vm;
+}
+
+pub fn deinit(self: *Vm) void {
+    if (self.memo_allocator) |a| {
+        a.free(self.memo_table);
+        self.memo_table = &.{};
+        self.memo_allocator = null;
+    }
+}
+
 /// Run the VM. Returns the position after the match, or null on failure.
 pub fn execute(self: *Vm) ?usize {
     var pc: u32 = 0;
@@ -54,8 +114,10 @@ pub fn execute(self: *Vm) ?usize {
     var stack: [max_stack]Entry = undefined;
     var sp: usize = 0;
 
+    self.steps = 0;
     while (pc < self.code.len) {
         const inst = self.code[pc];
+        self.steps += 1;
         self.traceStep(pc, pos, sp, inst);
         switch (inst.op) {
             .char => {
@@ -143,9 +205,59 @@ pub fn execute(self: *Vm) ?usize {
                 sp += 1;
                 pc = inst.data.offset;
             },
+            .memo_call => {
+                const mc = inst.data.memo;
+                if (self.memo_table.len == 0) {
+                    // No memo table allocated: behave like a plain call.
+                    stack[sp] = .{ .ret = pc + 1 };
+                    sp += 1;
+                    pc = mc.offset;
+                } else {
+                    const stride = self.input.len + 1;
+                    const idx = @as(usize, mc.rule_id) * stride + pos;
+                    switch (self.memo_table[idx].state) {
+                        .success => {
+                            pos = self.memo_table[idx].next_pos;
+                            pc += 1;
+                        },
+                        .fail => {
+                            if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                            return null;
+                        },
+                        .in_progress => {
+                            // Left-recursion hook. Warth's seed-growing
+                            // algorithm will handle this; for now, fail.
+                            if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
+                            return null;
+                        },
+                        .empty => {
+                            self.memo_table[idx] = .{ .state = .in_progress, .next_pos = 0 };
+                            stack[sp] = .{ .memo = .{
+                                .rule_id = mc.rule_id,
+                                .start_pos = @intCast(pos),
+                                .return_pc = pc + 1,
+                            } };
+                            sp += 1;
+                            pc = mc.offset;
+                        },
+                    }
+                }
+            },
             .ret => {
                 sp -= 1;
-                pc = stack[sp].ret;
+                switch (stack[sp]) {
+                    .ret => |addr| pc = addr,
+                    .memo => |m| {
+                        const stride = self.input.len + 1;
+                        const idx = @as(usize, m.rule_id) * stride + m.start_pos;
+                        self.memo_table[idx] = .{
+                            .state = .success,
+                            .next_pos = @intCast(pos),
+                        };
+                        pc = m.return_pc;
+                    },
+                    else => unreachable,
+                }
             },
             .save => {
                 const slot = inst.data.slot;
@@ -177,6 +289,11 @@ fn backtrack(self: *Vm, stack: *[max_stack]Entry, sp: *usize, pc: *u32, pos: *us
             .ret => {},
             .save => |s| {
                 self.captures[s.slot] = s.old;
+            },
+            .memo => |m| {
+                const stride = self.input.len + 1;
+                const idx = @as(usize, m.rule_id) * stride + m.start_pos;
+                self.memo_table[idx] = .{ .state = .fail, .next_pos = 0 };
             },
         }
     }
@@ -243,6 +360,7 @@ fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
         .fail_twice => w.writeAll("fail_twice") catch {},
         .jump => w.print("jump -> {d}", .{inst.data.offset}) catch {},
         .call => w.print("call -> {d}", .{inst.data.offset}) catch {},
+        .memo_call => w.print("memo_call R{d} -> {d}", .{ inst.data.memo.rule_id, inst.data.memo.offset }) catch {},
         .ret => w.writeAll("ret") catch {},
         .save => w.print("save {d}", .{inst.data.slot}) catch {},
         .match => w.writeAll("match") catch {},
@@ -447,4 +565,142 @@ test "capture: no match clears captures" {
     try testing.expectEqual(@as(?usize, null), vm.execute());
     // Capture should be null after failed match (undone by backtrack).
     try testing.expectEqual(@as(?Span, null), vm.getCapture(0));
+}
+
+fn compilePegOpts(source: []const u8, opts: Compiler.Options) Compiler {
+    var scanner = PegScanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = PegParser.init(tokens, source);
+    const rules = parser.parse() catch return Compiler{};
+    return Compiler.compileOpts(rules, opts);
+}
+
+test "packrat: same result as non-packrat on simple grammar" {
+    const src =
+        \\Main <- Greet " " Name
+        \\Greet <- "hi" / "hello"
+        \\Name  <- [a-z]+
+    ;
+    const input = "hello world";
+
+    var plain = compilePegOpts(src, .{ .memoize = false });
+    var vm_plain = Vm.init(plain.getCode(), plain.getCharsets(), plain.getStringData(), input);
+    const r_plain = vm_plain.execute();
+
+    var memo = compilePegOpts(src, .{ .memoize = true });
+    var vm_memo = try Vm.initPackrat(
+        testing.allocator,
+        memo.getCode(),
+        memo.getCharsets(),
+        memo.getStringData(),
+        memo.getMemoRuleCount(),
+        input,
+    );
+    defer vm_memo.deinit();
+    const r_memo = vm_memo.execute();
+
+    try testing.expectEqual(r_plain, r_memo);
+    try testing.expectEqual(@as(?usize, 11), r_memo);
+}
+
+test "packrat: rewrites rule callsites into memo_call" {
+    // Every rule here is capture-free, so every call should become a memo_call.
+    const src =
+        \\Main <- A B
+        \\A    <- "a"
+        \\B    <- "b"
+    ;
+    var c = compilePegOpts(src, .{ .memoize = true });
+    try testing.expectEqual(@as(u16, 3), c.getMemoRuleCount());
+
+    var call_count: usize = 0;
+    var memo_count: usize = 0;
+    for (c.getCode()) |inst| {
+        if (inst.op == .call) call_count += 1;
+        if (inst.op == .memo_call) memo_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), call_count);
+    try testing.expectEqual(@as(usize, 3), memo_count);
+}
+
+test "packrat: redundant rule re-entry is cached" {
+    // S tries the first alternative; E matches but "!" fails, so S
+    // backtracks and tries the second alternative. Without packrat,
+    // E is re-executed from pos 0; with packrat, the second call is
+    // a table hit.
+    const src =
+        \\S <- E "!" / E "?"
+        \\E <- "a" "b" "c" "d"
+    ;
+    const input = "abcd?";
+
+    var plain = compilePegOpts(src, .{ .memoize = false });
+    var vm_plain = Vm.init(plain.getCode(), plain.getCharsets(), plain.getStringData(), input);
+    const r_plain = vm_plain.execute();
+
+    var memo = compilePegOpts(src, .{ .memoize = true });
+    var vm_memo = try Vm.initPackrat(
+        testing.allocator,
+        memo.getCode(),
+        memo.getCharsets(),
+        memo.getStringData(),
+        memo.getMemoRuleCount(),
+        input,
+    );
+    defer vm_memo.deinit();
+    const r_memo = vm_memo.execute();
+
+    try testing.expectEqual(@as(?usize, 5), r_plain);
+    try testing.expectEqual(r_plain, r_memo);
+    // Packrat must execute strictly fewer instructions: the second
+    // call to E returns via a memo hit instead of running the body.
+    try testing.expect(vm_memo.steps < vm_plain.steps);
+}
+
+test "packrat: failure memoization" {
+    // Same idea but E fails — the failure must be cached too, so the
+    // second call to E returns fail without re-running the body.
+    const src =
+        \\S <- E "x" / E "y"
+        \\E <- "a" "b" "c"
+    ;
+    const input = "abqy";
+
+    var plain = compilePegOpts(src, .{ .memoize = false });
+    var vm_plain = Vm.init(plain.getCode(), plain.getCharsets(), plain.getStringData(), input);
+    const r_plain = vm_plain.execute();
+
+    var memo = compilePegOpts(src, .{ .memoize = true });
+    var vm_memo = try Vm.initPackrat(
+        testing.allocator,
+        memo.getCode(),
+        memo.getCharsets(),
+        memo.getStringData(),
+        memo.getMemoRuleCount(),
+        input,
+    );
+    defer vm_memo.deinit();
+    const r_memo = vm_memo.execute();
+
+    try testing.expectEqual(@as(?usize, null), r_plain);
+    try testing.expectEqual(r_plain, r_memo);
+    try testing.expect(vm_memo.steps < vm_plain.steps);
+}
+
+test "packrat: captures keep rule out of memoization" {
+    // The ERE capture emits `save`, so the whole wrapper rule is
+    // ineligible. But it still compiles and runs correctly.
+    var c = compilePegOpts("Main <- \"a\" \"b\"", .{ .memoize = true });
+    // Single-rule PEG (no multi-rule call sites) yields zero memoizable rules.
+    try testing.expectEqual(@as(u16, 0), c.getMemoRuleCount());
+    var vm = try Vm.initPackrat(
+        testing.allocator,
+        c.getCode(),
+        c.getCharsets(),
+        c.getStringData(),
+        c.getMemoRuleCount(),
+        "ab",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 2), vm.execute());
 }

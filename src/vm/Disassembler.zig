@@ -52,6 +52,7 @@ pub fn dump(self: *const Disassembler, writer: anytype) !void {
             .fail_twice => try writer.writeAll("fail_twice\n"),
             .jump => try writer.print("jump    -> {d}\n", .{inst.data.offset}),
             .call => try writer.print("call    -> {d}\n", .{inst.data.offset}),
+            .memo_call => try writer.print("memo_call R{d} -> {d}\n", .{ inst.data.memo.rule_id, inst.data.memo.offset }),
             .ret => try writer.writeAll("ret\n"),
             .save => try writer.print("save    {d}\n", .{inst.data.slot}),
             .match => try writer.writeAll("match\n"),
