@@ -43,7 +43,7 @@ fn printUsage() void {
         \\  fmt     <file>                     Format a grammar
         \\  match   -r <rule> <file> <input>   Match input against a rule
         \\  run     <blob> <input>             Run a compiled .zpar blob
-        \\  vm      [-t] <file> [<input>]      Disassemble (and optionally run) via VM
+        \\  vm      [-t] [-p] <file> [<input>]  Disassemble (and optionally run) via VM (-t trace, -p packrat)
         \\
         \\Format is auto-detected from file extension (.abnf, .peg, .ere).
         \\
@@ -245,10 +245,13 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var filename: ?[]const u8 = null;
     var input: ?[]const u8 = null;
     var trace_enabled = false;
+    var packrat_enabled = false;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "-t")) {
             trace_enabled = true;
+        } else if (std.mem.eql(u8, arg, "-p")) {
+            packrat_enabled = true;
         } else if (filename == null) {
             filename = arg;
         } else if (input == null) {
@@ -257,7 +260,7 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (filename == null) {
-        std.debug.print("usage: zpars vm [-t] <file> [<input>]\n", .{});
+        std.debug.print("usage: zpars vm [-t] [-p] <file> [<input>]\n", .{});
         std.process.exit(1);
     }
 
@@ -275,7 +278,7 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
 
-    var compiler = zpars.vm.Compiler.compile(rules);
+    var compiler = zpars.vm.Compiler.compileOpts(rules, .{ .memoize = packrat_enabled });
     const code = compiler.getCode();
     const charsets = compiler.getCharsets();
     const string_data = compiler.getStringData();
@@ -292,11 +295,22 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (trace_enabled) try stdout.print("--- trace ---\n", .{});
         try stdout.flush();
 
-        var vm = zpars.vm.Vm.init(code, charsets, string_data, inp);
+        var vm = if (packrat_enabled)
+            try zpars.vm.Vm.initPackrat(
+                allocator,
+                code,
+                charsets,
+                string_data,
+                compiler.getMemoRuleCount(),
+                inp,
+            )
+        else
+            zpars.vm.Vm.init(code, charsets, string_data, inp);
+        defer vm.deinit();
         if (trace_enabled) {
             vm.trace = .{ .writer = stdout };
         }
-        if (vm.execute()) |pos| {
+        if (try vm.execute()) |pos| {
             if (trace_enabled) try stdout.print("--- end ---\n", .{});
             try stdout.print("match: {d} bytes \"{s}\"\n", .{ pos, inp[0..pos] });
             const cap_count = compiler.getCaptureCount();

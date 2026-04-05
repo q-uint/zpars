@@ -6,11 +6,10 @@
 # descent at the same input position.
 #
 # Current behaviour in zpars:
-#   - `zpars check`  flags Expr as left-recursive (validator diagnostic).
-#   - `zpars vm`     blows the VM call stack.
-#   - Matcher        bails out at max_depth and returns no match.
-#
-# A future Warth-style seed-growing packrat implementation should
-# accept this grammar and parse "1+2+3" as ((1+2)+3).
+#   - `zpars check`     flags Expr as left-recursive (validator diagnostic).
+#   - `zpars vm`        blows the VM call stack.
+#   - `zpars vm -p`     runs the Warth-style packrat VM, which handles it.
+#                       Try: zpars vm -p examples/leftrec.peg "1+2+3"
+#   - Matcher (no -p)   bails out at max_depth and returns no match.
 Expr <- Expr "+" Num / Num
 Num  <- [0-9]+

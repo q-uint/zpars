@@ -13,6 +13,8 @@ const Aot = zpars.vm.Aot;
 const AotRuntime = zpars.vm.AotRuntime;
 const EreScanner = zpars.ere.Scanner;
 const EreParser = zpars.ere.Parser;
+const PegScanner = zpars.peg.Scanner;
+const PegParser = zpars.peg.Parser;
 
 const iterations = 1_000_000;
 
@@ -178,7 +180,7 @@ fn benchVm(compiler: *const VmCompiler, input: []const u8) u64 {
 
     for (0..iterations) |_| {
         var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), inp);
-        const r = vm.execute();
+        const r = vm.execute() catch unreachable;
         std.mem.doNotOptimizeAway(&r);
     }
 
@@ -367,7 +369,146 @@ pub fn main() !void {
     }
 
     try stdout.print("\n  ({d} iterations per case)\n\n", .{iterations});
+
+    // ---- Packrat VM: plain vs memoized ----
+    try stdout.print("  Packrat VM (plain vs memoized)\n", .{});
+    try stdout.print("  {s:<20} {s:>14} {s:>14} {s:>10}\n", .{
+        "case", "plain", "packrat", "speedup",
+    });
+    try stdout.print("  {s:-<20} {s:->14} {s:->14} {s:->10}\n", .{
+        "", "", "", "",
+    });
+
+    for (packrat_cases) |case| {
+        const memo_comp = compilePeg(case.grammar, .{ .memoize = true });
+        const memo_ns = benchVmPackrat(gpa.allocator(), &memo_comp, case.input);
+        const memo_per = memo_ns / iterations;
+
+        if (case.left_recursive) {
+            try stdout.print("  {s:<20} {s:>14} {d:>11} ns {s:>10}\n", .{
+                case.name,
+                "(LR: n/a)",
+                memo_per,
+                "-",
+            });
+            continue;
+        }
+
+        const plain_comp = compilePeg(case.grammar, .{ .memoize = false });
+        const plain_ns = benchVmPlain(&plain_comp, case.input);
+        const plain_per = plain_ns / iterations;
+
+        const speedup: f64 = if (memo_per > 0)
+            @as(f64, @floatFromInt(plain_per)) / @as(f64, @floatFromInt(memo_per))
+        else
+            0;
+
+        try stdout.print("  {s:<20} {d:>11} ns {d:>11} ns {d:>9.2}x\n", .{
+            case.name,
+            plain_per,
+            memo_per,
+            speedup,
+        });
+    }
+
+    try stdout.print("\n  ({d} iterations per case)\n\n", .{iterations});
     try stdout.flush();
+}
+
+const PackratCase = struct {
+    name: []const u8,
+    grammar: []const u8,
+    input: []const u8,
+    /// Plain-VM cannot run left-recursive grammars (call-stack blows
+    /// up), so benchmark packrat in isolation.
+    left_recursive: bool = false,
+};
+
+const packrat_cases = [_]PackratCase{
+    .{
+        // Redundant E descent: backtracks from alt 1 to alt 2 but E
+        // has already been evaluated once at position 0.
+        .name = "redundant E",
+        .grammar = "S <- E \"!\" / E \"?\"\nE <- \"a\" \"b\" \"c\" \"d\"",
+        .input = "abcd?",
+    },
+    .{
+        // Same pattern, failure path: both branches must consult E.
+        .name = "failure memo",
+        .grammar = "S <- E \"x\" / E \"y\"\nE <- \"a\" \"b\" \"c\"",
+        .input = "abqy",
+    },
+    .{
+        // Direct left recursion via Warth's seed-growing.
+        .name = "left-rec arith",
+        .grammar = "E <- E \"+\" N / N\nN <- [0-9]+",
+        .input = "1+2+3+4+5+6+7+8+9+0",
+        .left_recursive = true,
+    },
+    .{
+        // Indirect LR through two rules (A -> B -> A "x" / "y").
+        .name = "indirect LR",
+        .grammar = "A <- B\nB <- A \"x\" / \"y\"",
+        .input = "yxxxxxxxxx",
+        .left_recursive = true,
+    },
+    .{
+        // A baseline non-pathological grammar where packrat should
+        // add pure overhead (no redundant re-entries).
+        .name = "baseline (no LR)",
+        .grammar = "E <- T (\"+\" T)*\nT <- F (\"*\" F)*\nF <- \"(\" E \")\" / [0-9]+",
+        .input = "1+2*3+4*5+6",
+    },
+};
+
+fn compilePeg(source: []const u8, opts: VmCompiler.Options) VmCompiler {
+    var scanner = PegScanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = PegParser.init(tokens, source);
+    const rules = parser.parse() catch return VmCompiler{};
+    return VmCompiler.compileOpts(rules, opts);
+}
+
+fn benchVmPlain(compiler: *const VmCompiler, input: []const u8) u64 {
+    var inp: []const u8 = input;
+    std.mem.doNotOptimizeAway(&inp);
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    for (0..iterations) |_| {
+        var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), inp);
+        const r = vm.execute() catch unreachable;
+        std.mem.doNotOptimizeAway(&r);
+    }
+
+    return timer.read();
+}
+
+fn benchVmPackrat(base_allocator: std.mem.Allocator, compiler: *const VmCompiler, input: []const u8) u64 {
+    var inp: []const u8 = input;
+    std.mem.doNotOptimizeAway(&inp);
+
+    var arena = std.heap.ArenaAllocator.init(base_allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    for (0..iterations) |_| {
+        var vm = Vm.initPackrat(
+            arena_allocator,
+            compiler.getCode(),
+            compiler.getCharsets(),
+            compiler.getStringData(),
+            compiler.getMemoRuleCount(),
+            inp,
+        ) catch unreachable;
+        const r = vm.execute() catch unreachable;
+        std.mem.doNotOptimizeAway(&r);
+        _ = arena.reset(.retain_capacity);
+    }
+
+    return timer.read();
 }
 
 fn buildMatcher(allocator: std.mem.Allocator, comptime idx: usize) !Matcher {

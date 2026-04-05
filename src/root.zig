@@ -52,3 +52,18 @@ pub const Validator = @import("Validator.zig");
 pub const combinators = @import("combinators.zig");
 pub const diagnostic = @import("diagnostic.zig");
 pub const token = @import("token.zig");
+
+test {
+    // Force test compilation for files with tests. Without these
+    // references, zig's test runner only pulls in tests in files
+    // reachable at comptime, which skips all `pub const X = @import(...)`
+    // re-exports above.
+    _ = @import("Matcher.zig");
+    _ = @import("Validator.zig");
+    _ = @import("combinators.zig");
+    _ = @import("vm/Compiler.zig");
+    _ = @import("vm/Disassembler.zig");
+    _ = @import("vm/Jit.zig");
+    _ = @import("vm/Optimizer.zig");
+    _ = @import("vm/Vm.zig");
+}
