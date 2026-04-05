@@ -104,7 +104,27 @@ fn parseDefinition(self: *Parser) ParseError!Ast.Rule {
     _ = self.advance(); // consume <-
     self.skipTrivia();
 
-    return .{ .name = name, .node = try self.parseExpression(), .incremental = false };
+    const node = try self.parseExpression();
+    // After the expression we must be at eof or the start of the next
+    // definition (`identifier <-`). Anything else (stray `)`, `/`
+    // without a follow-up sequence, etc.) is a syntax error that
+    // should abort this definition so the error-recovery path in
+    // `parse()` can sync to the next rule.
+    self.skipTrivia();
+    if (!self.isDefinitionBoundary()) {
+        self.fail(.expression, self.peek());
+        return error.SyntaxError;
+    }
+    return .{ .name = name, .node = node, .incremental = false };
+}
+
+/// True when the current position marks the end of a definition body:
+/// either eof, or an `identifier` immediately followed by `<-`.
+fn isDefinitionBoundary(self: *Parser) bool {
+    const tag = self.peek().tag;
+    if (tag == .eof) return true;
+    if (tag != .identifier) return false;
+    return self.peekNextMeaningful() == .left_arrow;
 }
 
 /// Expression <- Sequence (SLASH Sequence)*

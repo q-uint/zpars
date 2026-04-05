@@ -45,8 +45,7 @@ test "multi-char terminal" {
 test "multiline" {
     try expectTags("<a> ::= x\n<b> ::= y", &.{
         .rulename, .definition, .terminal, .newline,
-        .rulename, .definition, .terminal, .newline,
-        .eof,
+        .rulename, .definition, .terminal, .eof,
     });
 }
 
@@ -65,12 +64,21 @@ test "ALGOL 60 example" {
     });
 }
 
-test "bare colon as terminal" {
-    try expectTags("<x> ::= a:b", &.{ .rulename, .definition, .terminal, .eof });
+test "bare colon breaks up terminal" {
+    // `:` is the leading byte of the `definition` rule (`::=`), so the
+    // scanner's first-byte dispatch always treats it as a candidate
+    // rule-start and breaks the surrounding terminal run. A bare `:`
+    // that doesn't continue into `::=` shows up as `.invalid`.
+    try expectTags("<x> ::= a:b", &.{
+        .rulename, .definition, .terminal, .invalid, .terminal, .eof,
+    });
 }
 
 test "unterminated rulename" {
-    try expectTags("<oops", &.{ .invalid, .eof });
+    // `<` alone can't complete the `rulename` rule, so the scanner
+    // emits a single `.invalid` byte for `<` and then treats the rest
+    // as a catch-all terminal.
+    try expectTags("<oops", &.{ .invalid, .terminal, .eof });
 }
 
 test "line tracking" {

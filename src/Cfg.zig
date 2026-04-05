@@ -111,7 +111,7 @@ fn formatProduction(self: Cfg, prod: Production, writer: anytype) !void {
 }
 
 /// Format the entire grammar for debug display.
-pub fn format(self: Cfg, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+pub fn format(self: Cfg, writer: anytype) !void {
     for (self.productions, 0..) |prod, i| {
         if (i > 0) try writer.writeByte('\n');
         try self.formatProduction(prod, writer);
@@ -278,8 +278,8 @@ test "parse: basic nonterminal and string terminal" {
     );
 
     try std.testing.expectEqual(2, cfg.nonterminals.len);
-    try std.testing.expectEqualStrings("S", cfg.nonterminalName(0));
-    try std.testing.expectEqualStrings("A", cfg.nonterminalName(1));
+    comptime try std.testing.expectEqualStrings("S", cfg.nonterminalName(0));
+    comptime try std.testing.expectEqualStrings("A", cfg.nonterminalName(1));
     try std.testing.expectEqual(@as(u32, 0), cfg.start);
 
     try std.testing.expectEqual(2, cfg.productions.len);
@@ -357,13 +357,17 @@ test "parse: productions grouped by LHS" {
     );
 
     // S productions should be grouped together despite interleaving.
-    const s_prods = cfg.productionsFor(0);
-    try std.testing.expectEqual(2, s_prods.len);
-    try std.testing.expectEqual(@as(u32, 0), s_prods[0].lhs);
-    try std.testing.expectEqual(@as(u32, 0), s_prods[1].lhs);
+    // `productionsFor` takes Cfg by value, which would require comptime
+    // slice pointers to be materialized at runtime; run at comptime.
+    comptime {
+        const s_prods = cfg.productionsFor(0);
+        try std.testing.expectEqual(2, s_prods.len);
+        try std.testing.expectEqual(@as(u32, 0), s_prods[0].lhs);
+        try std.testing.expectEqual(@as(u32, 0), s_prods[1].lhs);
 
-    const a_prods = cfg.productionsFor(1);
-    try std.testing.expectEqual(1, a_prods.len);
+        const a_prods = cfg.productionsFor(1);
+        try std.testing.expectEqual(1, a_prods.len);
+    }
 }
 
 test "parse: format round-trip" {
@@ -373,12 +377,10 @@ test "parse: format round-trip" {
         \\A ->
     );
 
-    var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.fmt.format(fbs.writer(), "{}", .{cfg});
+    const actual = comptime std.fmt.comptimePrint("{f}", .{cfg});
     try std.testing.expectEqualStrings(
         \\S → A %x78
         \\A → "hello"
         \\A → ε
-    , fbs.getWritten());
+    , actual);
 }

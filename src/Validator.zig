@@ -22,6 +22,10 @@ fn CiHashMap(comptime V: type) type {
 rules: []const Ast.Rule,
 allocator: std.mem.Allocator,
 diagnostics: std.ArrayList(Validation) = .empty,
+/// Alternation slices allocated during `validate()` and embedded in
+/// the returned rules. Callers must free them via `freeMerges` once
+/// they're done with the merged rule set.
+merges: std.ArrayList([]Ast.Node) = .empty,
 /// Name of the start rule (exempt from "unused" check).
 /// When null, the first rule is assumed to be the start rule.
 start_rule: ?[]const u8 = null,
@@ -64,6 +68,14 @@ const core_rules = [_][]const u8{
 
 pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) Validator {
     return .{ .rules = rules, .allocator = allocator };
+}
+
+/// Free all alternation slices allocated by `mergeAlternation`.
+/// Call this once you're done with the merged rule set returned by
+/// `validate()` (the slices are embedded in those rules).
+pub fn freeMerges(self: *Validator) void {
+    for (self.merges.items) |slice| self.allocator.free(slice);
+    self.merges.deinit(self.allocator);
 }
 
 /// Validate the grammar and return the merged rule set.
@@ -240,7 +252,12 @@ fn mergeAlternation(self: *Validator, a: Ast.Node, b: Ast.Node) !Ast.Node {
         else => try alts.append(self.allocator, b),
     }
 
-    return .{ .alternation = try alts.toOwnedSlice(self.allocator) };
+    const slice = try alts.toOwnedSlice(self.allocator);
+    // Track the slice so callers can free it via `freeMerges` — merged
+    // alternation slices live beyond `validate()` (they're embedded in
+    // the returned rules), so the validator holds onto them.
+    try self.merges.append(self.allocator, slice);
+    return .{ .alternation = slice };
 }
 
 fn collectRefs(self: *Validator, node: Ast.Node, refs: *CiHashMap(void)) !void {
@@ -479,10 +496,21 @@ const Parser = @import("abnf/Parser.zig");
 const PegScanner = @import("peg/Scanner.zig");
 const PegParser = @import("peg/Parser.zig");
 
-fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
+const TestResult = struct {
     rules: []const Ast.Rule,
     diagnostics: []const Validation,
-} {
+    merges: [][]Ast.Node,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: TestResult) void {
+        for (self.merges) |slice| self.allocator.free(slice);
+        self.allocator.free(self.merges);
+        self.allocator.free(self.rules);
+        self.allocator.free(self.diagnostics);
+    }
+};
+
+fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !TestResult {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
@@ -490,13 +518,15 @@ fn parseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
     try std.testing.expectEqual(0, parser.getDiagnostics().len);
     var validator = Validator.init(allocator, rules);
     const merged = try validator.validate();
-    return .{ .rules = merged, .diagnostics = try validator.diagnostics.toOwnedSlice(allocator) };
+    return .{
+        .rules = merged,
+        .diagnostics = try validator.diagnostics.toOwnedSlice(allocator),
+        .merges = try validator.merges.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
 }
 
-fn pegParseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct {
-    rules: []const Ast.Rule,
-    diagnostics: []const Validation,
-} {
+fn pegParseAndValidate(allocator: std.mem.Allocator, source: []const u8) !TestResult {
     var scanner = PegScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = PegParser.init(tokens, source);
@@ -504,14 +534,18 @@ fn pegParseAndValidate(allocator: std.mem.Allocator, source: []const u8) !struct
     try std.testing.expectEqual(0, parser.getDiagnostics().len);
     var validator = Validator.init(allocator, rules);
     const merged = try validator.validate();
-    return .{ .rules = merged, .diagnostics = try validator.diagnostics.toOwnedSlice(allocator) };
+    return .{
+        .rules = merged,
+        .diagnostics = try validator.diagnostics.toOwnedSlice(allocator),
+        .merges = try validator.merges.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
 }
 
 test "clean grammar — no diagnostics" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = bar\nbar = \"hello\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(0, result.diagnostics.len);
     try std.testing.expectEqual(2, result.rules.len);
 }
@@ -519,26 +553,28 @@ test "clean grammar — no diagnostics" {
 test "core rules not flagged as undefined" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = ALPHA DIGIT");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(0, result.diagnostics.len);
 }
 
 test "undefined rule reference" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = bar");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
-    try std.testing.expectEqual(1, result.diagnostics.len);
-    try std.testing.expectEqual(.undefined_rule, result.diagnostics[0].kind);
-    try std.testing.expectEqualStrings("bar", result.diagnostics[0].ref_name.?);
+    defer result.deinit();
+    // "foo" also ends up flagged as unproductive (it depends only on the
+    // undefined "bar"), so we just look for the undefined_rule.
+    var found: ?Validation = null;
+    for (result.diagnostics) |d| if (d.kind == .undefined_rule) {
+        found = d;
+    };
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("bar", found.?.ref_name.?);
 }
 
 test "unused rule detected" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = \"a\"\nbar = \"b\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(1, result.diagnostics.len);
     try std.testing.expectEqual(.unused_rule, result.diagnostics[0].kind);
     try std.testing.expectEqualStrings("bar", result.diagnostics[0].rule_name);
@@ -547,16 +583,14 @@ test "unused rule detected" {
 test "start rule not flagged as unused" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = \"a\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(0, result.diagnostics.len);
 }
 
 test "duplicate = definition" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = \"a\"\nfoo = \"b\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(1, result.diagnostics.len);
     try std.testing.expectEqual(.duplicate_rule, result.diagnostics[0].kind);
     try std.testing.expectEqualStrings("foo", result.diagnostics[0].rule_name);
@@ -565,8 +599,7 @@ test "duplicate = definition" {
 test "=/ not flagged as duplicate" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = \"a\"\nfoo =/ \"b\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(0, result.diagnostics.len);
     // Merged into one rule with alternation.
     try std.testing.expectEqual(1, result.rules.len);
@@ -576,8 +609,7 @@ test "=/ not flagged as duplicate" {
 test "simple cycle detected as unproductive" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "a = b\nb = a");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     // Both rules are unproductive (plus undefined refs won't fire since
     // both are defined).
     var unproductive_count: usize = 0;
@@ -590,8 +622,7 @@ test "simple cycle detected as unproductive" {
 test "cycle with terminal escape is productive" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "a = b / \"x\"\nb = a");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .unproductive_rule);
     }
@@ -600,8 +631,7 @@ test "cycle with terminal escape is productive" {
 test "incremental alternation merges via validator" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = \"a\"\nfoo =/ \"b\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(1, result.rules.len);
     const alts = result.rules[0].node.alternation;
     try std.testing.expectEqual(2, alts.len);
@@ -612,8 +642,7 @@ test "incremental alternation merges via validator" {
 test "mixed-case rule names merge as duplicates" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "Foo = \"a\"\nfoo = \"b\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(1, result.diagnostics.len);
     try std.testing.expectEqual(.duplicate_rule, result.diagnostics[0].kind);
     try std.testing.expectEqual(1, result.rules.len);
@@ -622,8 +651,7 @@ test "mixed-case rule names merge as duplicates" {
 test "mixed-case incremental alternation merges" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "Foo = \"a\"\nfoo =/ \"b\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     try std.testing.expectEqual(0, result.diagnostics.len);
     try std.testing.expectEqual(1, result.rules.len);
     try std.testing.expectEqual(2, result.rules[0].node.alternation.len);
@@ -632,8 +660,7 @@ test "mixed-case incremental alternation merges" {
 test "mixed-case reference not flagged as undefined" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = Bar\nbar = \"x\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .undefined_rule);
     }
@@ -642,8 +669,7 @@ test "mixed-case reference not flagged as undefined" {
 test "mixed-case reference counts as used" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = Bar\nbar = \"x\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .unused_rule);
     }
@@ -655,19 +681,21 @@ test "mixed-case undefined reference reports correct owner" {
     // identify "foo" as the rule containing the bad reference regardless
     // of casing.
     const result = try parseAndValidate(allocator, "foo = Missing");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
-    try std.testing.expectEqual(1, result.diagnostics.len);
-    try std.testing.expectEqual(.undefined_rule, result.diagnostics[0].kind);
-    try std.testing.expectEqualStrings("foo", result.diagnostics[0].rule_name);
-    try std.testing.expectEqualStrings("Missing", result.diagnostics[0].ref_name.?);
+    defer result.deinit();
+    // "foo" also ends up flagged as unproductive; find the undefined_rule.
+    var found: ?Validation = null;
+    for (result.diagnostics) |d| if (d.kind == .undefined_rule) {
+        found = d;
+    };
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("foo", found.?.rule_name);
+    try std.testing.expectEqualStrings("Missing", found.?.ref_name.?);
 }
 
 test "direct left recursion detected" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "a = a \"x\" / \"y\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     var count: usize = 0;
     for (result.diagnostics) |d| {
         if (d.kind == .left_recursive_rule) count += 1;
@@ -678,8 +706,7 @@ test "direct left recursion detected" {
 test "indirect left recursion detected" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "a = b \"x\"\nb = a \"y\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     var count: usize = 0;
     for (result.diagnostics) |d| {
         if (d.kind == .left_recursive_rule) count += 1;
@@ -691,8 +718,7 @@ test "indirect left recursion detected" {
 test "right recursion is not left recursion" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "a = \"x\" a / \"y\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .left_recursive_rule);
     }
@@ -702,8 +728,7 @@ test "left recursion through nullable prefix" {
     const allocator = std.testing.allocator;
     // *"x" can match zero chars, so `a` is reachable at position 0.
     const result = try parseAndValidate(allocator, "a = *\"x\" a / \"y\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     var count: usize = 0;
     for (result.diagnostics) |d| {
         if (d.kind == .left_recursive_rule) count += 1;
@@ -715,8 +740,7 @@ test "zero-width loop detected" {
     const allocator = std.testing.allocator;
     // b = *"x" is nullable; a = *b loops forever.
     const result = try parseAndValidate(allocator, "a = 1*b\nb = *\"x\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     var count: usize = 0;
     for (result.diagnostics) |d| {
         if (d.kind == .zero_width_loop) count += 1;
@@ -728,8 +752,7 @@ test "bounded repetition of nullable body is not zero-width loop" {
     const allocator = std.testing.allocator;
     // 3*5b where b is nullable — bounded, will terminate.
     const result = try parseAndValidate(allocator, "a = 3*5b\nb = *\"x\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .zero_width_loop);
     }
@@ -738,8 +761,7 @@ test "bounded repetition of nullable body is not zero-width loop" {
 test "non-nullable repetition body is not zero-width loop" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "a = *\"x\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .zero_width_loop);
     }
@@ -749,8 +771,7 @@ test "predicate-guarded self-reference is not left-recursive" {
     const allocator = std.testing.allocator;
     // !a is a lookahead guard, not a recursive descent into a.
     const result = try pegParseAndValidate(allocator, "a <- !a 'x'");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .left_recursive_rule);
     }
@@ -759,8 +780,7 @@ test "predicate-guarded self-reference is not left-recursive" {
 test "and-predicate self-reference is not left-recursive" {
     const allocator = std.testing.allocator;
     const result = try pegParseAndValidate(allocator, "a <- &a 'x'");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     for (result.diagnostics) |d| {
         try std.testing.expect(d.kind != .left_recursive_rule);
     }
@@ -771,8 +791,7 @@ test "disabled check suppresses diagnostic" {
     // "a = a" is direct left recursion, but with the check disabled
     // the validator must not emit a left_recursive_rule diagnostic.
     const result = try parseAndValidate(allocator, "a = a \"x\" / \"y\"");
-    defer allocator.free(result.rules);
-    defer allocator.free(result.diagnostics);
+    defer result.deinit();
     // Sanity: default config does flag it.
     var found = false;
     for (result.diagnostics) |d| {

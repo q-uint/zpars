@@ -33,7 +33,12 @@ pub fn ParserBase(
         }
 
         pub fn peek(self: *Self) TokenType {
-            return self.tokens[self.pos];
+            // Clamp past-the-end reads to the trailing eof token.
+            // Error paths can `advance()` past eof while reporting a
+            // diagnostic; clamping here lets `synchronize()` and other
+            // post-error cleanup see eof instead of crashing on OOB.
+            const i = @min(self.pos, self.tokens.len - 1);
+            return self.tokens[i];
         }
 
         pub fn advance(self: *Self) TokenType {

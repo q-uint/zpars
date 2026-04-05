@@ -208,12 +208,17 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
                     }
                 },
                 .catch_all => {
-                    while (!self.isAtEnd()) {
-                        const p = self.peekByte();
-                        if (skip_set[p] or any_rule_byte[p]) break;
-                        _ = self.advanceByte();
-                    }
-                    self.addToken(@field(Tag, config.catch_all.?));
+                    // Only reachable when `has_catch_all` is true; the
+                    // comptime guard keeps `config.catch_all.?` from
+                    // being analyzed in configs without a catch-all.
+                    if (comptime has_catch_all) {
+                        while (!self.isAtEnd()) {
+                            const p = self.peekByte();
+                            if (skip_set[p] or any_rule_byte[p]) break;
+                            _ = self.advanceByte();
+                        }
+                        self.addToken(@field(Tag, config.catch_all.?));
+                    } else unreachable;
                 },
                 .invalid => self.addToken(.invalid),
             }
@@ -235,9 +240,9 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
         }
 
         fn addToken(self: *Self, tag: Tag) void {
-            if (comptime config.line_tag) |lt| {
-                if (tag == @field(Tag, lt)) self.line += 1;
-            }
+            // Record the token first (so a newline token keeps the
+            // line it *terminates*), then advance the line counter for
+            // subsequent tokens.
             self.tokens[self.token_count] = .{
                 .tag = tag,
                 .start = self.start,
@@ -245,6 +250,9 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
                 .line = self.line,
             };
             self.token_count += 1;
+            if (comptime config.line_tag) |lt| {
+                if (tag == @field(Tag, lt)) self.line += 1;
+            }
         }
     };
 }
@@ -473,12 +481,15 @@ fn expectTags(comptime S: type, source: []const u8, expected: []const S.Tag) !vo
 }
 
 test "first-byte conflict: longest match wins" {
+    // ABNF rulenames use `-` (not `_`) per RFC 5234. Reference the
+    // generated enum fields via `@"..."` since hyphens aren't legal
+    // Zig identifier characters.
     const S = CompileScanner(
-        \\equals       = "="
-        \\equals_slash = "=/"
+        \\eq       = "="
+        \\eq-slash = "=/"
     , .{});
-    try expectTags(S, "=/", &.{ .equals_slash, .eof });
-    try expectTags(S, "=", &.{ .equals, .eof });
+    try expectTags(S, "=/", &.{ .@"eq-slash", .eof });
+    try expectTags(S, "=", &.{ .eq, .eof });
 }
 
 test "first-byte conflict: declaration order breaks ties" {

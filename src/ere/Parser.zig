@@ -437,7 +437,9 @@ test "grouping" {
     const result = try parseSource("(a|b)+");
     const rep = result.rules[0].node.repetition;
     try std.testing.expectEqual(1, rep.min);
-    const alts = rep.element.alternation;
+    // `(...)` in ERE creates a capture group wrapping the inner
+    // alternation.
+    const alts = rep.element.capture.alternation;
     try std.testing.expectEqual(2, alts.len);
 }
 

@@ -244,7 +244,7 @@ fn unitStep(b: *CnfBuilder) void {
     // 1. Compute unit closure for every nonterminal.
     //    unit[A][B] == true means A can reach B through unit productions.
     //    Seed with identity (A reaches A), then propagate.
-    var unit = [1][1]bool{[1]bool{false} ** max_nts} ** max_nts;
+    var unit = [1][max_nts]bool{[1]bool{false} ** max_nts} ** max_nts;
     for (0..b.nt_count) |i| unit[i][i] = true;
 
     // Seed direct unit productions.
@@ -332,8 +332,13 @@ fn termStep(b: *CnfBuilder) void {
             continue;
         }
 
-        // Rewrite: replace terminals with proxy nonterminals.
-        const ss = b.sym_total;
+        // Rewrite: replace terminals with proxy nonterminals. Stage
+        // into a local buffer first because `findOrAddProxy` itself
+        // writes the proxy's own production into `sym_pool`, which
+        // would otherwise interleave with (and grow) the rhs we're
+        // accumulating for this production.
+        var new_rhs: [max_symbols]Symbol = undefined;
+        var new_len: usize = 0;
         for (prod.rhs) |sym| {
             switch (sym) {
                 .terminal => |t| {
@@ -344,14 +349,18 @@ fn termStep(b: *CnfBuilder) void {
                         t,
                         b,
                     );
-                    b.sym_pool[b.sym_total] = .{ .nonterminal = pid };
-                    b.sym_total += 1;
+                    new_rhs[new_len] = .{ .nonterminal = pid };
                 },
                 .nonterminal => {
-                    b.sym_pool[b.sym_total] = sym;
-                    b.sym_total += 1;
+                    new_rhs[new_len] = sym;
                 },
             }
+            new_len += 1;
+        }
+        const ss = b.sym_total;
+        for (new_rhs[0..new_len]) |sym| {
+            b.sym_pool[b.sym_total] = sym;
+            b.sym_total += 1;
         }
         b.prods[b.prod_count] = .{
             .lhs = prod.lhs,
@@ -482,14 +491,15 @@ fn result(b: *CnfBuilder) Cfg {
 }
 
 fn expectCnf(comptime source: []const u8, comptime expected: []const u8) !void {
-    const cnf = comptime blk: {
+    // Runs entirely at comptime: `toCnf()` produces a Cfg whose slices
+    // point to comptime-var storage, so formatting must also be
+    // comptime, otherwise we'd try to expose those pointers at runtime.
+    const actual = comptime blk: {
         const cfg = Cfg.parse(source);
-        break :blk cfg.toCnf();
+        const cnf = cfg.toCnf();
+        break :blk std.fmt.comptimePrint("{f}", .{cnf});
     };
-    var buf: [expected.len]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.fmt.format(fbs.writer(), "{}", .{cnf});
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "START: start not on rhs — no change" {
@@ -513,7 +523,7 @@ test "START: start on rhs — fresh S0 added" {
     const cnf = comptime cfg.toCnf();
 
     // S0 added; unit prods resolved; TERM adds proxy.
-    try std.testing.expectEqualStrings("S0", cnf.nonterminalName(cnf.start));
+    comptime try std.testing.expectEqualStrings("S0", cnf.nonterminalName(cnf.start));
     try std.testing.expectEqual(5, cnf.productions.len);
 }
 
@@ -524,8 +534,8 @@ test "START: format with new S0" {
     ,
         \\S0 → A T_x
         \\S → A T_x
-        \\A → "a"
         \\A → A T_x
+        \\A → "a"
         \\T_x → "x"
     );
 }
@@ -618,8 +628,9 @@ test "UNIT: no unit productions — no change" {
     );
     const cnf = comptime cfg.toCnf();
 
-    // UNIT: no change. TERM: S → "a" "b" gets proxies (2 prods + 1 original + "c").
-    try std.testing.expectEqual(5, cnf.productions.len);
+    // UNIT: no change. TERM: S → "a" "b" rewritten + 2 proxies
+    // (T_a → "a", T_b → "b") + single-terminal S → "c" kept as-is = 4.
+    try std.testing.expectEqual(4, cnf.productions.len);
 }
 
 test "TERM: terminal in mixed rhs replaced" {
@@ -641,10 +652,10 @@ test "TERM: same terminal reused — single proxy" {
         \\S -> "x" A "x"
         \\A -> "a"
     ,
-        \\S → T_x B_1
+        \\S → T_x B_0
         \\A → "a"
         \\T_x → "x"
-        \\B_1 → A T_x
+        \\B_0 → A T_x
     );
 }
 
@@ -677,11 +688,11 @@ test "BIN: length-3 rhs splits into binary chain" {
         \\B -> "b"
         \\C -> "c"
     ,
-        \\S → A B_2
+        \\S → A B_0
         \\A → "a"
         \\B → "b"
         \\C → "c"
-        \\B_2 → B C
+        \\B_0 → B C
     );
 }
 
@@ -693,12 +704,12 @@ test "BIN: length-4 rhs creates two fresh nonterminals" {
         \\C -> "c"
         \\D -> "d"
     ,
-        \\S → A B_3
+        \\S → A B_0
         \\A → "a"
         \\B → "b"
         \\C → "c"
         \\D → "d"
-        \\B_3 → B B_4
-        \\B_4 → C D
+        \\B_0 → B B_1
+        \\B_1 → C D
     );
 }

@@ -84,6 +84,26 @@ fn scanBracketExpr(self: *Scanner) void {
         if (self.peek() == '\\') {
             _ = self.advance();
             if (!self.isAtEnd()) _ = self.advance();
+        } else if (self.peek() == '[' and
+            self.current + 1 < self.source.len and
+            self.source[self.current + 1] == ':')
+        {
+            // POSIX character class `[:name:]` — must scan past the
+            // inner `:]` so the outer bracket's `]` still terminates
+            // the overall bracket expression.
+            _ = self.advance(); // [
+            _ = self.advance(); // :
+            while (!self.isAtEnd()) {
+                if (self.peek() == ':' and
+                    self.current + 1 < self.source.len and
+                    self.source[self.current + 1] == ']')
+                {
+                    _ = self.advance(); // :
+                    _ = self.advance(); // ]
+                    break;
+                }
+                _ = self.advance();
+            }
         } else {
             _ = self.advance();
         }

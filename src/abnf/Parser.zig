@@ -114,6 +114,16 @@ fn parseConcatenation(self: *Parser) ParseError!Ast.Node {
     var buf: [256]Ast.Node = undefined;
     var count: usize = 0;
 
+    // ABNF requires at least one repetition per concatenation. Emit a
+    // diagnostic pointing at the offending token (e.g. the `)` in
+    // `foo = (a / )`) instead of silently returning an empty
+    // concatenation, but still let callers like group/option recovery
+    // distinguish "no element at all" by bailing out via SyntaxError.
+    if (!self.isAtRepetition()) {
+        self.fail(.element, self.peek());
+        return error.SyntaxError;
+    }
+
     while (self.isAtRepetition()) {
         buf[count] = try self.parseRepetition();
         count += 1;

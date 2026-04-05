@@ -320,7 +320,7 @@ test "format round-trip" {
 
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try std.fmt.format(fbs.writer(), "{}", .{result.cfg});
+    try std.fmt.format(fbs.writer(), "{f}", .{result.cfg});
     try std.testing.expectEqualStrings(
         \\S → A %x78
         \\A → "hello"

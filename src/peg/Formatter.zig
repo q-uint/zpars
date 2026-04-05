@@ -4,6 +4,7 @@
 /// Comments are preserved from the token stream.
 const std = @import("std");
 const Ast = @import("../Ast.zig");
+const token_mod = @import("../token.zig");
 const Token = @import("Token.zig").Token;
 
 /// Format a complete grammar to the writer, preserving comments from the
@@ -45,7 +46,7 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
 
                         // Skip past the original definition tokens.
                         tok_idx += 1; // skip identifier
-                        tok_idx = Token.skipBodyTokens(tokens, tok_idx, isDefinitionStart);
+                        tok_idx = token_mod.skipBodyTokens(Token, tokens, tok_idx, isDefinitionStart);
 
                         // Emit any trailing comment.
                         if (tok_idx < tokens.len and tokens[tok_idx].tag == .comment) {
@@ -215,7 +216,7 @@ fn writeClassChar(c: u8, writer: anytype) !void {
 
 fn isDefinitionStart(tokens: []const Token, idx: usize) bool {
     if (tokens[idx].tag != .identifier) return false;
-    const after = Token.nextMeaningful(tokens, idx + 1);
+    const after = token_mod.nextMeaningful(Token, tokens, idx + 1);
     return after < tokens.len and tokens[after].tag == .left_arrow;
 }
 

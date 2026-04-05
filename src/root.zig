@@ -22,7 +22,11 @@ pub const peg = struct {
     pub const Token = @import("peg/Token.zig");
 };
 pub const cfg = struct {
-    pub const CnfBuilder = @import("cfg/CnfBuilder.zig");
+    // CnfBuilder is intentionally not re-exported: it is a comptime-only
+    // helper used internally by Cfg.toCnf, and exposing it publicly
+    // causes `refAllDeclsRecursive` (in our root test block) to analyze
+    // its runtime surface, which breaks comptime-only helpers like
+    // `std.fmt.comptimePrint` used inside its build steps.
     pub const Diagnostic = @import("cfg/Diagnostic.zig");
     pub const Parser = @import("cfg/Parser.zig");
     pub const Scanner = @import("cfg/Scanner.zig");
@@ -54,16 +58,13 @@ pub const diagnostic = @import("diagnostic.zig");
 pub const token = @import("token.zig");
 
 test {
-    // Force test compilation for files with tests. Without these
-    // references, zig's test runner only pulls in tests in files
-    // reachable at comptime, which skips all `pub const X = @import(...)`
-    // re-exports above.
-    _ = @import("Matcher.zig");
-    _ = @import("Validator.zig");
-    _ = @import("combinators.zig");
-    _ = @import("vm/Compiler.zig");
-    _ = @import("vm/Disassembler.zig");
-    _ = @import("vm/Jit.zig");
-    _ = @import("vm/Optimizer.zig");
-    _ = @import("vm/Vm.zig");
+    // Recursively reference every public decl in this module so that
+    // tests in files re-exported via `pub const X = @import(...)` are
+    // actually compiled and run. Without this, zig's test runner only
+    // pulls in tests transitively reachable from `_ = @import(...)`
+    // statements, silently skipping many files.
+    @import("std").testing.refAllDeclsRecursive(@This());
+    // CnfBuilder is not exposed in the public API above (see comment on
+    // `cfg` namespace). Pull its tests in explicitly so they still run.
+    _ = @import("cfg/CnfBuilder.zig");
 }

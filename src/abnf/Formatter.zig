@@ -4,6 +4,7 @@
 /// rules in the grammar. Comments are preserved from the token stream.
 const std = @import("std");
 const Ast = @import("../Ast.zig");
+const token_mod = @import("../token.zig");
 const Token = @import("Token.zig").Token;
 
 /// Format a complete grammar to the writer, preserving comments from the
@@ -49,7 +50,7 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
                     // Skip past the original rule tokens to find an
                     // optional trailing comment on the same logical line.
                     tok_idx += 1; // skip rulename
-                    tok_idx = Token.skipBodyTokens(tokens, tok_idx, isRuleStart);
+                    tok_idx = token_mod.skipBodyTokens(Token, tokens, tok_idx, isRuleStart);
 
                     // Emit any trailing comment on this rule's line.
                     if (tok_idx < tokens.len and tokens[tok_idx].tag == .comment) {
@@ -78,7 +79,7 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
 /// `=` or `=/`).
 fn isRuleStart(tokens: []const Token, idx: usize) bool {
     if (tokens[idx].tag != .rulename) return false;
-    const after = Token.nextMeaningful(tokens, idx + 1);
+    const after = token_mod.nextMeaningful(Token, tokens, idx + 1);
     return after < tokens.len and
         (tokens[after].tag == .equals or tokens[after].tag == .equals_slash);
 }

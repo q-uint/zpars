@@ -65,9 +65,16 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     const mod_tests = b.addTest(.{ .root_module = mod });
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
-    test_step.dependOn(&b.addRunArtifact(mod_tests).step);
-    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    // Drive the test binary through a plain `Run` step (spawns it
+    // directly with inherited stdio) instead of the default
+    // `--listen=-` protocol, so per-test output and the final
+    // "All N tests passed." line are always printed without needing
+    // `--summary all` on the command line. src/main.zig currently has
+    // no tests, so it isn't included here.
+    const run_mod_tests = std.Build.Step.Run.create(b, "run mod tests");
+    run_mod_tests.addArtifactArg(mod_tests);
+    run_mod_tests.has_side_effects = true;
+    test_step.dependOn(&run_mod_tests.step);
 
     const lsp_step = b.step("lsp", "Build the LSP server");
     const lsp_exe = b.addExecutable(.{

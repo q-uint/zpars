@@ -306,7 +306,6 @@ test "incremental alternation" {
 test "multiline" {
     try expectTags("a = b\nc = d", &.{
         .rulename, .equals, .rulename, .newline,
-        .rulename, .equals, .rulename, .newline,
-        .eof,
+        .rulename, .equals, .rulename, .eof,
     });
 }
