@@ -9,6 +9,8 @@ pub fn Pool(comptime T: type, comptime capacity: usize) type {
 
         /// Append one item; return a pointer into the pool.
         pub fn addOne(self: *@This(), item: T) *const T {
+            if (self.count >= capacity)
+                @panic("pool exhausted: " ++ @typeName(T));
             self.items[self.count] = item;
             const ptr = &self.items[self.count];
             self.count += 1;
@@ -17,6 +19,8 @@ pub fn Pool(comptime T: type, comptime capacity: usize) type {
 
         /// Append a slice of items; return a sub-slice into the pool.
         pub fn addSlice(self: *@This(), items: []const T) []const T {
+            if (self.count + items.len > capacity)
+                @panic("pool exhausted: " ++ @typeName(T));
             const start = self.count;
             for (items) |item| {
                 self.items[self.count] = item;

@@ -227,7 +227,7 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     stderr.flush() catch {};
 
-    var matcher = zpars.Matcher.init(arena.allocator(), merged);
+    var matcher = try zpars.Matcher.init(arena.allocator(), merged);
     const result = matcher.match(rule_name.?, input.?) orelse {
         std.debug.print("no match\n", .{});
         std.process.exit(1);

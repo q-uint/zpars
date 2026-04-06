@@ -118,7 +118,7 @@ pub fn format(self: Cfg, writer: anytype) !void {
     }
 }
 
-const Scanner = @import("cfg/Scanner.zig");
+const Scanner = @import("cfg/Scanner.zig").Scanner;
 const Parser = @import("cfg/Parser.zig");
 
 /// Parse a CFG from a textual representation at compile time.

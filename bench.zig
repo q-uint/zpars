@@ -518,5 +518,5 @@ fn buildMatcher(allocator: std.mem.Allocator, comptime idx: usize) !Matcher {
     const rules = try parser.parse();
     var validator = Validator.init(allocator, rules);
     const merged = try validator.validate();
-    return Matcher.init(allocator, merged);
+    return try Matcher.init(allocator, merged);
 }

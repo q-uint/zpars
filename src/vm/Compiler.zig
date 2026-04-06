@@ -11,6 +11,7 @@ pub const max_code = 4096;
 const max_charsets = 256;
 const max_patches = 512;
 pub const max_string_data = 4096;
+const max_captures = 64;
 
 code: [max_code]I.Inst = undefined,
 code_len: u32 = 0,
@@ -175,6 +176,8 @@ fn compileNode(self: *Compiler, node: Ast.Node) void {
         },
         .num_val => |nv| self.compileNumVal(nv),
         .rulename => |name| {
+            if (self.patch_len >= max_patches)
+                @panic("compiler patch buffer exhausted");
             self.patches[self.patch_len] = .{
                 .addr = self.code_len,
                 .name = name,
@@ -206,6 +209,8 @@ fn compileNode(self: *Compiler, node: Ast.Node) void {
             self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
         },
         .capture => |inner| {
+            if (self.capture_count >= max_captures / 2)
+                @panic("too many capture groups");
             const slot = self.capture_count * 2;
             self.capture_count += 1;
             self.emit(.{ .op = .save, .data = .{ .slot = slot } });
@@ -320,6 +325,8 @@ fn findOrAddCharset(self: *Compiler, cs: I.Charset) u16 {
             return @intCast(i);
         }
     }
+    if (self.charset_len >= max_charsets)
+        @panic("compiler charset buffer exhausted");
     const idx = self.charset_len;
     self.charsets[idx] = cs;
     self.charset_len += 1;
@@ -327,6 +334,8 @@ fn findOrAddCharset(self: *Compiler, cs: I.Charset) u16 {
 }
 
 fn emit(self: *Compiler, inst: I.Inst) void {
+    if (self.code_len >= max_code)
+        @panic("compiler code buffer exhausted");
     self.code[self.code_len] = inst;
     self.code_len += 1;
 }

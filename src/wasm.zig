@@ -375,7 +375,7 @@ fn matchGeneric(
     const merged = validator.validate() catch return null;
 
     // Match.
-    var matcher = root.Matcher.init(arena.allocator(), merged);
+    var matcher = root.Matcher.init(arena.allocator(), merged) catch return null;
     const result = matcher.match(rule_name, input) orelse {
         // No match — return single byte 0.
         const buf = allocator.alloc(u8, 1) catch return null;

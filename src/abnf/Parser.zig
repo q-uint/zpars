@@ -12,6 +12,7 @@ const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .commen
     .def_tags = &.{ .equals, .equals_slash },
 });
 pub const peek = primitives.peek;
+const peekAt = primitives.peekAt;
 const advance = primitives.advance;
 pub const skipTrivia = primitives.skipTrivia;
 pub const peekNextMeaningful = primitives.peekNextMeaningful;
@@ -277,12 +278,6 @@ fn parseNumber(self: *Parser) !usize {
     return std.fmt.parseInt(usize, self.advance().lexeme(self.source), 10);
 }
 
-fn peekAt(self: *Parser, offset: usize) Token {
-    const idx = self.pos + offset;
-    if (idx >= self.tokens.len) return .{ .tag = .eof, .start = 0, .len = 0, .line = 0 };
-    return self.tokens[idx];
-}
-
 /// Can the current position start a repetition/element?
 fn isAtRepetition(self: *Parser) bool {
     return switch (self.peek().tag) {
@@ -307,7 +302,7 @@ fn isAtRepetition(self: *Parser) bool {
     };
 }
 
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 
 fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);

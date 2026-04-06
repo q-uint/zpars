@@ -1,4 +1,4 @@
-/// PEG scanner — tokenizes Parsing Expression Grammars.
+/// PEG scanner -- tokenizes Parsing Expression Grammars.
 ///
 /// Based on Bryan Ford's "Parsing Expression Grammars: A Recognition-Based
 /// Syntactic Foundation" (2004). Handles identifiers, the `<-` operator,
@@ -8,198 +8,208 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const char_flags = @import("../char_flags.zig");
 
-const Scanner = @This();
-
-pub const max_tokens = 4096;
-
-source: []const u8,
-tokens: [max_tokens]Token = undefined,
-token_count: usize = 0,
-start: usize = 0,
-current: usize = 0,
-line: usize = 1,
-
-pub fn init(source: []const u8) Scanner {
-    return .{ .source = source };
-}
-
-pub fn scanTokens(self: *Scanner) []const Token {
-    while (!self.isAtEnd()) {
-        self.start = self.current;
-        self.scanToken();
-    }
-
-    self.addToken(.eof);
-    return self.tokens[0..self.token_count];
-}
-
-const Action = union(enum) {
-    single: Token.Tag,
-    skip,
-    handler: *const fn (*Scanner) void,
-    invalid,
+pub const Config = struct {
+    max_tokens: usize = 4096,
 };
 
-const dispatch_table: [256]Action = blk: {
-    var t: [256]Action = @splat(.invalid);
+pub const Scanner = ScannerWith(.{});
 
-    t['/'] = .{ .single = .slash };
-    t['&'] = .{ .single = .@"and" };
-    t['!'] = .{ .single = .not };
-    t['?'] = .{ .single = .question };
-    t['*'] = .{ .single = .star };
-    t['+'] = .{ .single = .plus };
-    t['('] = .{ .single = .left_paren };
-    t[')'] = .{ .single = .right_paren };
-    t['.'] = .{ .single = .dot };
+pub fn ScannerWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-    t[' '] = .skip;
-    t['\t'] = .skip;
+        source: []const u8,
+        tokens: [config.max_tokens]Token = undefined,
+        token_count: usize = 0,
+        start: usize = 0,
+        current: usize = 0,
+        line: usize = 1,
 
-    t['<'] = .{ .handler = scanLeftArrow };
-    t['\''] = .{ .handler = scanSingleQuote };
-    t['"'] = .{ .handler = scanDoubleQuote };
-    t['['] = .{ .handler = scanCharClass };
-    t['#'] = .{ .handler = scanComment };
-    t['\r'] = .{ .handler = scanNewlineCR };
-    t['\n'] = .{ .handler = scanNewlineLF };
-
-    for ('A'..('Z' + 1)) |c| t[c] = .{ .handler = scanIdentifier };
-    for ('a'..('z' + 1)) |c| t[c] = .{ .handler = scanIdentifier };
-    t['_'] = .{ .handler = scanIdentifier };
-
-    break :blk t;
-};
-
-fn scanToken(self: *Scanner) void {
-    const c = self.advance();
-    switch (dispatch_table[c]) {
-        .single => |tag| self.addToken(tag),
-        .skip => {},
-        .handler => |func| func(self),
-        .invalid => self.addToken(.invalid),
-    }
-}
-
-fn scanLeftArrow(self: *Scanner) void {
-    if (!self.isAtEnd() and self.peek() == '-') {
-        _ = self.advance();
-        self.addToken(.left_arrow);
-    } else {
-        self.addToken(.invalid);
-    }
-}
-
-fn scanSingleQuote(self: *Scanner) void {
-    self.scanLiteral('\'');
-}
-
-fn scanDoubleQuote(self: *Scanner) void {
-    self.scanLiteral('"');
-}
-
-fn scanLiteral(self: *Scanner, quote: u8) void {
-    if (!self.isAtEnd() and self.peek() == quote) {
-        _ = self.advance();
-        self.addToken(.invalid);
-        return;
-    }
-    while (!self.isAtEnd() and self.peek() != quote) {
-        if (self.peek() == '\n' or self.peek() == '\r') {
-            self.addToken(.invalid);
-            return;
+        pub fn init(source: []const u8) Self {
+            return .{ .source = source };
         }
-        if (self.peek() == '\\') {
-            _ = self.advance();
-            if (!self.isAtEnd()) _ = self.advance();
-        } else {
-            _ = self.advance();
+
+        pub fn scanTokens(self: *Self) []const Token {
+            while (!self.isAtEnd()) {
+                self.start = self.current;
+                self.scanToken();
+            }
+
+            self.addToken(.eof);
+            return self.tokens[0..self.token_count];
         }
-    }
-    if (self.isAtEnd()) {
-        self.addToken(.invalid);
-    } else {
-        _ = self.advance();
-        self.addToken(.literal);
-    }
-}
 
-fn scanCharClass(self: *Scanner) void {
-    while (!self.isAtEnd() and self.peek() != ']') {
-        if (self.peek() == '\n' or self.peek() == '\r') {
-            self.addToken(.invalid);
-            return;
+        const Action = union(enum) {
+            single: Token.Tag,
+            skip,
+            handler: *const fn (*Self) void,
+            invalid,
+        };
+
+        const dispatch_table: [256]Action = blk: {
+            var t: [256]Action = @splat(.invalid);
+
+            t['/'] = .{ .single = .slash };
+            t['&'] = .{ .single = .@"and" };
+            t['!'] = .{ .single = .not };
+            t['?'] = .{ .single = .question };
+            t['*'] = .{ .single = .star };
+            t['+'] = .{ .single = .plus };
+            t['('] = .{ .single = .left_paren };
+            t[')'] = .{ .single = .right_paren };
+            t['.'] = .{ .single = .dot };
+
+            t[' '] = .skip;
+            t['\t'] = .skip;
+
+            t['<'] = .{ .handler = scanLeftArrow };
+            t['\''] = .{ .handler = scanSingleQuote };
+            t['"'] = .{ .handler = scanDoubleQuote };
+            t['['] = .{ .handler = scanCharClass };
+            t['#'] = .{ .handler = scanComment };
+            t['\r'] = .{ .handler = scanNewlineCR };
+            t['\n'] = .{ .handler = scanNewlineLF };
+
+            for ('A'..('Z' + 1)) |c| t[c] = .{ .handler = scanIdentifier };
+            for ('a'..('z' + 1)) |c| t[c] = .{ .handler = scanIdentifier };
+            t['_'] = .{ .handler = scanIdentifier };
+
+            break :blk t;
+        };
+
+        fn scanToken(self: *Self) void {
+            const c = self.advance();
+            switch (dispatch_table[c]) {
+                .single => |tag| self.addToken(tag),
+                .skip => {},
+                .handler => |func| func(self),
+                .invalid => self.addToken(.invalid),
+            }
         }
-        if (self.peek() == '\\') {
-            _ = self.advance();
-            if (!self.isAtEnd()) _ = self.advance();
-        } else {
-            _ = self.advance();
+
+        fn scanLeftArrow(self: *Self) void {
+            if (!self.isAtEnd() and self.peek() == '-') {
+                _ = self.advance();
+                self.addToken(.left_arrow);
+            } else {
+                self.addToken(.invalid);
+            }
         }
-    }
-    if (self.isAtEnd()) {
-        self.addToken(.invalid);
-    } else {
-        _ = self.advance();
-        self.addToken(.char_class);
-    }
-}
 
-fn scanComment(self: *Scanner) void {
-    while (!self.isAtEnd() and self.peek() != '\n' and self.peek() != '\r') {
-        _ = self.advance();
-    }
-    self.addToken(.comment);
-}
+        fn scanSingleQuote(self: *Self) void {
+            self.scanLiteral('\'');
+        }
 
-fn scanIdentifier(self: *Scanner) void {
-    while (!self.isAtEnd() and char_flags.isIdentCont(self.peek())) {
-        _ = self.advance();
-    }
-    self.addToken(.identifier);
-}
+        fn scanDoubleQuote(self: *Self) void {
+            self.scanLiteral('"');
+        }
 
-fn scanNewlineCR(self: *Scanner) void {
-    _ = self.match('\n');
-    self.line += 1;
-    self.addToken(.newline);
-}
+        fn scanLiteral(self: *Self, quote: u8) void {
+            if (!self.isAtEnd() and self.peek() == quote) {
+                _ = self.advance();
+                self.addToken(.invalid);
+                return;
+            }
+            while (!self.isAtEnd() and self.peek() != quote) {
+                if (self.peek() == '\n' or self.peek() == '\r') {
+                    self.addToken(.invalid);
+                    return;
+                }
+                if (self.peek() == '\\') {
+                    _ = self.advance();
+                    if (!self.isAtEnd()) _ = self.advance();
+                } else {
+                    _ = self.advance();
+                }
+            }
+            if (self.isAtEnd()) {
+                self.addToken(.invalid);
+            } else {
+                _ = self.advance();
+                self.addToken(.literal);
+            }
+        }
 
-fn scanNewlineLF(self: *Scanner) void {
-    self.line += 1;
-    self.addToken(.newline);
-}
+        fn scanCharClass(self: *Self) void {
+            while (!self.isAtEnd() and self.peek() != ']') {
+                if (self.peek() == '\n' or self.peek() == '\r') {
+                    self.addToken(.invalid);
+                    return;
+                }
+                if (self.peek() == '\\') {
+                    _ = self.advance();
+                    if (!self.isAtEnd()) _ = self.advance();
+                } else {
+                    _ = self.advance();
+                }
+            }
+            if (self.isAtEnd()) {
+                self.addToken(.invalid);
+            } else {
+                _ = self.advance();
+                self.addToken(.char_class);
+            }
+        }
 
-fn advance(self: *Scanner) u8 {
-    const c = self.source[self.current];
-    self.current += 1;
-    return c;
-}
+        fn scanComment(self: *Self) void {
+            while (!self.isAtEnd() and self.peek() != '\n' and self.peek() != '\r') {
+                _ = self.advance();
+            }
+            self.addToken(.comment);
+        }
 
-fn peek(self: *Scanner) u8 {
-    if (self.isAtEnd()) return 0;
-    return self.source[self.current];
-}
+        fn scanIdentifier(self: *Self) void {
+            while (!self.isAtEnd() and char_flags.isIdentCont(self.peek())) {
+                _ = self.advance();
+            }
+            self.addToken(.identifier);
+        }
 
-fn match(self: *Scanner, expected: u8) bool {
-    if (self.isAtEnd()) return false;
-    if (self.source[self.current] != expected) return false;
-    self.current += 1;
-    return true;
-}
+        fn scanNewlineCR(self: *Self) void {
+            _ = self.match('\n');
+            self.line += 1;
+            self.addToken(.newline);
+        }
 
-fn isAtEnd(self: *Scanner) bool {
-    return self.current >= self.source.len;
-}
+        fn scanNewlineLF(self: *Self) void {
+            self.line += 1;
+            self.addToken(.newline);
+        }
 
-fn addToken(self: *Scanner, tag: Token.Tag) void {
-    self.tokens[self.token_count] = .{
-        .tag = tag,
-        .start = self.start,
-        .len = self.current - self.start,
-        .line = self.line,
+        fn advance(self: *Self) u8 {
+            const c = self.source[self.current];
+            self.current += 1;
+            return c;
+        }
+
+        fn peek(self: *Self) u8 {
+            if (self.isAtEnd()) return 0;
+            return self.source[self.current];
+        }
+
+        fn match(self: *Self, expected: u8) bool {
+            if (self.isAtEnd()) return false;
+            if (self.source[self.current] != expected) return false;
+            self.current += 1;
+            return true;
+        }
+
+        fn isAtEnd(self: *Self) bool {
+            return self.current >= self.source.len;
+        }
+
+        fn addToken(self: *Self, tag: Token.Tag) void {
+            if (self.token_count >= config.max_tokens)
+                @panic("scanner token buffer exhausted");
+            self.tokens[self.token_count] = .{
+                .tag = tag,
+                .start = self.start,
+                .len = self.current - self.start,
+                .line = self.line,
+            };
+            self.token_count += 1;
+        }
     };
-    self.token_count += 1;
 }
 
 fn expectTags(source: []const u8, expected: []const Token.Tag) !void {

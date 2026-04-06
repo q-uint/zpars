@@ -48,9 +48,15 @@ fn fuseConsecutiveChars(c: *Compiler) void {
         const run_len = run_end - i;
 
         if (run_len >= 2) {
-            // Copy bytes into string_data buffer.
+            // Copy bytes into string_data buffer. Clamp to both the
+            // u8 StringRef.len limit and the remaining buffer space.
             const str_offset = c.string_data_len;
-            const len: u8 = @intCast(@min(run_len, 255));
+            const avail = Compiler.max_string_data - c.string_data_len;
+            const len: u8 = @intCast(@min(run_len, @min(255, avail)));
+            if (len < 2) {
+                i = run_end;
+                continue;
+            }
             for (0..len) |j| {
                 c.string_data[c.string_data_len] = code[i + @as(u32, @intCast(j))].data.byte;
                 c.string_data_len += 1;
@@ -327,7 +333,7 @@ fn charsetSingleByte(cs: I.Charset) u8 {
 }
 
 const testing = @import("std").testing;
-const EreScanner = @import("../ere/Scanner.zig");
+const EreScanner = @import("../ere/Scanner.zig").Scanner;
 const EreParser = @import("../ere/Parser.zig");
 
 fn compileEre(source: []const u8) Compiler {

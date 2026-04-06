@@ -232,6 +232,7 @@ pub fn execute(self: *Vm) !?usize {
                 pc += 1;
             },
             .choice => {
+                if (sp >= max_stack) return null;
                 stack[sp] = .{ .choice = .{ .pos = pos, .pc = inst.data.offset } };
                 sp += 1;
                 pc += 1;
@@ -255,6 +256,7 @@ pub fn execute(self: *Vm) !?usize {
                 pc = inst.data.offset;
             },
             .call => {
+                if (sp >= max_stack) return null;
                 stack[sp] = .{ .ret = pc + 1 };
                 sp += 1;
                 pc = inst.data.offset;
@@ -262,6 +264,7 @@ pub fn execute(self: *Vm) !?usize {
             .memo_call => {
                 const mc = inst.data.memo;
                 if (self.memo_table.len == 0) {
+                    if (sp >= max_stack) return null;
                     stack[sp] = .{ .ret = pc + 1 };
                     sp += 1;
                     pc = mc.offset;
@@ -287,6 +290,7 @@ pub fn execute(self: *Vm) !?usize {
                         }
                         if (h.eval.isSet(mc.rule_id)) {
                             h.eval.unset(mc.rule_id);
+                            if (sp >= max_stack) return null;
                             stack[sp] = .{ .memo = .{
                                 .rule_id = mc.rule_id,
                                 .is_recall = true,
@@ -331,6 +335,7 @@ pub fn execute(self: *Vm) !?usize {
                             }
                         },
                         .empty => {
+                            if (sp >= max_stack) return null;
                             self.memo_table[idx] = .{
                                 .state = .lr,
                                 .next_pos_or_frame = @intCast(sp),
@@ -386,6 +391,7 @@ pub fn execute(self: *Vm) !?usize {
                                     self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = cur_end };
                                     self.heads[m.start_pos] = m.head_idx;
                                     try self.resetEvalSet(m.head_idx);
+                                    if (sp >= max_stack) return null;
                                     var frame = m;
                                     frame.best_end = cur_end;
                                     stack[sp] = .{ .memo = frame };
@@ -418,6 +424,7 @@ pub fn execute(self: *Vm) !?usize {
                             if (new_best > m.best_end) {
                                 self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = new_best };
                                 try self.resetEvalSet(m.head_idx);
+                                if (sp >= max_stack) return null;
                                 var frame = m;
                                 frame.best_end = new_best;
                                 stack[sp] = .{ .memo = frame };
@@ -436,6 +443,7 @@ pub fn execute(self: *Vm) !?usize {
                 }
             },
             .save => {
+                if (sp >= max_stack) return null;
                 const slot = inst.data.slot;
                 stack[sp] = .{ .save = .{ .slot = slot, .old = self.captures[slot] } };
                 sp += 1;
@@ -626,9 +634,9 @@ fn traceStep(self: *Vm, pc: u32, pos: usize, sp: usize, inst: I.Inst) void {
 
 const testing = std.testing;
 const Compiler = @import("Compiler.zig");
-const EreScanner = @import("../ere/Scanner.zig");
+const EreScanner = @import("../ere/Scanner.zig").Scanner;
 const EreParser = @import("../ere/Parser.zig");
-const PegScanner = @import("../peg/Scanner.zig");
+const PegScanner = @import("../peg/Scanner.zig").Scanner;
 const PegParser = @import("../peg/Parser.zig");
 
 fn compileEre(source: []const u8) Compiler {

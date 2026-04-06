@@ -97,7 +97,7 @@ fn printByte(writer: anytype, b: u8) !void {
 
 const testing = std.testing;
 const Compiler = @import("Compiler.zig");
-const EreScanner = @import("../ere/Scanner.zig");
+const EreScanner = @import("../ere/Scanner.zig").Scanner;
 const EreParser = @import("../ere/Parser.zig");
 
 test "disassemble literal" {

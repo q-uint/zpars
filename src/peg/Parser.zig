@@ -402,7 +402,7 @@ fn isAtPrimary(self: *Parser) bool {
     };
 }
 
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 
 fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);

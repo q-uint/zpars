@@ -220,7 +220,7 @@ fn isDefinitionStart(tokens: []const Token, idx: usize) bool {
     return after < tokens.len and tokens[after].tag == .left_arrow;
 }
 
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 const PegParser = @import("Parser.zig");
 
 fn expectFmt(expected: []const u8, input: []const u8) !void {

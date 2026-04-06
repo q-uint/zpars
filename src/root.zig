@@ -4,7 +4,10 @@ pub const abnf = struct {
     pub const Diagnostic = @import("abnf/Diagnostic.zig");
     pub const Formatter = @import("abnf/Formatter.zig");
     pub const Parser = @import("abnf/Parser.zig");
-    pub const Scanner = @import("abnf/Scanner.zig");
+    const scanner_mod = @import("abnf/Scanner.zig");
+    pub const Scanner = scanner_mod.Scanner;
+    pub const ScannerWith = scanner_mod.ScannerWith;
+    pub const ScannerConfig = scanner_mod.Config;
     pub const Tokenizer = @import("abnf/Tokenizer.zig");
     pub const Token = @import("abnf/Token.zig");
 };
@@ -18,7 +21,10 @@ pub const peg = struct {
     pub const Diagnostic = @import("peg/Diagnostic.zig");
     pub const Formatter = @import("peg/Formatter.zig");
     pub const Parser = @import("peg/Parser.zig");
-    pub const Scanner = @import("peg/Scanner.zig");
+    const scanner_mod = @import("peg/Scanner.zig");
+    pub const Scanner = scanner_mod.Scanner;
+    pub const ScannerWith = scanner_mod.ScannerWith;
+    pub const ScannerConfig = scanner_mod.Config;
     pub const Token = @import("peg/Token.zig");
 };
 pub const cfg = struct {
@@ -29,14 +35,20 @@ pub const cfg = struct {
     // `std.fmt.comptimePrint` used inside its build steps.
     pub const Diagnostic = @import("cfg/Diagnostic.zig");
     pub const Parser = @import("cfg/Parser.zig");
-    pub const Scanner = @import("cfg/Scanner.zig");
+    const scanner_mod = @import("cfg/Scanner.zig");
+    pub const Scanner = scanner_mod.Scanner;
+    pub const ScannerWith = scanner_mod.ScannerWith;
+    pub const ScannerConfig = scanner_mod.Config;
     pub const Token = @import("cfg/Token.zig");
 };
 pub const ere = struct {
     pub const Diagnostic = @import("ere/Diagnostic.zig");
     pub const Formatter = @import("ere/Formatter.zig");
     pub const Parser = @import("ere/Parser.zig");
-    pub const Scanner = @import("ere/Scanner.zig");
+    const scanner_mod = @import("ere/Scanner.zig");
+    pub const Scanner = scanner_mod.Scanner;
+    pub const ScannerWith = scanner_mod.ScannerWith;
+    pub const ScannerConfig = scanner_mod.Config;
     pub const Token = @import("ere/Token.zig");
 };
 pub const sexp = @import("sexp.zig");

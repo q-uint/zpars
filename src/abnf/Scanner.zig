@@ -2,238 +2,238 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const char_flags = @import("../char_flags.zig");
 
-const Scanner = @This();
-
-pub const max_tokens = 4096;
-
-/// The full source text being scanned.
-source: []const u8,
-/// Collected tokens (bounded).
-tokens: [max_tokens]Token = undefined,
-/// Number of tokens collected so far.
-token_count: usize = 0,
-/// Start of the current lexeme being scanned.
-start: usize = 0,
-/// Current position in source (next character to read).
-current: usize = 0,
-/// Current line number (1-based).
-line: usize = 1,
-
-pub fn init(source: []const u8) Scanner {
-    return .{ .source = source };
-}
-
-/// Scan the entire source and return the token list.
-pub fn scanTokens(self: *Scanner) []const Token {
-    while (!self.isAtEnd()) {
-        self.start = self.current;
-        self.scanToken();
-    }
-
-    self.addToken(.eof);
-
-    return self.tokens[0..self.token_count];
-}
-
-const Action = union(enum) {
-    single: Token.Tag,
-    skip,
-    handler: *const fn (*Scanner) void,
-    invalid,
+pub const Config = struct {
+    max_tokens: usize = 4096,
 };
 
-const dispatch_table: [256]Action = blk: {
-    var t: [256]Action = @splat(.invalid);
+pub const Scanner = ScannerWith(.{});
 
-    t['('] = .{ .single = .left_paren };
-    t[')'] = .{ .single = .right_paren };
-    t['['] = .{ .single = .left_bracket };
-    t[']'] = .{ .single = .right_bracket };
-    t['*'] = .{ .single = .star };
-    t['/'] = .{ .single = .slash };
+pub fn ScannerWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-    t[' '] = .skip;
-    t['\t'] = .skip;
+        source: []const u8,
+        tokens: [config.max_tokens]Token = undefined,
+        token_count: usize = 0,
+        start: usize = 0,
+        current: usize = 0,
+        line: usize = 1,
 
-    t['='] = .{ .handler = scanEquals };
-    t['"'] = .{ .handler = scanString };
-    t['<'] = .{ .handler = scanProse };
-    t['%'] = .{ .handler = scanPercent };
-    t[';'] = .{ .handler = scanLineComment };
-    t['\r'] = .{ .handler = scanNewlineCR };
-    t['\n'] = .{ .handler = scanNewlineLF };
-
-    for ('A'..('Z' + 1)) |c| t[c] = .{ .handler = scanRulename };
-    for ('a'..('z' + 1)) |c| t[c] = .{ .handler = scanRulename };
-    for ('0'..('9' + 1)) |c| t[c] = .{ .handler = scanNumber };
-
-    break :blk t;
-};
-
-fn scanToken(self: *Scanner) void {
-    const c = self.advance();
-    switch (dispatch_table[c]) {
-        .single => |tag| self.addToken(tag),
-        .skip => {},
-        .handler => |func| func(self),
-        .invalid => self.addToken(.invalid),
-    }
-}
-
-fn scanEquals(self: *Scanner) void {
-    self.addToken(if (self.match('/')) .equals_slash else .equals);
-}
-
-fn scanString(self: *Scanner) void {
-    if (self.peek() == '"') {
-        _ = self.advance();
-        self.addToken(.invalid);
-    } else {
-        while (self.peek() != '"' and !self.isAtEnd()) {
-            if (self.peek() == '\n') self.line += 1;
-            _ = self.advance();
+        pub fn init(source: []const u8) Self {
+            return .{ .source = source };
         }
-        if (self.isAtEnd()) {
-            self.addToken(.invalid);
-        } else {
-            _ = self.advance();
-            self.addToken(.char_val);
+
+        pub fn scanTokens(self: *Self) []const Token {
+            while (!self.isAtEnd()) {
+                self.start = self.current;
+                self.scanToken();
+            }
+            self.addToken(.eof);
+            return self.tokens[0..self.token_count];
         }
-    }
-}
 
-fn scanProse(self: *Scanner) void {
-    while (self.peek() != '>' and !self.isAtEnd()) {
-        _ = self.advance();
-    }
-    if (self.isAtEnd()) {
-        self.addToken(.invalid);
-    } else {
-        _ = self.advance();
-        self.addToken(.prose_val);
-    }
-}
+        const Action = union(enum) {
+            single: Token.Tag,
+            skip,
+            handler: *const fn (*Self) void,
+            invalid,
+        };
 
-fn scanPercent(self: *Scanner) void {
-    const base = self.peek();
-    switch (base) {
-        'b' => {
-            _ = self.advance();
-            self.consumeDigits(char_flags.isBit);
-            self.addToken(.bin_val);
-        },
-        'd' => {
-            _ = self.advance();
-            self.consumeDigits(char_flags.isDigit);
-            self.addToken(.dec_val);
-        },
-        'x' => {
-            _ = self.advance();
-            self.consumeDigits(char_flags.isHexDigit);
-            self.addToken(.hex_val);
-        },
-        's', 'i' => {
-            _ = self.advance();
-            if (self.peek() != '"') {
+        const dispatch_table: [256]Action = blk: {
+            var t: [256]Action = @splat(.invalid);
+
+            t['('] = .{ .single = .left_paren };
+            t[')'] = .{ .single = .right_paren };
+            t['['] = .{ .single = .left_bracket };
+            t[']'] = .{ .single = .right_bracket };
+            t['*'] = .{ .single = .star };
+            t['/'] = .{ .single = .slash };
+
+            t[' '] = .skip;
+            t['\t'] = .skip;
+
+            t['='] = .{ .handler = scanEquals };
+            t['"'] = .{ .handler = scanString };
+            t['<'] = .{ .handler = scanProse };
+            t['%'] = .{ .handler = scanPercent };
+            t[';'] = .{ .handler = scanLineComment };
+            t['\r'] = .{ .handler = scanNewlineCR };
+            t['\n'] = .{ .handler = scanNewlineLF };
+
+            for ('A'..('Z' + 1)) |c| t[c] = .{ .handler = scanRulename };
+            for ('a'..('z' + 1)) |c| t[c] = .{ .handler = scanRulename };
+            for ('0'..('9' + 1)) |c| t[c] = .{ .handler = scanNumber };
+
+            break :blk t;
+        };
+
+        fn scanToken(self: *Self) void {
+            const c = self.advance();
+            switch (dispatch_table[c]) {
+                .single => |tag| self.addToken(tag),
+                .skip => {},
+                .handler => |func| func(self),
+                .invalid => self.addToken(.invalid),
+            }
+        }
+
+        fn scanEquals(self: *Self) void {
+            self.addToken(if (self.match('/')) .equals_slash else .equals);
+        }
+
+        fn scanString(self: *Self) void {
+            if (self.peek() == '"') {
+                _ = self.advance();
+                self.addToken(.invalid);
+            } else {
+                while (self.peek() != '"' and !self.isAtEnd()) {
+                    if (self.peek() == '\n') self.line += 1;
+                    _ = self.advance();
+                }
+                if (self.isAtEnd()) {
+                    self.addToken(.invalid);
+                } else {
+                    _ = self.advance();
+                    self.addToken(.char_val);
+                }
+            }
+        }
+
+        fn scanProse(self: *Self) void {
+            while (self.peek() != '>' and !self.isAtEnd()) {
+                _ = self.advance();
+            }
+            if (self.isAtEnd()) {
                 self.addToken(.invalid);
             } else {
                 _ = self.advance();
-                if (self.peek() == '"') {
+                self.addToken(.prose_val);
+            }
+        }
+
+        fn scanPercent(self: *Self) void {
+            const base = self.peek();
+            switch (base) {
+                'b' => {
                     _ = self.advance();
-                    self.addToken(.invalid);
-                } else {
-                    while (self.peek() != '"' and !self.isAtEnd()) {
-                        if (self.peek() == '\n') self.line += 1;
-                        _ = self.advance();
-                    }
-                    if (self.isAtEnd()) {
+                    self.consumeDigits(char_flags.isBit);
+                    self.addToken(.bin_val);
+                },
+                'd' => {
+                    _ = self.advance();
+                    self.consumeDigits(char_flags.isDigit);
+                    self.addToken(.dec_val);
+                },
+                'x' => {
+                    _ = self.advance();
+                    self.consumeDigits(char_flags.isHexDigit);
+                    self.addToken(.hex_val);
+                },
+                's', 'i' => {
+                    _ = self.advance();
+                    if (self.peek() != '"') {
                         self.addToken(.invalid);
                     } else {
                         _ = self.advance();
-                        self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
+                        if (self.peek() == '"') {
+                            _ = self.advance();
+                            self.addToken(.invalid);
+                        } else {
+                            while (self.peek() != '"' and !self.isAtEnd()) {
+                                if (self.peek() == '\n') self.line += 1;
+                                _ = self.advance();
+                            }
+                            if (self.isAtEnd()) {
+                                self.addToken(.invalid);
+                            } else {
+                                _ = self.advance();
+                                self.addToken(if (base == 's') .char_val_cs else .char_val_ci);
+                            }
+                        }
                     }
-                }
+                },
+                else => self.addToken(.invalid),
             }
-        },
-        else => self.addToken(.invalid),
-    }
-}
-
-fn scanLineComment(self: *Scanner) void {
-    while (self.peek() != '\n' and self.peek() != '\r' and !self.isAtEnd()) {
-        _ = self.advance();
-    }
-    self.addToken(.comment);
-}
-
-fn scanNewlineCR(self: *Scanner) void {
-    _ = self.match('\n');
-    self.line += 1;
-    self.addToken(.newline);
-}
-
-fn scanNewlineLF(self: *Scanner) void {
-    self.line += 1;
-    self.addToken(.newline);
-}
-
-fn scanRulename(self: *Scanner) void {
-    while (char_flags.isAlpha(self.peek()) or char_flags.isDigit(self.peek()) or self.peek() == '-') {
-        _ = self.advance();
-    }
-    self.addToken(.rulename);
-}
-
-fn scanNumber(self: *Scanner) void {
-    while (char_flags.isDigit(self.peek())) _ = self.advance();
-    self.addToken(.number);
-}
-
-fn advance(self: *Scanner) u8 {
-    const c = self.source[self.current];
-    self.current += 1;
-    return c;
-}
-
-fn peek(self: *Scanner) u8 {
-    if (self.isAtEnd()) return 0;
-    return self.source[self.current];
-}
-
-fn match(self: *Scanner, expected: u8) bool {
-    if (self.isAtEnd()) return false;
-    if (self.source[self.current] != expected) return false;
-    self.current += 1;
-    return true;
-}
-
-/// Consume digits for a numeric value, including "." and "-" continuations.
-fn consumeDigits(self: *Scanner, isValidDigit: *const fn (u8) bool) void {
-    while (isValidDigit(self.peek())) _ = self.advance();
-
-    if (self.peek() == '.') {
-        while (self.peek() == '.') {
-            _ = self.advance();
-            while (isValidDigit(self.peek())) _ = self.advance();
         }
-    } else if (self.peek() == '-') {
-        _ = self.advance();
-        while (isValidDigit(self.peek())) _ = self.advance();
-    }
-}
 
-fn isAtEnd(self: *Scanner) bool {
-    return self.current >= self.source.len;
-}
+        fn scanLineComment(self: *Self) void {
+            while (self.peek() != '\n' and self.peek() != '\r' and !self.isAtEnd()) {
+                _ = self.advance();
+            }
+            self.addToken(.comment);
+        }
 
-fn addToken(self: *Scanner, tag: Token.Tag) void {
-    self.tokens[self.token_count] = .{
-        .tag = tag,
-        .start = self.start,
-        .len = self.current - self.start,
-        .line = self.line,
+        fn scanNewlineCR(self: *Self) void {
+            _ = self.match('\n');
+            self.line += 1;
+            self.addToken(.newline);
+        }
+
+        fn scanNewlineLF(self: *Self) void {
+            self.line += 1;
+            self.addToken(.newline);
+        }
+
+        fn scanRulename(self: *Self) void {
+            while (char_flags.isAlpha(self.peek()) or char_flags.isDigit(self.peek()) or self.peek() == '-') {
+                _ = self.advance();
+            }
+            self.addToken(.rulename);
+        }
+
+        fn scanNumber(self: *Self) void {
+            while (char_flags.isDigit(self.peek())) _ = self.advance();
+            self.addToken(.number);
+        }
+
+        fn advance(self: *Self) u8 {
+            const c = self.source[self.current];
+            self.current += 1;
+            return c;
+        }
+
+        fn peek(self: *Self) u8 {
+            if (self.isAtEnd()) return 0;
+            return self.source[self.current];
+        }
+
+        fn match(self: *Self, expected: u8) bool {
+            if (self.isAtEnd()) return false;
+            if (self.source[self.current] != expected) return false;
+            self.current += 1;
+            return true;
+        }
+
+        fn consumeDigits(self: *Self, isValidDigit: *const fn (u8) bool) void {
+            while (isValidDigit(self.peek())) _ = self.advance();
+
+            if (self.peek() == '.') {
+                while (self.peek() == '.') {
+                    _ = self.advance();
+                    while (isValidDigit(self.peek())) _ = self.advance();
+                }
+            } else if (self.peek() == '-') {
+                _ = self.advance();
+                while (isValidDigit(self.peek())) _ = self.advance();
+            }
+        }
+
+        fn isAtEnd(self: *Self) bool {
+            return self.current >= self.source.len;
+        }
+
+        fn addToken(self: *Self, tag: Token.Tag) void {
+            if (self.token_count >= config.max_tokens)
+                @panic("scanner token buffer exhausted");
+            self.tokens[self.token_count] = .{
+                .tag = tag,
+                .start = self.start,
+                .len = self.current - self.start,
+                .line = self.line,
+            };
+            self.token_count += 1;
+        }
     };
-    self.token_count += 1;
 }
 
 fn expectTags(source: []const u8, expected: []const Token.Tag) !void {

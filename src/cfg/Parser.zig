@@ -224,7 +224,7 @@ fn parseHex(s: []const u8) u8 {
     return @intCast(result & 0xFF);
 }
 
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 
 fn parseSource(source: []const u8) ParseError!struct { parser: Parser, cfg: Cfg } {
     var scanner = Scanner.init(source);

@@ -14,9 +14,18 @@ const std = @import("std");
 const Token = @import("Token.zig").Token;
 const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
+const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
 
 const Parser = @This();
+
+const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{}, .{
+    .name_tag = .eof,
+    .def_tags = &.{},
+});
+const peek = primitives.peek;
+const advance = primitives.advance;
+const fail = primitives.fail;
 
 pub const ParseError = error{ SyntaxError, Overflow };
 
@@ -327,27 +336,7 @@ fn isAtAtom(self: *Parser) bool {
     };
 }
 
-fn peek(self: *Parser) Token {
-    return self.tokens[self.pos];
-}
-
-fn advance(self: *Parser) Token {
-    const tok = self.tokens[self.pos];
-    self.pos += 1;
-    return tok;
-}
-
-fn fail(self: *Parser, expected: Diagnostic.Expected, tok: Token) void {
-    _ = self.diagnostics.addOne(.{
-        .expected = expected,
-        .found_tag = tok.tag,
-        .found_start = tok.start,
-        .found_len = tok.len,
-        .line = tok.line,
-    });
-}
-
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 
 fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);

@@ -208,7 +208,7 @@ fn writeHex(writer: anytype, byte: u8) !void {
     try writer.writeByte(hex_digits[byte & 0x0F]);
 }
 
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 const Parser = @import("Parser.zig");
 
 fn expectFmt(expected: []const u8, input: []const u8) !void {

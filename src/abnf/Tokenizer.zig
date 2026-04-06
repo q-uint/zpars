@@ -14,7 +14,7 @@
 ///     const tokens = scanner.scanTokens();
 const std = @import("std");
 const Ast = @import("../Ast.zig");
-const AbnfScanner = @import("Scanner.zig");
+const AbnfScanner = @import("Scanner.zig").Scanner;
 const AbnfParser = @import("Parser.zig");
 const tok = @import("../token.zig");
 

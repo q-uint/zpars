@@ -177,9 +177,9 @@ pub fn freeBlob(allocator: std.mem.Allocator, blob: *Blob) void {
 const testing = std.testing;
 const Compiler = @import("Compiler.zig");
 const AotRuntime = @import("AotRuntime.zig");
-const EreScanner = @import("../ere/Scanner.zig");
+const EreScanner = @import("../ere/Scanner.zig").Scanner;
 const EreParser = @import("../ere/Parser.zig");
-const PegScanner = @import("../peg/Scanner.zig");
+const PegScanner = @import("../peg/Scanner.zig").Scanner;
 const PegParser = @import("../peg/Parser.zig");
 
 fn compileEre(source: []const u8) Compiler {

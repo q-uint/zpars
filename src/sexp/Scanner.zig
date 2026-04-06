@@ -233,6 +233,7 @@ fn advance(self: *Scanner) u8 {
 }
 
 fn peek(self: *Scanner) u8 {
+    if (self.isAtEnd()) return 0;
     return self.source[self.current];
 }
 

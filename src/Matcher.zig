@@ -10,7 +10,7 @@
 ///     const rules = try parser.parse();
 ///     var validator = Validator.init(allocator, rules);
 ///     const merged = try validator.validate();
-///     const matcher = Matcher.init(allocator, merged);
+///     const matcher = try Matcher.init(allocator, merged);
 ///     const r = matcher.match("start", "hello world").?;
 ///     // r.value == "hello", r.rest == " world"
 const std = @import("std");
@@ -73,6 +73,7 @@ const Head = struct {
     eval: std.DynamicBitSetUnmanaged,
 };
 
+allocator: std.mem.Allocator,
 rules: []const Ast.Rule,
 rule_index: RuleIndex,
 /// Start pointer of the input passed to `match()`, used for anchor_start.
@@ -100,15 +101,21 @@ rule_body_entries: u64 = 0,
 /// Counts memo hits (success + fail + in_progress). Zero outside packrat.
 memo_hits: u64 = 0,
 
-pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) Matcher {
+pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) !Matcher {
     var index = RuleIndex{};
-    index.ensureTotalCapacity(allocator, @intCast(rules.len)) catch {};
+    try index.ensureTotalCapacity(allocator, @intCast(rules.len));
     for (rules, 0..) |rule, i| {
-        const key = asciiLowerAlloc(allocator, rule.name) catch rule.name;
+        const key = try asciiLowerAlloc(allocator, rule.name);
         // Only store first occurrence; rules are already merged by Validator.
-        _ = index.getOrPutValue(allocator, key, @intCast(i)) catch {};
+        _ = try index.getOrPutValue(allocator, key, @intCast(i));
     }
-    return .{ .rules = rules, .rule_index = index };
+    return .{ .allocator = allocator, .rules = rules, .rule_index = index };
+}
+
+pub fn deinit(self: *Matcher) void {
+    var it = self.rule_index.keyIterator();
+    while (it.next()) |key| self.allocator.free(key.*);
+    self.rule_index.deinit(self.allocator);
 }
 
 fn asciiLowerAlloc(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
@@ -645,7 +652,7 @@ fn isWsp(c: u8) bool {
     return c == 0x20 or c == 0x09;
 }
 
-const Scanner = @import("abnf/Scanner.zig");
+const Scanner = @import("abnf/Scanner.zig").Scanner;
 const Parser = @import("abnf/Parser.zig");
 const Validator = @import("Validator.zig");
 
@@ -659,7 +666,7 @@ fn compileMatcher(allocator: std.mem.Allocator, grammar: []const u8) !struct { m
     var arena = std.heap.ArenaAllocator.init(allocator);
     var validator = Validator.init(arena.allocator(), rules);
     const merged = try validator.validate();
-    return .{ .matcher = Matcher.init(arena.allocator(), merged), .arena = arena };
+    return .{ .matcher = try Matcher.init(arena.allocator(), merged), .arena = arena };
 }
 
 test "single char_val rule (case-insensitive)" {

@@ -8,7 +8,7 @@
 ///     // r.value == "42", r.rest == "abc"
 const std = @import("std");
 const Ast = @import("../Ast.zig");
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("Scanner.zig").Scanner;
 const Parser = @import("Parser.zig");
 const c = @import("../combinators.zig");
 
