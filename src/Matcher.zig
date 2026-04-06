@@ -653,7 +653,7 @@ fn isWsp(c: u8) bool {
 }
 
 const Scanner = @import("abnf/Scanner.zig").Scanner;
-const Parser = @import("abnf/Parser.zig");
+const Parser = @import("abnf/Parser.zig").Parser;
 const Validator = @import("Validator.zig");
 
 /// Parse an ABNF grammar, validate it, and return a Matcher ready to use.

@@ -90,7 +90,7 @@ var parser = zpars.abnf.Parser.init(tokens, grammar);
 const rules = try parser.parse();
 var validator = zpars.Validator.init(allocator, rules);
 const merged = try validator.validate();
-const matcher = zpars.Matcher.init(allocator, merged);
+const matcher = try zpars.Matcher.init(allocator, merged);
 
 const r = matcher.match("version", "HTTP/1.1 OK").?;
 // r.value == "HTTP/1.1", r.rest == " OK"
@@ -158,7 +158,7 @@ $ zpars vm -t pattern.ere "abcbd"
    ...
 ```
 
-The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 14 opcodes: `char`, `string`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, and `match`.
+The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 16 opcodes: `char`, `string`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, `optional_char`, `memo_call`, and `match`.
 
 ### Peephole Optimizer
 

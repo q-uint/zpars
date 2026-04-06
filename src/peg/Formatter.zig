@@ -221,7 +221,7 @@ fn isDefinitionStart(tokens: []const Token, idx: usize) bool {
 }
 
 const Scanner = @import("Scanner.zig").Scanner;
-const PegParser = @import("Parser.zig");
+const PegParser = @import("Parser.zig").Parser;
 
 fn expectFmt(expected: []const u8, input: []const u8) !void {
     var scanner = Scanner.init(input);

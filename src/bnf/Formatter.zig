@@ -53,7 +53,7 @@ pub fn formatNode(node: Ast.Node, writer: anytype) anyerror!void {
 }
 
 const Scanner = @import("Scanner.zig").Scanner;
-const Parser = @import("Parser.zig");
+const Parser = @import("Parser.zig").Parser;
 
 fn expectFmt(expected: []const u8, input: []const u8) !void {
     var scanner = Scanner.init(input);

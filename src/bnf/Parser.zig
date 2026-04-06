@@ -1,4 +1,4 @@
-/// BNF parser — produces an AST from a BNF token stream (ALGOL 60 variant).
+/// BNF parser -- produces an AST from a BNF token stream (ALGOL 60 variant).
 ///
 /// Grammar:
 ///   rule          = rulename "::=" alternation
@@ -12,158 +12,166 @@ const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
 
-const Parser = @This();
+pub const Config = struct {
+    max_rules: usize = 256,
+    max_nodes: usize = 4096,
+    max_diagnostics: usize = 64,
+};
 
-const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{.newline}, .{
-    .name_tag = .rulename,
-    .def_tags = &.{.definition},
-});
-pub const peek = primitives.peek;
-const advance = primitives.advance;
-pub const skipTrivia = primitives.skipTrivia;
-pub const peekNextMeaningful = primitives.peekNextMeaningful;
-pub const synchronize = primitives.synchronize;
-const fail = primitives.fail;
+pub const Parser = ParserWith(.{});
 
-pub const ParseError = error{ SyntaxError, Overflow };
+pub fn ParserWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-pub const max_rules = 256;
-pub const max_nodes = 4096;
-pub const max_diagnostics = 64;
+        const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{.newline}, .{
+            .name_tag = .rulename,
+            .def_tags = &.{.definition},
+        });
+        pub const peek = primitives.peek;
+        const advance = primitives.advance;
+        pub const skipTrivia = primitives.skipTrivia;
+        pub const peekNextMeaningful = primitives.peekNextMeaningful;
+        pub const synchronize = primitives.synchronize;
+        const fail = primitives.fail;
 
-tokens: []const Token,
-source: []const u8,
-pos: usize = 0,
+        pub const ParseError = error{ SyntaxError, Overflow };
 
-/// Pool for AST nodes.
-nodes: Pool(Ast.Node, max_nodes) = .{},
+        tokens: []const Token,
+        source: []const u8,
+        pos: usize = 0,
 
-/// Parsed rules.
-rules: Pool(Ast.Rule, max_rules) = .{},
+        /// Pool for AST nodes.
+        nodes: Pool(Ast.Node, config.max_nodes) = .{},
 
-/// Accumulated parse diagnostics.
-diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
+        /// Parsed rules.
+        rules: Pool(Ast.Rule, config.max_rules) = .{},
 
-pub fn init(tokens: []const Token, source: []const u8) Parser {
-    return .{
-        .tokens = tokens,
-        .source = source,
-    };
-}
+        /// Accumulated parse diagnostics.
+        diagnostics: Pool(Diagnostic, config.max_diagnostics) = .{},
 
-/// Parse all rules from the token stream.
-pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
-    self.skipTrivia();
-    while (self.peek().tag != .eof) {
-        const rule = self.parseRule() catch |err| switch (err) {
-            error.SyntaxError => {
-                self.synchronize();
+        pub fn init(tokens: []const Token, source: []const u8) Self {
+            return .{
+                .tokens = tokens,
+                .source = source,
+            };
+        }
+
+        /// Parse all rules from the token stream.
+        pub fn parse(self: *Self) ParseError![]const Ast.Rule {
+            self.skipTrivia();
+            while (self.peek().tag != .eof) {
+                const rule = self.parseRule() catch |err| switch (err) {
+                    error.SyntaxError => {
+                        self.synchronize();
+                        self.skipTrivia();
+                        continue;
+                    },
+                    else => |e| return e,
+                };
+
+                _ = self.rules.addOne(rule);
                 self.skipTrivia();
-                continue;
-            },
-            else => |e| return e,
-        };
+            }
 
-        _ = self.rules.addOne(rule);
-        self.skipTrivia();
-    }
+            return self.rules.slice();
+        }
 
-    return self.rules.slice();
-}
+        pub fn getDiagnostics(self: *const Self) []const Diagnostic {
+            return self.diagnostics.slice();
+        }
 
-pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics.slice();
-}
+        /// rule = rulename "::=" alternation
+        fn parseRule(self: *Self) ParseError!Ast.Rule {
+            if (self.peek().tag != .rulename) {
+                self.fail(.rulename, self.peek());
+                return error.SyntaxError;
+            }
+            const name_tok = self.advance();
+            const name_lex = name_tok.lexeme(self.source);
+            // Strip angle brackets: <name> -> name
+            const name = name_lex[1 .. name_lex.len - 1];
 
-/// rule = rulename "::=" alternation
-fn parseRule(self: *Parser) ParseError!Ast.Rule {
-    if (self.peek().tag != .rulename) {
-        self.fail(.rulename, self.peek());
-        return error.SyntaxError;
-    }
-    const name_tok = self.advance();
-    const name_lex = name_tok.lexeme(self.source);
-    // Strip angle brackets: <name> → name
-    const name = name_lex[1 .. name_lex.len - 1];
+            self.skipTrivia();
+            if (self.peek().tag != .definition) {
+                self.fail(.definition, self.peek());
+                return error.SyntaxError;
+            }
+            _ = self.advance(); // consume ::=
+            self.skipTrivia();
 
-    self.skipTrivia();
-    if (self.peek().tag != .definition) {
-        self.fail(.definition, self.peek());
-        return error.SyntaxError;
-    }
-    _ = self.advance(); // consume ::=
-    self.skipTrivia();
+            return .{ .name = name, .node = try self.parseAlternation(), .incremental = false };
+        }
 
-    return .{ .name = name, .node = try self.parseAlternation(), .incremental = false };
-}
+        /// alternation = concatenation *("|" concatenation)
+        fn parseAlternation(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
 
-/// alternation = concatenation *("|" concatenation)
-fn parseAlternation(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
+            buf[0] = self.parseConcatenation();
+            count = 1;
 
-    buf[0] = self.parseConcatenation();
-    count = 1;
+            while (true) {
+                self.skipTrivia();
+                if (self.peek().tag != .pipe) break;
+                _ = self.advance();
+                self.skipTrivia();
+                buf[count] = self.parseConcatenation();
+                count += 1;
+            }
 
-    while (true) {
-        self.skipTrivia();
-        if (self.peek().tag != .pipe) break;
-        _ = self.advance();
-        self.skipTrivia();
-        buf[count] = self.parseConcatenation();
-        count += 1;
-    }
+            if (count == 1) return buf[0];
+            return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
+        }
 
-    if (count == 1) return buf[0];
-    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
-}
+        /// concatenation = *element
+        fn parseConcatenation(self: *Self) Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
 
-/// concatenation = *element
-fn parseConcatenation(self: *Parser) Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
+            while (self.isAtElement()) {
+                buf[count] = self.parseElement();
+                count += 1;
+            }
 
-    while (self.isAtElement()) {
-        buf[count] = self.parseElement();
-        count += 1;
-    }
+            if (count == 1) return buf[0];
+            return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
+        }
 
-    if (count == 1) return buf[0];
-    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
-}
+        /// element = rulename / terminal
+        fn parseElement(self: *Self) Ast.Node {
+            return switch (self.peek().tag) {
+                .rulename => {
+                    const lex = self.advance().lexeme(self.source);
+                    // Strip angle brackets: <name> -> name
+                    return .{ .rulename = lex[1 .. lex.len - 1] };
+                },
+                .terminal => {
+                    const lex = self.advance().lexeme(self.source);
+                    return .{ .char_val = .{ .value = lex, .case_sensitive = true } };
+                },
+                else => unreachable, // isAtElement guards this
+            };
+        }
 
-/// element = rulename / terminal
-fn parseElement(self: *Parser) Ast.Node {
-    return switch (self.peek().tag) {
-        .rulename => {
-            const lex = self.advance().lexeme(self.source);
-            // Strip angle brackets: <name> → name
-            return .{ .rulename = lex[1 .. lex.len - 1] };
-        },
-        .terminal => {
-            const lex = self.advance().lexeme(self.source);
-            return .{ .char_val = .{ .value = lex, .case_sensitive = true } };
-        },
-        else => unreachable, // isAtElement guards this
-    };
-}
-
-/// Can the current position start an element?
-fn isAtElement(self: *Parser) bool {
-    return switch (self.peek().tag) {
-        .terminal => true,
-        .rulename => {
-            // A <rulename> followed by ::= starts a new rule, not an element.
-            const next = self.peekNextMeaningful();
-            return next != .definition;
-        },
-        else => false,
+        /// Can the current position start an element?
+        fn isAtElement(self: *Self) bool {
+            return switch (self.peek().tag) {
+                .terminal => true,
+                .rulename => {
+                    // A <rulename> followed by ::= starts a new rule, not an element.
+                    const next = self.peekNextMeaningful();
+                    return next != .definition;
+                },
+                else => false,
+            };
+        }
     };
 }
 
 const Scanner = @import("Scanner.zig").Scanner;
 
-fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
+fn parseSource(source: []const u8) Parser.ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
@@ -228,16 +236,16 @@ test "ALGOL 60 example" {
     const result = try parseSource("<ab> ::= ( | [ | <ab> ( | <ab> <d>");
     const alts = result.rules[0].node.alternation;
     try std.testing.expectEqual(4, alts.len);
-    // ( — single terminal
+    // ( -- single terminal
     try std.testing.expectEqualStrings("(", alts[0].char_val.value);
-    // [ — single terminal
+    // [ -- single terminal
     try std.testing.expectEqualStrings("[", alts[1].char_val.value);
-    // <ab> ( — concatenation
+    // <ab> ( -- concatenation
     const cat3 = alts[2].concatenation;
     try std.testing.expectEqual(2, cat3.len);
     try std.testing.expectEqualStrings("ab", cat3[0].rulename);
     try std.testing.expectEqualStrings("(", cat3[1].char_val.value);
-    // <ab> <d> — concatenation
+    // <ab> <d> -- concatenation
     const cat4 = alts[3].concatenation;
     try std.testing.expectEqual(2, cat4.len);
     try std.testing.expectEqualStrings("ab", cat4[0].rulename);

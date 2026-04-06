@@ -9,7 +9,7 @@
 const std = @import("std");
 const Ast = @import("../Ast.zig");
 const Scanner = @import("Scanner.zig").Scanner;
-const Parser = @import("Parser.zig");
+const Parser = @import("Parser.zig").Parser;
 const c = @import("../combinators.zig");
 
 /// Compile an ABNF grammar string into a comptime parser combinator type.
@@ -122,7 +122,8 @@ fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, 
 
     // User-defined rules: collect all definitions (handles =/).
     const new_visited = visited ++ .{name};
-    comptime var matching: [Parser.max_rules]Ast.Node = undefined;
+    const parser_config = @import("Parser.zig").Config{};
+    comptime var matching: [parser_config.max_rules]Ast.Node = undefined;
     comptime var count: usize = 0;
     inline for (rules) |rule| {
         if (eqlIgnoreCase(rule.name, name)) {

@@ -1,4 +1,4 @@
-/// CFG parser — produces a `Cfg` from a CFG token stream.
+/// CFG parser -- produces a `Cfg` from a CFG token stream.
 ///
 /// Grammar:
 ///   rule          = identifier "->" alternation
@@ -13,220 +13,228 @@ const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
 
-const Parser = @This();
+pub const Config = struct {
+    max_rules: usize = 256,
+    max_prods: usize = 1024,
+    max_symbols: usize = 4096,
+    max_diagnostics: usize = 64,
+};
 
-const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{.newline}, .{
-    .name_tag = .identifier,
-    .def_tags = &.{.arrow},
-});
-pub const peek = primitives.peek;
-const advance = primitives.advance;
-pub const skipTrivia = primitives.skipTrivia;
-pub const peekNextMeaningful = primitives.peekNextMeaningful;
-pub const synchronize = primitives.synchronize;
-const fail = primitives.fail;
+pub const Parser = ParserWith(.{});
 
-pub const ParseError = error{ SyntaxError, Overflow };
+pub fn ParserWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-pub const max_rules = 256;
-pub const max_prods = 1024;
-pub const max_symbols = 4096;
-pub const max_diagnostics = 64;
+        const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{.newline}, .{
+            .name_tag = .identifier,
+            .def_tags = &.{.arrow},
+        });
+        pub const peek = primitives.peek;
+        const advance = primitives.advance;
+        pub const skipTrivia = primitives.skipTrivia;
+        pub const peekNextMeaningful = primitives.peekNextMeaningful;
+        pub const synchronize = primitives.synchronize;
+        const fail = primitives.fail;
 
-/// Hash table bucket count — must be a power of 2 and > max_rules.
-const nt_hash_cap = 512;
-const nt_hash_empty: u32 = std.math.maxInt(u32);
+        pub const ParseError = error{ SyntaxError, Overflow };
 
-tokens: []const Token,
-source: []const u8,
-pos: usize = 0,
+        /// Hash table bucket count -- must be a power of 2 and > max_rules.
+        const nt_hash_cap = std.math.ceilPowerOfTwo(usize, config.max_rules + 1) catch unreachable;
+        const nt_hash_empty: u32 = std.math.maxInt(u32);
 
-/// Nonterminal name table.
-nts: [max_rules][]const u8 = undefined,
-nt_count: usize = 0,
+        tokens: []const Token,
+        source: []const u8,
+        pos: usize = 0,
 
-/// Open-addressing hash table: bucket → nonterminal index (nt_hash_empty = vacant).
-nt_hash: [nt_hash_cap]u32 = @splat(nt_hash_empty),
+        /// Nonterminal name table.
+        nts: [config.max_rules][]const u8 = undefined,
+        nt_count: usize = 0,
 
-/// Symbol pool shared across all productions.
-symbols: Pool(Cfg.Symbol, max_symbols) = .{},
+        /// Open-addressing hash table: bucket -> nonterminal index (nt_hash_empty = vacant).
+        nt_hash: [nt_hash_cap]u32 = @splat(nt_hash_empty),
 
-/// Parsed productions.
-prods: Pool(Cfg.Production, max_prods) = .{},
+        /// Symbol pool shared across all productions.
+        symbols: Pool(Cfg.Symbol, config.max_symbols) = .{},
 
-/// Accumulated parse diagnostics.
-diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
+        /// Parsed productions.
+        prods: Pool(Cfg.Production, config.max_prods) = .{},
 
-pub fn init(tokens: []const Token, source: []const u8) Parser {
-    return .{
-        .tokens = tokens,
-        .source = source,
-    };
-}
+        /// Accumulated parse diagnostics.
+        diagnostics: Pool(Diagnostic, config.max_diagnostics) = .{},
 
-/// Parse all rules and return a `Cfg`.
-///
-/// Productions are grouped by LHS so that `Cfg.productionsFor` works.
-pub fn parse(self: *Parser) ParseError!Cfg {
-    self.skipTrivia();
-    while (self.peek().tag != .eof) {
-        self.parseRule() catch |err| switch (err) {
-            error.SyntaxError => {
-                self.synchronize();
+        pub fn init(tokens: []const Token, source: []const u8) Self {
+            return .{
+                .tokens = tokens,
+                .source = source,
+            };
+        }
+
+        /// Parse all rules and return a `Cfg`.
+        ///
+        /// Productions are grouped by LHS so that `Cfg.productionsFor` works.
+        pub fn parse(self: *Self) ParseError!Cfg {
+            self.skipTrivia();
+            while (self.peek().tag != .eof) {
+                self.parseRule() catch |err| switch (err) {
+                    error.SyntaxError => {
+                        self.synchronize();
+                        self.skipTrivia();
+                        continue;
+                    },
+                    else => |e| return e,
+                };
                 self.skipTrivia();
-                continue;
-            },
-            else => |e| return e,
-        };
-        self.skipTrivia();
-    }
+            }
 
-    if (self.prods.count == 0) return error.SyntaxError;
+            if (self.prods.count == 0) return error.SyntaxError;
 
-    // Group productions by LHS.
-    var sorted: [max_prods]Cfg.Production = undefined;
-    var sorted_count: usize = 0;
-    for (0..self.nt_count) |nt_id| {
-        for (self.prods.slice()) |prod| {
-            if (prod.lhs == @as(u32, @intCast(nt_id))) {
-                sorted[sorted_count] = prod;
-                sorted_count += 1;
+            // Group productions by LHS.
+            var sorted: [config.max_prods]Cfg.Production = undefined;
+            var sorted_count: usize = 0;
+            for (0..self.nt_count) |nt_id| {
+                for (self.prods.slice()) |prod| {
+                    if (prod.lhs == @as(u32, @intCast(nt_id))) {
+                        sorted[sorted_count] = prod;
+                        sorted_count += 1;
+                    }
+                }
+            }
+
+            return .{
+                .nonterminals = self.nts[0..self.nt_count],
+                .productions = sorted[0..sorted_count],
+                .start = 0,
+            };
+        }
+
+        pub fn getDiagnostics(self: *const Self) []const Diagnostic {
+            return self.diagnostics.slice();
+        }
+
+        /// rule = identifier "->" alternation
+        fn parseRule(self: *Self) ParseError!void {
+            if (self.peek().tag != .identifier) {
+                self.fail(.identifier, self.peek());
+                return error.SyntaxError;
+            }
+            const name_tok = self.advance();
+            const lhs_name = name_tok.lexeme(self.source);
+
+            self.skipTrivia();
+            if (self.peek().tag != .arrow) {
+                self.fail(.arrow, self.peek());
+                return error.SyntaxError;
+            }
+            _ = self.advance(); // consume ->
+
+            const lhs_id = self.findOrAddNt(lhs_name);
+
+            // Parse alternatives: sequence *("|" sequence)
+            self.parseSequence(lhs_id);
+
+            while (self.peek().tag == .pipe) {
+                _ = self.advance(); // consume |
+                self.parseSequence(lhs_id);
             }
         }
-    }
 
-    return .{
-        .nonterminals = self.nts[0..self.nt_count],
-        .productions = sorted[0..sorted_count],
-        .start = 0,
+        /// Parse a sequence of symbols and append as a production.
+        fn parseSequence(self: *Self, lhs_id: u32) void {
+            const sym_start = self.symbols.count;
+
+            while (isSymbolTag(self.peek().tag)) {
+                _ = self.symbols.addOne(self.parseSymbol());
+            }
+
+            _ = self.prods.addOne(.{
+                .lhs = lhs_id,
+                .rhs = self.symbols.items[sym_start..self.symbols.count],
+            });
+        }
+
+        fn parseSymbol(self: *Self) Cfg.Symbol {
+            const tok = self.advance();
+            const lex = tok.lexeme(self.source);
+            return switch (tok.tag) {
+                .identifier => .{ .nonterminal = self.findOrAddNt(lex) },
+                .string => .{ .terminal = .{ .string = stripQuotes(lex) } },
+                .string_cs => .{ .terminal = .{ .string = stripPrefixedQuotes(lex) } },
+                .string_ci => .{ .terminal = .{ .string_ci = stripPrefixedQuotes(lex) } },
+                .hex_byte => .{ .terminal = .{ .byte = parseHexByte(lex) } },
+                .hex_range => .{ .terminal = parseHexRange(lex) },
+                else => unreachable, // guarded by isSymbolTag
+            };
+        }
+
+        fn isSymbolTag(tag: Token.Tag) bool {
+            return switch (tag) {
+                .identifier, .string, .string_cs, .string_ci, .hex_byte, .hex_range => true,
+                else => false,
+            };
+        }
+
+        fn findOrAddNt(self: *Self, name: []const u8) u32 {
+            const mask: usize = nt_hash_cap - 1;
+            var idx: usize = @truncate(std.hash.Wyhash.hash(0, name) & mask);
+            while (true) {
+                const slot = self.nt_hash[idx];
+                if (slot == nt_hash_empty) break;
+                if (std.mem.eql(u8, self.nts[slot], name)) return slot;
+                idx = (idx + 1) & mask;
+            }
+            const id: u32 = @intCast(self.nt_count);
+            self.nts[self.nt_count] = name;
+            self.nt_count += 1;
+            self.nt_hash[idx] = id;
+            return id;
+        }
+
+        /// `"text"` -> `text`
+        fn stripQuotes(lex: []const u8) []const u8 {
+            return lex[1 .. lex.len - 1];
+        }
+
+        /// `%s"text"` or `%i"text"` -> `text`
+        fn stripPrefixedQuotes(lex: []const u8) []const u8 {
+            return lex[3 .. lex.len - 1];
+        }
+
+        /// `%x41` -> 0x41
+        fn parseHexByte(lex: []const u8) u8 {
+            return parseHex(lex[2..]);
+        }
+
+        /// `%x41-5A` -> Terminal.range
+        fn parseHexRange(lex: []const u8) Cfg.Terminal {
+            // Skip "%x", then split on '-'
+            const hex_part = lex[2..];
+            const dash = std.mem.indexOf(u8, hex_part, "-").?;
+            return .{ .range = .{
+                .lo = parseHex(hex_part[0..dash]),
+                .hi = parseHex(hex_part[dash + 1 ..]),
+            } };
+        }
+
+        fn parseHex(s: []const u8) u8 {
+            var result: u16 = 0;
+            for (s) |c| {
+                const digit: u16 = if (c >= '0' and c <= '9')
+                    c - '0'
+                else if (c >= 'a' and c <= 'f')
+                    c - 'a' + 10
+                else
+                    c - 'A' + 10;
+                result = result * 16 + digit;
+            }
+            return @intCast(result & 0xFF);
+        }
     };
-}
-
-pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics.slice();
-}
-
-/// rule = identifier "->" alternation
-fn parseRule(self: *Parser) ParseError!void {
-    if (self.peek().tag != .identifier) {
-        self.fail(.identifier, self.peek());
-        return error.SyntaxError;
-    }
-    const name_tok = self.advance();
-    const lhs_name = name_tok.lexeme(self.source);
-
-    self.skipTrivia();
-    if (self.peek().tag != .arrow) {
-        self.fail(.arrow, self.peek());
-        return error.SyntaxError;
-    }
-    _ = self.advance(); // consume ->
-
-    const lhs_id = self.findOrAddNt(lhs_name);
-
-    // Parse alternatives: sequence *("|" sequence)
-    self.parseSequence(lhs_id);
-
-    while (self.peek().tag == .pipe) {
-        _ = self.advance(); // consume |
-        self.parseSequence(lhs_id);
-    }
-}
-
-/// Parse a sequence of symbols and append as a production.
-fn parseSequence(self: *Parser, lhs_id: u32) void {
-    const sym_start = self.symbols.count;
-
-    while (isSymbolTag(self.peek().tag)) {
-        _ = self.symbols.addOne(self.parseSymbol());
-    }
-
-    _ = self.prods.addOne(.{
-        .lhs = lhs_id,
-        .rhs = self.symbols.items[sym_start..self.symbols.count],
-    });
-}
-
-fn parseSymbol(self: *Parser) Cfg.Symbol {
-    const tok = self.advance();
-    const lex = tok.lexeme(self.source);
-    return switch (tok.tag) {
-        .identifier => .{ .nonterminal = self.findOrAddNt(lex) },
-        .string => .{ .terminal = .{ .string = stripQuotes(lex) } },
-        .string_cs => .{ .terminal = .{ .string = stripPrefixedQuotes(lex) } },
-        .string_ci => .{ .terminal = .{ .string_ci = stripPrefixedQuotes(lex) } },
-        .hex_byte => .{ .terminal = .{ .byte = parseHexByte(lex) } },
-        .hex_range => .{ .terminal = parseHexRange(lex) },
-        else => unreachable, // guarded by isSymbolTag
-    };
-}
-
-fn isSymbolTag(tag: Token.Tag) bool {
-    return switch (tag) {
-        .identifier, .string, .string_cs, .string_ci, .hex_byte, .hex_range => true,
-        else => false,
-    };
-}
-
-fn findOrAddNt(self: *Parser, name: []const u8) u32 {
-    const mask: usize = nt_hash_cap - 1;
-    var idx: usize = @truncate(std.hash.Wyhash.hash(0, name) & mask);
-    while (true) {
-        const slot = self.nt_hash[idx];
-        if (slot == nt_hash_empty) break;
-        if (std.mem.eql(u8, self.nts[slot], name)) return slot;
-        idx = (idx + 1) & mask;
-    }
-    const id: u32 = @intCast(self.nt_count);
-    self.nts[self.nt_count] = name;
-    self.nt_count += 1;
-    self.nt_hash[idx] = id;
-    return id;
-}
-
-/// `"text"` → `text`
-fn stripQuotes(lex: []const u8) []const u8 {
-    return lex[1 .. lex.len - 1];
-}
-
-/// `%s"text"` or `%i"text"` → `text`
-fn stripPrefixedQuotes(lex: []const u8) []const u8 {
-    return lex[3 .. lex.len - 1];
-}
-
-/// `%x41` → 0x41
-fn parseHexByte(lex: []const u8) u8 {
-    return parseHex(lex[2..]);
-}
-
-/// `%x41-5A` → Terminal.range
-fn parseHexRange(lex: []const u8) Cfg.Terminal {
-    // Skip "%x", then split on '-'
-    const hex_part = lex[2..];
-    const dash = std.mem.indexOf(u8, hex_part, "-").?;
-    return .{ .range = .{
-        .lo = parseHex(hex_part[0..dash]),
-        .hi = parseHex(hex_part[dash + 1 ..]),
-    } };
-}
-
-fn parseHex(s: []const u8) u8 {
-    var result: u16 = 0;
-    for (s) |c| {
-        const digit: u16 = if (c >= '0' and c <= '9')
-            c - '0'
-        else if (c >= 'a' and c <= 'f')
-            c - 'a' + 10
-        else
-            c - 'A' + 10;
-        result = result * 16 + digit;
-    }
-    return @intCast(result & 0xFF);
 }
 
 const Scanner = @import("Scanner.zig").Scanner;
 
-fn parseSource(source: []const u8) ParseError!struct { parser: Parser, cfg: Cfg } {
+fn parseSource(source: []const u8) Parser.ParseError!struct { parser: Parser, cfg: Cfg } {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);

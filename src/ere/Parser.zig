@@ -1,4 +1,4 @@
-/// ERE parser — produces an AST from a POSIX Extended Regular Expression.
+/// ERE parser -- produces an AST from a POSIX Extended Regular Expression.
 ///
 /// Grammar (IEEE Std 1003.1, Section 9.4):
 ///   ERE         = alternation
@@ -17,297 +17,313 @@ const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
 
-const Parser = @This();
+pub const Config = struct {
+    max_rules: usize = 1,
+    max_nodes: usize = 4096,
+    max_ranges: usize = 1024,
+    max_bytes: usize = 1024,
+    max_diagnostics: usize = 64,
+};
 
-const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{}, .{
-    .name_tag = .eof,
-    .def_tags = &.{},
-});
-const peek = primitives.peek;
-const advance = primitives.advance;
-const fail = primitives.fail;
+pub const Parser = ParserWith(.{});
 
-pub const ParseError = error{ SyntaxError, Overflow };
+pub fn ParserWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-pub const max_rules = 1;
-pub const max_nodes = 4096;
-pub const max_ranges = 1024;
-pub const max_bytes = 1024;
-pub const max_diagnostics = 64;
+        const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{}, .{
+            .name_tag = .eof,
+            .def_tags = &.{},
+        });
+        const peek = primitives.peek;
+        const advance = primitives.advance;
+        const fail = primitives.fail;
 
-tokens: []const Token,
-source: []const u8,
-pos: usize = 0,
+        pub const ParseError = error{ SyntaxError, Overflow };
 
-nodes: Pool(Ast.Node, max_nodes) = .{},
-ranges: Pool(Ast.ClassRange, max_ranges) = .{},
-bytes: Pool(u8, max_bytes) = .{},
-rules: Pool(Ast.Rule, max_rules) = .{},
-diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
+        tokens: []const Token,
+        source: []const u8,
+        pos: usize = 0,
 
-pub fn init(tokens: []const Token, source: []const u8) Parser {
-    return .{ .tokens = tokens, .source = source };
-}
+        nodes: Pool(Ast.Node, config.max_nodes) = .{},
+        ranges: Pool(Ast.ClassRange, config.max_ranges) = .{},
+        bytes: Pool(u8, config.max_bytes) = .{},
+        rules: Pool(Ast.Rule, config.max_rules) = .{},
+        diagnostics: Pool(Diagnostic, config.max_diagnostics) = .{},
 
-/// Parse the ERE token stream into a single rule.
-pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
-    const node = try self.parseAlternation();
+        pub fn init(tokens: []const Token, source: []const u8) Self {
+            return .{ .tokens = tokens, .source = source };
+        }
 
-    if (self.peek().tag != .eof) {
-        self.fail(.eof, self.peek());
-        return error.SyntaxError;
-    }
+        /// Parse the ERE token stream into a single rule.
+        pub fn parse(self: *Self) ParseError![]const Ast.Rule {
+            const node = try self.parseAlternation();
 
-    _ = self.rules.addOne(.{ .name = "", .node = node, .incremental = false });
-    return self.rules.slice();
-}
+            if (self.peek().tag != .eof) {
+                self.fail(.eof, self.peek());
+                return error.SyntaxError;
+            }
 
-pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics.slice();
-}
+            _ = self.rules.addOne(.{ .name = "", .node = node, .incremental = false });
+            return self.rules.slice();
+        }
 
-/// alternation = branch ('|' branch)*
-fn parseAlternation(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    buf[0] = try self.parseBranch();
-    var count: usize = 1;
+        pub fn getDiagnostics(self: *const Self) []const Diagnostic {
+            return self.diagnostics.slice();
+        }
 
-    while (self.peek().tag == .pipe) {
-        _ = self.advance();
-        buf[count] = try self.parseBranch();
-        count += 1;
-    }
+        /// alternation = branch ('|' branch)*
+        fn parseAlternation(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            buf[0] = try self.parseBranch();
+            var count: usize = 1;
 
-    if (count == 1) return buf[0];
-    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
-}
+            while (self.peek().tag == .pipe) {
+                _ = self.advance();
+                buf[count] = try self.parseBranch();
+                count += 1;
+            }
 
-/// branch = piece*
-fn parseBranch(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
+            if (count == 1) return buf[0];
+            return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
+        }
 
-    while (self.isAtAtom()) {
-        buf[count] = try self.parsePiece();
-        count += 1;
-    }
+        /// branch = piece*
+        fn parseBranch(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
 
-    if (count == 0) {
-        // Empty branch — matches empty string.
-        return .{ .concatenation = self.nodes.addSlice(buf[0..0]) };
-    }
-    if (count == 1) return buf[0];
-    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
-}
+            while (self.isAtAtom()) {
+                buf[count] = try self.parsePiece();
+                count += 1;
+            }
 
-/// piece = atom quantifier?
-fn parsePiece(self: *Parser) ParseError!Ast.Node {
-    const atom = try self.parseAtom();
-    return self.parseQuantifier(atom);
-}
+            if (count == 0) {
+                // Empty branch -- matches empty string.
+                return .{ .concatenation = self.nodes.addSlice(buf[0..0]) };
+            }
+            if (count == 1) return buf[0];
+            return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
+        }
 
-/// quantifier = '*' | '+' | '?' | '{' interval '}'
-fn parseQuantifier(self: *Parser, atom: Ast.Node) ParseError!Ast.Node {
-    return switch (self.peek().tag) {
-        .star => {
-            _ = self.advance();
-            return .{ .repetition = .{ .min = 0, .max = null, .element = self.nodes.addOne(atom) } };
-        },
-        .plus => {
-            _ = self.advance();
-            return .{ .repetition = .{ .min = 1, .max = null, .element = self.nodes.addOne(atom) } };
-        },
-        .question => {
-            _ = self.advance();
-            return .{ .repetition = .{ .min = 0, .max = 1, .element = self.nodes.addOne(atom) } };
-        },
-        .lbrace => self.parseInterval(atom),
-        else => atom,
-    };
-}
+        /// piece = atom quantifier?
+        fn parsePiece(self: *Self) ParseError!Ast.Node {
+            const atom = try self.parseAtom();
+            return self.parseQuantifier(atom);
+        }
 
-/// Parse `{ number [, [number]] }` — already tokenized by the scanner.
-fn parseInterval(self: *Parser, atom: Ast.Node) ParseError!Ast.Node {
-    _ = self.advance(); // consume {
-    const min = self.parseNumber() orelse {
-        self.fail(.number, self.peek());
-        return error.SyntaxError;
-    };
+        /// quantifier = '*' | '+' | '?' | '{' interval '}'
+        fn parseQuantifier(self: *Self, atom: Ast.Node) ParseError!Ast.Node {
+            return switch (self.peek().tag) {
+                .star => {
+                    _ = self.advance();
+                    return .{ .repetition = .{ .min = 0, .max = null, .element = self.nodes.addOne(atom) } };
+                },
+                .plus => {
+                    _ = self.advance();
+                    return .{ .repetition = .{ .min = 1, .max = null, .element = self.nodes.addOne(atom) } };
+                },
+                .question => {
+                    _ = self.advance();
+                    return .{ .repetition = .{ .min = 0, .max = 1, .element = self.nodes.addOne(atom) } };
+                },
+                .lbrace => self.parseInterval(atom),
+                else => atom,
+            };
+        }
 
-    if (self.peek().tag == .rbrace) {
-        // {m} — exact
-        _ = self.advance();
-        return .{ .repetition = .{ .min = min, .max = min, .element = self.nodes.addOne(atom) } };
-    }
+        /// Parse `{ number [, [number]] }` -- already tokenized by the scanner.
+        fn parseInterval(self: *Self, atom: Ast.Node) ParseError!Ast.Node {
+            _ = self.advance(); // consume {
+            const min = self.parseNumber() orelse {
+                self.fail(.number, self.peek());
+                return error.SyntaxError;
+            };
 
-    if (self.peek().tag != .comma) {
-        self.fail(.right_brace, self.peek());
-        return error.SyntaxError;
-    }
-    _ = self.advance(); // consume ,
+            if (self.peek().tag == .rbrace) {
+                // {m} -- exact
+                _ = self.advance();
+                return .{ .repetition = .{ .min = min, .max = min, .element = self.nodes.addOne(atom) } };
+            }
 
-    if (self.peek().tag == .rbrace) {
-        // {m,} — unbounded
-        _ = self.advance();
-        return .{ .repetition = .{ .min = min, .max = null, .element = self.nodes.addOne(atom) } };
-    }
+            if (self.peek().tag != .comma) {
+                self.fail(.right_brace, self.peek());
+                return error.SyntaxError;
+            }
+            _ = self.advance(); // consume ,
 
-    const max = self.parseNumber() orelse {
-        self.fail(.number, self.peek());
-        return error.SyntaxError;
-    };
+            if (self.peek().tag == .rbrace) {
+                // {m,} -- unbounded
+                _ = self.advance();
+                return .{ .repetition = .{ .min = min, .max = null, .element = self.nodes.addOne(atom) } };
+            }
 
-    if (self.peek().tag != .rbrace) {
-        self.fail(.right_brace, self.peek());
-        return error.SyntaxError;
-    }
-    _ = self.advance();
+            const max = self.parseNumber() orelse {
+                self.fail(.number, self.peek());
+                return error.SyntaxError;
+            };
 
-    return .{ .repetition = .{ .min = min, .max = max, .element = self.nodes.addOne(atom) } };
-}
-
-fn parseNumber(self: *Parser) ?usize {
-    if (self.peek().tag != .number) return null;
-    const lex = self.advance().lexeme(self.source);
-    return std.fmt.parseInt(usize, lex, 10) catch null;
-}
-
-/// atom = char | '.' | '^' | '$' | '(' alternation ')' | bracket_expr
-fn parseAtom(self: *Parser) ParseError!Ast.Node {
-    return switch (self.peek().tag) {
-        .char => self.parseChar(),
-        .dot => {
-            _ = self.advance();
-            return .any;
-        },
-        .caret => {
-            _ = self.advance();
-            return .anchor_start;
-        },
-        .dollar => {
-            _ = self.advance();
-            return .anchor_end;
-        },
-        .left_paren => {
-            _ = self.advance();
-            const expr = try self.parseAlternation();
-            if (self.peek().tag != .right_paren) {
-                self.fail(.right_paren, self.peek());
+            if (self.peek().tag != .rbrace) {
+                self.fail(.right_brace, self.peek());
                 return error.SyntaxError;
             }
             _ = self.advance();
-            return .{ .capture = self.nodes.addOne(expr) };
-        },
-        .bracket_expr => self.parseBracketExpr(),
-        else => {
-            self.fail(.expression, self.peek());
-            return error.SyntaxError;
-        },
-    };
-}
 
-fn parseChar(self: *Parser) Ast.Node {
-    const lex = self.advance().lexeme(self.source);
-    const ch: u8 = if (lex.len == 2 and lex[0] == '\\')
-        lex[1]
-    else
-        lex[0];
-    const value = self.bytes.items[self.bytes.count .. self.bytes.count + 1];
-    _ = self.bytes.addOne(ch);
-    return .{ .char_val = .{ .value = value, .case_sensitive = true } };
-}
-
-fn parseBracketExpr(self: *Parser) Ast.Node {
-    const lex = self.advance().lexeme(self.source);
-    // Strip outer brackets.
-    var inner = lex[1 .. lex.len - 1];
-
-    // Check for negation.
-    const negated = inner.len > 0 and inner[0] == '^';
-    if (negated) inner = inner[1..];
-
-    // Per POSIX: ] immediately after [ or [^ is a literal.
-    // The scanner already handled this by including it in the token,
-    // so if inner starts with ] it's a literal.
-
-    const start = self.ranges.count;
-    var i: usize = 0;
-    while (i < inner.len) {
-        // Check for POSIX class [:name:]
-        if (i + 2 < inner.len and inner[i] == '[' and inner[i + 1] == ':') {
-            if (self.parsePosixClass(inner, &i)) continue;
+            return .{ .repetition = .{ .min = min, .max = max, .element = self.nodes.addOne(atom) } };
         }
 
-        const lo = decodeBracketChar(inner, &i) orelse break;
+        fn parseNumber(self: *Self) ?usize {
+            if (self.peek().tag != .number) return null;
+            const lex = self.advance().lexeme(self.source);
+            return std.fmt.parseInt(usize, lex, 10) catch null;
+        }
 
-        // Check for range: char '-' char (but not trailing '-').
-        if (i + 1 < inner.len and inner[i] == '-' and i + 1 < inner.len) {
-            const after_dash = i + 1;
-            if (after_dash < inner.len and inner[after_dash] != ']') {
-                i += 1; // skip '-'
-                const hi = decodeBracketChar(inner, &i) orelse {
-                    _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
-                    _ = self.ranges.addOne(.{ .lo = '-', .hi = '-' });
-                    break;
-                };
-                _ = self.ranges.addOne(.{ .lo = lo, .hi = hi });
-                continue;
+        /// atom = char | '.' | '^' | '$' | '(' alternation ')' | bracket_expr
+        fn parseAtom(self: *Self) ParseError!Ast.Node {
+            return switch (self.peek().tag) {
+                .char => self.parseChar(),
+                .dot => {
+                    _ = self.advance();
+                    return .any;
+                },
+                .caret => {
+                    _ = self.advance();
+                    return .anchor_start;
+                },
+                .dollar => {
+                    _ = self.advance();
+                    return .anchor_end;
+                },
+                .left_paren => {
+                    _ = self.advance();
+                    const expr = try self.parseAlternation();
+                    if (self.peek().tag != .right_paren) {
+                        self.fail(.right_paren, self.peek());
+                        return error.SyntaxError;
+                    }
+                    _ = self.advance();
+                    return .{ .capture = self.nodes.addOne(expr) };
+                },
+                .bracket_expr => self.parseBracketExpr(),
+                else => {
+                    self.fail(.expression, self.peek());
+                    return error.SyntaxError;
+                },
+            };
+        }
+
+        fn parseChar(self: *Self) Ast.Node {
+            const lex = self.advance().lexeme(self.source);
+            const ch: u8 = if (lex.len == 2 and lex[0] == '\\')
+                lex[1]
+            else
+                lex[0];
+            const value = self.bytes.items[self.bytes.count .. self.bytes.count + 1];
+            _ = self.bytes.addOne(ch);
+            return .{ .char_val = .{ .value = value, .case_sensitive = true } };
+        }
+
+        fn parseBracketExpr(self: *Self) Ast.Node {
+            const lex = self.advance().lexeme(self.source);
+            // Strip outer brackets.
+            var inner = lex[1 .. lex.len - 1];
+
+            // Check for negation.
+            const negated = inner.len > 0 and inner[0] == '^';
+            if (negated) inner = inner[1..];
+
+            // Per POSIX: ] immediately after [ or [^ is a literal.
+            // The scanner already handled this by including it in the token,
+            // so if inner starts with ] it's a literal.
+
+            const start = self.ranges.count;
+            var i: usize = 0;
+            while (i < inner.len) {
+                // Check for POSIX class [:name:]
+                if (i + 2 < inner.len and inner[i] == '[' and inner[i + 1] == ':') {
+                    if (self.parsePosixClass(inner, &i)) continue;
+                }
+
+                const lo = decodeBracketChar(inner, &i) orelse break;
+
+                // Check for range: char '-' char (but not trailing '-').
+                if (i + 1 < inner.len and inner[i] == '-' and i + 1 < inner.len) {
+                    const after_dash = i + 1;
+                    if (after_dash < inner.len and inner[after_dash] != ']') {
+                        i += 1; // skip '-'
+                        const hi = decodeBracketChar(inner, &i) orelse {
+                            _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
+                            _ = self.ranges.addOne(.{ .lo = '-', .hi = '-' });
+                            break;
+                        };
+                        _ = self.ranges.addOne(.{ .lo = lo, .hi = hi });
+                        continue;
+                    }
+                }
+
+                _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
             }
+
+            const ranges = self.ranges.items[start..self.ranges.count];
+            if (negated) return .{ .neg_char_class = ranges };
+            return .{ .char_class = ranges };
         }
 
-        _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
-    }
-
-    const ranges = self.ranges.items[start..self.ranges.count];
-    if (negated) return .{ .neg_char_class = ranges };
-    return .{ .char_class = ranges };
-}
-
-/// Try to parse a POSIX character class like [:alpha:] starting at inner[*i].
-/// Returns true on success, advancing *i past the closing :].
-fn parsePosixClass(self: *Parser, inner: []const u8, i: *usize) bool {
-    // Find closing :]
-    const class_start = i.* + 2; // skip [:
-    var j = class_start;
-    while (j + 1 < inner.len) : (j += 1) {
-        if (inner[j] == ':' and inner[j + 1] == ']') {
-            const name = inner[class_start..j];
-            if (self.addPosixClassRanges(name)) {
-                i.* = j + 2; // skip :]
-                return true;
+        /// Try to parse a POSIX character class like [:alpha:] starting at inner[*i].
+        /// Returns true on success, advancing *i past the closing :].
+        fn parsePosixClass(self: *Self, inner: []const u8, i: *usize) bool {
+            // Find closing :]
+            const class_start = i.* + 2; // skip [:
+            var j = class_start;
+            while (j + 1 < inner.len) : (j += 1) {
+                if (inner[j] == ':' and inner[j + 1] == ']') {
+                    const name = inner[class_start..j];
+                    if (self.addPosixClassRanges(name)) {
+                        i.* = j + 2; // skip :]
+                        return true;
+                    }
+                    return false;
+                }
             }
             return false;
         }
-    }
-    return false;
-}
 
-/// Add ClassRange entries for a POSIX character class name (C/POSIX locale).
-fn addPosixClassRanges(self: *Parser, name: []const u8) bool {
-    const classes = .{
-        .{ "alpha", &[_][2]u8{ .{ 'A', 'Z' }, .{ 'a', 'z' } } },
-        .{ "digit", &[_][2]u8{.{ '0', '9' }} },
-        .{ "alnum", &[_][2]u8{ .{ 'A', 'Z' }, .{ 'a', 'z' }, .{ '0', '9' } } },
-        .{ "upper", &[_][2]u8{.{ 'A', 'Z' }} },
-        .{ "lower", &[_][2]u8{.{ 'a', 'z' }} },
-        .{ "space", &[_][2]u8{ .{ '\t', '\r' }, .{ ' ', ' ' } } },
-        .{ "blank", &[_][2]u8{ .{ '\t', '\t' }, .{ ' ', ' ' } } },
-        .{ "print", &[_][2]u8{.{ 0x20, 0x7E }} },
-        .{ "graph", &[_][2]u8{.{ 0x21, 0x7E }} },
-        .{ "cntrl", &[_][2]u8{ .{ 0x00, 0x1F }, .{ 0x7F, 0x7F } } },
-        .{ "xdigit", &[_][2]u8{ .{ '0', '9' }, .{ 'A', 'F' }, .{ 'a', 'f' } } },
-        .{ "punct", &[_][2]u8{ .{ '!', '/' }, .{ ':', '@' }, .{ '[', '`' }, .{ '{', '~' } } },
-    };
+        /// Add ClassRange entries for a POSIX character class name (C/POSIX locale).
+        fn addPosixClassRanges(self: *Self, name: []const u8) bool {
+            const classes = .{
+                .{ "alpha", &[_][2]u8{ .{ 'A', 'Z' }, .{ 'a', 'z' } } },
+                .{ "digit", &[_][2]u8{.{ '0', '9' }} },
+                .{ "alnum", &[_][2]u8{ .{ 'A', 'Z' }, .{ 'a', 'z' }, .{ '0', '9' } } },
+                .{ "upper", &[_][2]u8{.{ 'A', 'Z' }} },
+                .{ "lower", &[_][2]u8{.{ 'a', 'z' }} },
+                .{ "space", &[_][2]u8{ .{ '\t', '\r' }, .{ ' ', ' ' } } },
+                .{ "blank", &[_][2]u8{ .{ '\t', '\t' }, .{ ' ', ' ' } } },
+                .{ "print", &[_][2]u8{.{ 0x20, 0x7E }} },
+                .{ "graph", &[_][2]u8{.{ 0x21, 0x7E }} },
+                .{ "cntrl", &[_][2]u8{ .{ 0x00, 0x1F }, .{ 0x7F, 0x7F } } },
+                .{ "xdigit", &[_][2]u8{ .{ '0', '9' }, .{ 'A', 'F' }, .{ 'a', 'f' } } },
+                .{ "punct", &[_][2]u8{ .{ '!', '/' }, .{ ':', '@' }, .{ '[', '`' }, .{ '{', '~' } } },
+            };
 
-    inline for (classes) |entry| {
-        if (std.mem.eql(u8, name, entry[0])) {
-            for (entry[1]) |r| {
-                _ = self.ranges.addOne(.{ .lo = r[0], .hi = r[1] });
+            inline for (classes) |entry| {
+                if (std.mem.eql(u8, name, entry[0])) {
+                    for (entry[1]) |r| {
+                        _ = self.ranges.addOne(.{ .lo = r[0], .hi = r[1] });
+                    }
+                    return true;
+                }
             }
-            return true;
+            return false;
         }
-    }
-    return false;
+
+        /// Can the current token start an atom?
+        fn isAtAtom(self: *Self) bool {
+            return switch (self.peek().tag) {
+                .char, .dot, .caret, .dollar, .left_paren, .bracket_expr => true,
+                else => false,
+            };
+        }
+    };
 }
 
 fn decodeBracketChar(raw: []const u8, i: *usize) ?u8 {
@@ -328,17 +344,9 @@ fn decodeBracketChar(raw: []const u8, i: *usize) ?u8 {
     return c;
 }
 
-/// Can the current token start an atom?
-fn isAtAtom(self: *Parser) bool {
-    return switch (self.peek().tag) {
-        .char, .dot, .caret, .dollar, .left_paren, .bracket_expr => true,
-        else => false,
-    };
-}
-
 const Scanner = @import("Scanner.zig").Scanner;
 
-fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
+fn parseSource(source: []const u8) Parser.ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);

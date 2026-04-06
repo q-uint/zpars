@@ -492,9 +492,9 @@ fn hasZeroWidthLoop(
 }
 
 const Scanner = @import("abnf/Scanner.zig").Scanner;
-const Parser = @import("abnf/Parser.zig");
+const Parser = @import("abnf/Parser.zig").Parser;
 const PegScanner = @import("peg/Scanner.zig").Scanner;
-const PegParser = @import("peg/Parser.zig");
+const PegParser = @import("peg/Parser.zig").Parser;
 
 const TestResult = struct {
     rules: []const Ast.Rule,

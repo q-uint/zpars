@@ -121,7 +121,8 @@ pub fn serializeBlob(allocator: std.mem.Allocator, blob: Blob) ![]u8 {
 pub fn deserializeBlob(allocator: std.mem.Allocator, data: []const u8) !Blob {
     if (data.len < @sizeOf(Header)) return error.UnexpectedEof;
 
-    const header: *const Header = @ptrCast(@alignCast(data.ptr));
+    var header: Header = undefined;
+    @memcpy(std.mem.asBytes(&header), data[0..@sizeOf(Header)]);
 
     if (!std.mem.eql(u8, &header.magic, &magic)) return error.InvalidMagic;
     if (header.version != version) return error.UnsupportedVersion;
@@ -159,7 +160,7 @@ pub fn deserializeBlob(allocator: std.mem.Allocator, data: []const u8) !Blob {
     @memcpy(std.mem.sliceAsBytes(jump_table), data[off..jt_end]);
 
     return .{
-        .header = header.*,
+        .header = header,
         .native_code = native_code,
         .charsets = charsets,
         .string_data = string_data,
@@ -175,12 +176,12 @@ pub fn freeBlob(allocator: std.mem.Allocator, blob: *Blob) void {
 }
 
 const testing = std.testing;
-const Compiler = @import("Compiler.zig");
+const Compiler = @import("Compiler.zig").Compiler;
 const AotRuntime = @import("AotRuntime.zig");
 const EreScanner = @import("../ere/Scanner.zig").Scanner;
-const EreParser = @import("../ere/Parser.zig");
+const EreParser = @import("../ere/Parser.zig").Parser;
 const PegScanner = @import("../peg/Scanner.zig").Scanner;
-const PegParser = @import("../peg/Parser.zig");
+const PegParser = @import("../peg/Parser.zig").Parser;
 
 fn compileEre(source: []const u8) Compiler {
     var scanner = EreScanner.init(source);

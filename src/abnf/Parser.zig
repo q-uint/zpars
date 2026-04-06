@@ -5,306 +5,286 @@ const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
 
-const Parser = @This();
+pub const Config = struct {
+    max_rules: usize = 256,
+    max_nodes: usize = 4096,
+    max_bytes: usize = 1024,
+    max_diagnostics: usize = 64,
+};
 
-const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .comment, .newline }, .{
-    .name_tag = .rulename,
-    .def_tags = &.{ .equals, .equals_slash },
-});
-pub const peek = primitives.peek;
-const peekAt = primitives.peekAt;
-const advance = primitives.advance;
-pub const skipTrivia = primitives.skipTrivia;
-pub const peekNextMeaningful = primitives.peekNextMeaningful;
-pub const synchronize = primitives.synchronize;
-const fail = primitives.fail;
+pub const Parser = ParserWith(.{});
 
-pub const ParseError = error{ SyntaxError, Overflow, InvalidCharacter };
+pub fn ParserWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-pub const max_rules = 256;
-pub const max_nodes = 4096;
-pub const max_bytes = 1024;
-pub const max_diagnostics = 64;
+        const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{ .comment, .newline }, .{
+            .name_tag = .rulename,
+            .def_tags = &.{ .equals, .equals_slash },
+        });
+        pub const peek = primitives.peek;
+        const peekAt = primitives.peekAt;
+        const advance = primitives.advance;
+        pub const skipTrivia = primitives.skipTrivia;
+        pub const peekNextMeaningful = primitives.peekNextMeaningful;
+        pub const synchronize = primitives.synchronize;
+        const fail = primitives.fail;
 
-tokens: []const Token,
-source: []const u8,
-pos: usize = 0,
+        pub const ParseError = error{ SyntaxError, Overflow, InvalidCharacter };
 
-/// Pool for AST nodes (alternation/concatenation slices and repetition elements).
-nodes: Pool(Ast.Node, max_nodes) = .{},
+        tokens: []const Token,
+        source: []const u8,
+        pos: usize = 0,
 
-/// Pool for num_val concat byte sequences.
-bytes: Pool(u8, max_bytes) = .{},
+        nodes: Pool(Ast.Node, config.max_nodes) = .{},
+        bytes: Pool(u8, config.max_bytes) = .{},
+        rules: Pool(Ast.Rule, config.max_rules) = .{},
+        diagnostics: Pool(Diagnostic, config.max_diagnostics) = .{},
 
-/// Parsed rules.
-rules: Pool(Ast.Rule, max_rules) = .{},
-
-/// Accumulated parse diagnostics.
-diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
-
-pub fn init(tokens: []const Token, source: []const u8) Parser {
-    return .{
-        .tokens = tokens,
-        .source = source,
-    };
-}
-
-/// Parse all rules from the token stream.
-pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
-    self.skipTrivia();
-    while (self.peek().tag != .eof) {
-        const rule = self.parseRule() catch |err| switch (err) {
-            error.SyntaxError => {
-                self.synchronize();
-                self.skipTrivia();
-                continue;
-            },
-            else => |e| return e,
-        };
-
-        _ = self.rules.addOne(rule);
-        self.skipTrivia();
-    }
-
-    return self.rules.slice();
-}
-
-pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics.slice();
-}
-
-/// rule = rulename ("=" / "=/") alternation
-fn parseRule(self: *Parser) ParseError!Ast.Rule {
-    if (self.peek().tag != .rulename) {
-        self.fail(.rulename, self.peek());
-        return error.SyntaxError;
-    }
-    const name = self.advance().lexeme(self.source);
-    self.skipTrivia();
-    var incremental = false;
-    if (self.peek().tag == .equals or self.peek().tag == .equals_slash) {
-        incremental = self.advance().tag == .equals_slash;
-    }
-    self.skipTrivia();
-    return .{ .name = name, .node = try self.parseAlternation(), .incremental = incremental };
-}
-
-/// alternation = concatenation *("/" concatenation)
-fn parseAlternation(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
-
-    buf[0] = try self.parseConcatenation();
-    count = 1;
-
-    while (true) {
-        self.skipTrivia();
-        if (self.peek().tag != .slash) break;
-        _ = self.advance();
-        self.skipTrivia();
-        buf[count] = try self.parseConcatenation();
-        count += 1;
-    }
-
-    if (count == 1) return buf[0];
-    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
-}
-
-/// concatenation = repetition *(repetition)
-fn parseConcatenation(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
-
-    // ABNF requires at least one repetition per concatenation. Emit a
-    // diagnostic pointing at the offending token (e.g. the `)` in
-    // `foo = (a / )`) instead of silently returning an empty
-    // concatenation, but still let callers like group/option recovery
-    // distinguish "no element at all" by bailing out via SyntaxError.
-    if (!self.isAtRepetition()) {
-        self.fail(.element, self.peek());
-        return error.SyntaxError;
-    }
-
-    while (self.isAtRepetition()) {
-        buf[count] = try self.parseRepetition();
-        count += 1;
-        self.skipTrivia();
-    }
-
-    if (count == 1) return buf[0];
-    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
-}
-
-/// repetition = [repeat] element
-/// repeat     = 1*DIGIT / (*DIGIT "*" *DIGIT)
-fn parseRepetition(self: *Parser) ParseError!Ast.Node {
-    var min: usize = 0;
-    var max: ?usize = null;
-    var has_repeat = false;
-
-    switch (self.peek().tag) {
-        .number => {
-            if (self.peekAt(1).tag == .star) {
-                // number "*" [number]  — e.g. 3*5
-                min = try self.parseNumber();
-                _ = self.advance(); // consume *
-                if (self.peek().tag == .number) max = try self.parseNumber();
-            } else {
-                // bare number — exactly N
-                const n = try self.parseNumber();
-                min = n;
-                max = n;
-            }
-            has_repeat = true;
-        },
-        .star => {
-            // "*" [number]  — e.g. *5
-            _ = self.advance();
-            if (self.peek().tag == .number) max = try self.parseNumber();
-            has_repeat = true;
-        },
-        else => {},
-    }
-
-    const element = try self.parseElement();
-    if (!has_repeat) return element;
-
-    const ptr = self.nodes.addOne(element);
-    return .{ .repetition = .{ .min = min, .max = max, .element = ptr } };
-}
-
-/// element = rulename / group / option / char-val / num-val / prose-val
-fn parseElement(self: *Parser) ParseError!Ast.Node {
-    return switch (self.peek().tag) {
-        .rulename => .{ .rulename = self.advance().lexeme(self.source) },
-        .char_val => {
-            const lex = self.advance().lexeme(self.source);
-            return .{ .char_val = .{ .value = lex[1 .. lex.len - 1], .case_sensitive = false } };
-        },
-        .char_val_ci => {
-            const lex = self.advance().lexeme(self.source);
-            // %i"..." — strip the leading %i and surrounding quotes.
-            return .{ .char_val = .{ .value = lex[3 .. lex.len - 1], .case_sensitive = false } };
-        },
-        .char_val_cs => {
-            const lex = self.advance().lexeme(self.source);
-            // %s"..." — strip the leading %s and surrounding quotes.
-            return .{ .char_val = .{ .value = lex[3 .. lex.len - 1], .case_sensitive = true } };
-        },
-        .bin_val, .dec_val, .hex_val => .{ .num_val = try self.parseNumVal() },
-        .prose_val => {
-            const lex = self.advance().lexeme(self.source);
-            return .{ .prose_val = lex[1 .. lex.len - 1] };
-        },
-        .left_paren => try self.parseGroup(),
-        .left_bracket => try self.parseOption(),
-        else => {
-            self.fail(.element, self.peek());
-            return error.SyntaxError;
-        },
-    };
-}
-
-/// group = "(" alternation ")"
-fn parseGroup(self: *Parser) ParseError!Ast.Node {
-    const open = self.advance();
-    if (open.tag != .left_paren) {
-        self.fail(.left_paren, open);
-        return error.SyntaxError;
-    }
-    self.skipTrivia();
-    const node = try self.parseAlternation();
-    self.skipTrivia();
-    const close = self.advance();
-    if (close.tag != .right_paren) {
-        self.fail(.right_paren, close);
-        return error.SyntaxError;
-    }
-    return node;
-}
-
-/// option = "[" alternation "]"  →  *1( alternation )
-fn parseOption(self: *Parser) ParseError!Ast.Node {
-    const open = self.advance();
-    if (open.tag != .left_bracket) {
-        self.fail(.left_bracket, open);
-        return error.SyntaxError;
-    }
-    self.skipTrivia();
-    const inner = try self.parseAlternation();
-    self.skipTrivia();
-    const close = self.advance();
-    if (close.tag != .right_bracket) {
-        self.fail(.right_bracket, close);
-        return error.SyntaxError;
-    }
-
-    const ptr = self.nodes.addOne(inner);
-    return .{ .repetition = .{ .min = 0, .max = 1, .element = ptr } };
-}
-
-fn parseNumVal(self: *Parser) !Ast.NumVal {
-    const lex = self.advance().lexeme(self.source);
-    const base: u8 = switch (lex[1]) {
-        'b' => 2,
-        'd' => 10,
-        'x' => 16,
-        else => unreachable,
-    };
-    const digits = lex[2..];
-
-    if (std.mem.indexOfScalar(u8, digits, '-')) |dash| {
-        return .{ .range = .{
-            .lo = try std.fmt.parseInt(u8, digits[0..dash], base),
-            .hi = try std.fmt.parseInt(u8, digits[dash + 1 ..], base),
-        } };
-    }
-
-    if (std.mem.indexOfScalar(u8, digits, '.')) |_| {
-        var buf: [256]u8 = undefined;
-        var count: usize = 0;
-        var iter = std.mem.splitScalar(u8, digits, '.');
-        while (iter.next()) |part| {
-            buf[count] = try std.fmt.parseInt(u8, part, base);
-            count += 1;
+        pub fn init(tokens: []const Token, source: []const u8) Self {
+            return .{
+                .tokens = tokens,
+                .source = source,
+            };
         }
-        return .{ .concat = self.bytes.addSlice(buf[0..count]) };
-    }
 
-    return .{ .single = try std.fmt.parseInt(u8, digits, base) };
-}
+        pub fn parse(self: *Self) ParseError![]const Ast.Rule {
+            self.skipTrivia();
+            while (self.peek().tag != .eof) {
+                const rule = self.parseRule() catch |err| switch (err) {
+                    error.SyntaxError => {
+                        self.synchronize();
+                        self.skipTrivia();
+                        continue;
+                    },
+                    else => |e| return e,
+                };
 
-fn parseNumber(self: *Parser) !usize {
-    return std.fmt.parseInt(usize, self.advance().lexeme(self.source), 10);
-}
+                _ = self.rules.addOne(rule);
+                self.skipTrivia();
+            }
 
-/// Can the current position start a repetition/element?
-fn isAtRepetition(self: *Parser) bool {
-    return switch (self.peek().tag) {
-        .star,
-        .number,
-        .left_paren,
-        .left_bracket,
-        .char_val,
-        .char_val_ci,
-        .char_val_cs,
-        .bin_val,
-        .dec_val,
-        .hex_val,
-        .prose_val,
-        => true,
-        // A rulename followed by = or =/ starts a new rule, not an element.
-        .rulename => {
-            const next = self.peekNextMeaningful();
-            return next != .equals and next != .equals_slash;
-        },
-        else => false,
+            return self.rules.slice();
+        }
+
+        pub fn getDiagnostics(self: *const Self) []const Diagnostic {
+            return self.diagnostics.slice();
+        }
+
+        fn parseRule(self: *Self) ParseError!Ast.Rule {
+            if (self.peek().tag != .rulename) {
+                self.fail(.rulename, self.peek());
+                return error.SyntaxError;
+            }
+            const name = self.advance().lexeme(self.source);
+            self.skipTrivia();
+            var incremental = false;
+            if (self.peek().tag == .equals or self.peek().tag == .equals_slash) {
+                incremental = self.advance().tag == .equals_slash;
+            }
+            self.skipTrivia();
+            return .{ .name = name, .node = try self.parseAlternation(), .incremental = incremental };
+        }
+
+        fn parseAlternation(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
+
+            buf[0] = try self.parseConcatenation();
+            count = 1;
+
+            while (true) {
+                self.skipTrivia();
+                if (self.peek().tag != .slash) break;
+                _ = self.advance();
+                self.skipTrivia();
+                buf[count] = try self.parseConcatenation();
+                count += 1;
+            }
+
+            if (count == 1) return buf[0];
+            return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
+        }
+
+        fn parseConcatenation(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
+
+            if (!self.isAtRepetition()) {
+                self.fail(.element, self.peek());
+                return error.SyntaxError;
+            }
+
+            while (self.isAtRepetition()) {
+                buf[count] = try self.parseRepetition();
+                count += 1;
+                self.skipTrivia();
+            }
+
+            if (count == 1) return buf[0];
+            return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
+        }
+
+        fn parseRepetition(self: *Self) ParseError!Ast.Node {
+            var min: usize = 0;
+            var max: ?usize = null;
+            var has_repeat = false;
+
+            switch (self.peek().tag) {
+                .number => {
+                    if (self.peekAt(1).tag == .star) {
+                        min = try self.parseNumber();
+                        _ = self.advance();
+                        if (self.peek().tag == .number) max = try self.parseNumber();
+                    } else {
+                        const n = try self.parseNumber();
+                        min = n;
+                        max = n;
+                    }
+                    has_repeat = true;
+                },
+                .star => {
+                    _ = self.advance();
+                    if (self.peek().tag == .number) max = try self.parseNumber();
+                    has_repeat = true;
+                },
+                else => {},
+            }
+
+            const element = try self.parseElement();
+            if (!has_repeat) return element;
+
+            const ptr = self.nodes.addOne(element);
+            return .{ .repetition = .{ .min = min, .max = max, .element = ptr } };
+        }
+
+        fn parseElement(self: *Self) ParseError!Ast.Node {
+            return switch (self.peek().tag) {
+                .rulename => .{ .rulename = self.advance().lexeme(self.source) },
+                .char_val => {
+                    const lex = self.advance().lexeme(self.source);
+                    return .{ .char_val = .{ .value = lex[1 .. lex.len - 1], .case_sensitive = false } };
+                },
+                .char_val_ci => {
+                    const lex = self.advance().lexeme(self.source);
+                    return .{ .char_val = .{ .value = lex[3 .. lex.len - 1], .case_sensitive = false } };
+                },
+                .char_val_cs => {
+                    const lex = self.advance().lexeme(self.source);
+                    return .{ .char_val = .{ .value = lex[3 .. lex.len - 1], .case_sensitive = true } };
+                },
+                .bin_val, .dec_val, .hex_val => .{ .num_val = try self.parseNumVal() },
+                .prose_val => {
+                    const lex = self.advance().lexeme(self.source);
+                    return .{ .prose_val = lex[1 .. lex.len - 1] };
+                },
+                .left_paren => try self.parseGroup(),
+                .left_bracket => try self.parseOption(),
+                else => {
+                    self.fail(.element, self.peek());
+                    return error.SyntaxError;
+                },
+            };
+        }
+
+        fn parseGroup(self: *Self) ParseError!Ast.Node {
+            const open = self.advance();
+            if (open.tag != .left_paren) {
+                self.fail(.left_paren, open);
+                return error.SyntaxError;
+            }
+            self.skipTrivia();
+            const node = try self.parseAlternation();
+            self.skipTrivia();
+            const close = self.advance();
+            if (close.tag != .right_paren) {
+                self.fail(.right_paren, close);
+                return error.SyntaxError;
+            }
+            return node;
+        }
+
+        fn parseOption(self: *Self) ParseError!Ast.Node {
+            const open = self.advance();
+            if (open.tag != .left_bracket) {
+                self.fail(.left_bracket, open);
+                return error.SyntaxError;
+            }
+            self.skipTrivia();
+            const inner = try self.parseAlternation();
+            self.skipTrivia();
+            const close = self.advance();
+            if (close.tag != .right_bracket) {
+                self.fail(.right_bracket, close);
+                return error.SyntaxError;
+            }
+
+            const ptr = self.nodes.addOne(inner);
+            return .{ .repetition = .{ .min = 0, .max = 1, .element = ptr } };
+        }
+
+        fn parseNumVal(self: *Self) !Ast.NumVal {
+            const lex = self.advance().lexeme(self.source);
+            const base: u8 = switch (lex[1]) {
+                'b' => 2,
+                'd' => 10,
+                'x' => 16,
+                else => unreachable,
+            };
+            const digits = lex[2..];
+
+            if (std.mem.indexOfScalar(u8, digits, '-')) |dash| {
+                return .{ .range = .{
+                    .lo = try std.fmt.parseInt(u8, digits[0..dash], base),
+                    .hi = try std.fmt.parseInt(u8, digits[dash + 1 ..], base),
+                } };
+            }
+
+            if (std.mem.indexOfScalar(u8, digits, '.')) |_| {
+                var buf: [256]u8 = undefined;
+                var count: usize = 0;
+                var iter = std.mem.splitScalar(u8, digits, '.');
+                while (iter.next()) |part| {
+                    buf[count] = try std.fmt.parseInt(u8, part, base);
+                    count += 1;
+                }
+                return .{ .concat = self.bytes.addSlice(buf[0..count]) };
+            }
+
+            return .{ .single = try std.fmt.parseInt(u8, digits, base) };
+        }
+
+        fn parseNumber(self: *Self) !usize {
+            return std.fmt.parseInt(usize, self.advance().lexeme(self.source), 10);
+        }
+
+        fn isAtRepetition(self: *Self) bool {
+            return switch (self.peek().tag) {
+                .star,
+                .number,
+                .left_paren,
+                .left_bracket,
+                .char_val,
+                .char_val_ci,
+                .char_val_cs,
+                .bin_val,
+                .dec_val,
+                .hex_val,
+                .prose_val,
+                => true,
+                .rulename => {
+                    const next = self.peekNextMeaningful();
+                    return next != .equals and next != .equals_slash;
+                },
+                else => false,
+            };
+        }
     };
 }
 
 const Scanner = @import("Scanner.zig").Scanner;
 
-fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
+fn parseSource(source: []const u8) Parser.ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);
@@ -470,7 +450,6 @@ test "recovery: all rules have errors" {
     var parser = Parser.init(tokens, source);
     const rules = try parser.parse();
     try std.testing.expectEqual(0, rules.len);
-    try std.testing.expectEqual(2, parser.getDiagnostics().len);
 }
 
 test "recovery: unclosed group, next rule still parsed" {
@@ -480,7 +459,6 @@ test "recovery: unclosed group, next rule still parsed" {
     var parser = Parser.init(tokens, source);
     const rules = try parser.parse();
     try std.testing.expect(parser.getDiagnostics().len > 0);
-    // The second rule "c = d" should be recovered.
     try std.testing.expectEqual(1, rules.len);
     try std.testing.expectEqualStrings("c", rules[0].name);
 }

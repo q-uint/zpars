@@ -5,7 +5,7 @@
 /// backend is selected at comptime.
 const std = @import("std");
 const I = @import("Instruction.zig");
-const Vm = @import("Vm.zig");
+const Vm = @import("Vm.zig").Vm;
 
 const Jit = @This();
 
@@ -114,9 +114,11 @@ pub fn execute(self: *Jit) ?usize {
 }
 
 pub fn getCapture(self: *const Jit, i: u16) ?Vm.Span {
-    const s = self.captures_buf[i * 2];
+    const slot: usize = @as(usize, i) * 2;
+    if (slot + 1 >= max_captures) return null;
+    const s = self.captures_buf[slot];
     if (s == null_cap) return null;
-    const e = self.captures_buf[i * 2 + 1];
+    const e = self.captures_buf[slot + 1];
     if (e == null_cap) return null;
     return .{ .start = @intCast(s), .end = @intCast(e) };
 }
@@ -149,11 +151,11 @@ pub fn helperCharsetMatch(
 }
 
 const testing = std.testing;
-const Compiler = @import("Compiler.zig");
+const Compiler = @import("Compiler.zig").Compiler;
 const EreScanner = @import("../ere/Scanner.zig").Scanner;
-const EreParser = @import("../ere/Parser.zig");
+const EreParser = @import("../ere/Parser.zig").Parser;
 const PegScanner = @import("../peg/Scanner.zig").Scanner;
-const PegParser = @import("../peg/Parser.zig");
+const PegParser = @import("../peg/Parser.zig").Parser;
 
 fn compileEre(source: []const u8) Compiler {
     var scanner = EreScanner.init(source);

@@ -1,4 +1,4 @@
-/// PEG parser — produces an AST from a PEG token stream.
+/// PEG parser -- produces an AST from a PEG token stream.
 ///
 /// Grammar (Bryan Ford, 2004):
 ///   Grammar    <- Spacing Definition+ EndOfFile
@@ -17,394 +17,402 @@ const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
 
-const Parser = @This();
+pub const Config = struct {
+    max_rules: usize = 256,
+    max_nodes: usize = 4096,
+    max_ranges: usize = 1024,
+    max_bytes: usize = 1024,
+    max_diagnostics: usize = 64,
+};
 
-const primitives = parser_base.ParserBase(Parser, Token, Diagnostic, &.{ .comment, .newline }, .{
-    .name_tag = .identifier,
-    .def_tags = &.{.left_arrow},
-});
-pub const peek = primitives.peek;
-const advance = primitives.advance;
-pub const skipTrivia = primitives.skipTrivia;
-pub const peekNextMeaningful = primitives.peekNextMeaningful;
-pub const synchronize = primitives.synchronize;
-const fail = primitives.fail;
+pub const Parser = ParserWith(.{});
 
-pub const ParseError = error{ SyntaxError, Overflow };
+pub fn ParserWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-pub const max_rules = 256;
-pub const max_nodes = 4096;
-pub const max_ranges = 1024;
-pub const max_bytes = 1024;
-pub const max_diagnostics = 64;
+        const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{ .comment, .newline }, .{
+            .name_tag = .identifier,
+            .def_tags = &.{.left_arrow},
+        });
+        pub const peek = primitives.peek;
+        const advance = primitives.advance;
+        pub const skipTrivia = primitives.skipTrivia;
+        pub const peekNextMeaningful = primitives.peekNextMeaningful;
+        pub const synchronize = primitives.synchronize;
+        const fail = primitives.fail;
 
-tokens: []const Token,
-source: []const u8,
-pos: usize = 0,
+        pub const ParseError = error{ SyntaxError, Overflow };
 
-/// Pool for AST nodes.
-nodes: Pool(Ast.Node, max_nodes) = .{},
+        tokens: []const Token,
+        source: []const u8,
+        pos: usize = 0,
 
-/// Pool for ClassRange entries.
-ranges: Pool(Ast.ClassRange, max_ranges) = .{},
+        /// Pool for AST nodes.
+        nodes: Pool(Ast.Node, config.max_nodes) = .{},
 
-/// Pool for decoded literal bytes.
-bytes: Pool(u8, max_bytes) = .{},
+        /// Pool for ClassRange entries.
+        ranges: Pool(Ast.ClassRange, config.max_ranges) = .{},
 
-/// Parsed rules.
-rules: Pool(Ast.Rule, max_rules) = .{},
+        /// Pool for decoded literal bytes.
+        bytes: Pool(u8, config.max_bytes) = .{},
 
-/// Accumulated parse diagnostics.
-diagnostics: Pool(Diagnostic, max_diagnostics) = .{},
+        /// Parsed rules.
+        rules: Pool(Ast.Rule, config.max_rules) = .{},
 
-pub fn init(tokens: []const Token, source: []const u8) Parser {
-    return .{
-        .tokens = tokens,
-        .source = source,
-    };
-}
+        /// Accumulated parse diagnostics.
+        diagnostics: Pool(Diagnostic, config.max_diagnostics) = .{},
 
-/// Parse all definitions from the token stream.
-pub fn parse(self: *Parser) ParseError![]const Ast.Rule {
-    self.skipTrivia();
-    while (self.peek().tag != .eof) {
-        const rule = self.parseDefinition() catch |err| switch (err) {
-            error.SyntaxError => {
-                self.synchronize();
+        pub fn init(tokens: []const Token, source: []const u8) Self {
+            return .{
+                .tokens = tokens,
+                .source = source,
+            };
+        }
+
+        /// Parse all definitions from the token stream.
+        pub fn parse(self: *Self) ParseError![]const Ast.Rule {
+            self.skipTrivia();
+            while (self.peek().tag != .eof) {
+                const rule = self.parseDefinition() catch |err| switch (err) {
+                    error.SyntaxError => {
+                        self.synchronize();
+                        self.skipTrivia();
+                        continue;
+                    },
+                    else => |e| return e,
+                };
+
+                _ = self.rules.addOne(rule);
                 self.skipTrivia();
-                continue;
-            },
-            else => |e| return e,
-        };
+            }
 
-        _ = self.rules.addOne(rule);
-        self.skipTrivia();
-    }
+            return self.rules.slice();
+        }
 
-    return self.rules.slice();
-}
+        pub fn getDiagnostics(self: *const Self) []const Diagnostic {
+            return self.diagnostics.slice();
+        }
 
-pub fn getDiagnostics(self: *const Parser) []const Diagnostic {
-    return self.diagnostics.slice();
-}
+        /// Definition <- Identifier LEFTARROW Expression
+        fn parseDefinition(self: *Self) ParseError!Ast.Rule {
+            if (self.peek().tag != .identifier) {
+                self.fail(.identifier, self.peek());
+                return error.SyntaxError;
+            }
+            const name = self.advance().lexeme(self.source);
+            self.skipTrivia();
 
-/// Definition <- Identifier LEFTARROW Expression
-fn parseDefinition(self: *Parser) ParseError!Ast.Rule {
-    if (self.peek().tag != .identifier) {
-        self.fail(.identifier, self.peek());
-        return error.SyntaxError;
-    }
-    const name = self.advance().lexeme(self.source);
-    self.skipTrivia();
+            if (self.peek().tag != .left_arrow) {
+                self.fail(.left_arrow, self.peek());
+                return error.SyntaxError;
+            }
+            _ = self.advance(); // consume <-
+            self.skipTrivia();
 
-    if (self.peek().tag != .left_arrow) {
-        self.fail(.left_arrow, self.peek());
-        return error.SyntaxError;
-    }
-    _ = self.advance(); // consume <-
-    self.skipTrivia();
-
-    const node = try self.parseExpression();
-    // After the expression we must be at eof or the start of the next
-    // definition (`identifier <-`). Anything else (stray `)`, `/`
-    // without a follow-up sequence, etc.) is a syntax error that
-    // should abort this definition so the error-recovery path in
-    // `parse()` can sync to the next rule.
-    self.skipTrivia();
-    if (!self.isDefinitionBoundary()) {
-        self.fail(.expression, self.peek());
-        return error.SyntaxError;
-    }
-    return .{ .name = name, .node = node, .incremental = false };
-}
-
-/// True when the current position marks the end of a definition body:
-/// either eof, or an `identifier` immediately followed by `<-`.
-fn isDefinitionBoundary(self: *Parser) bool {
-    const tag = self.peek().tag;
-    if (tag == .eof) return true;
-    if (tag != .identifier) return false;
-    return self.peekNextMeaningful() == .left_arrow;
-}
-
-/// Expression <- Sequence (SLASH Sequence)*
-fn parseExpression(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
-
-    buf[0] = try self.parseSequence();
-    count = 1;
-
-    while (true) {
-        self.skipTrivia();
-        if (self.peek().tag != .slash) break;
-        _ = self.advance();
-        self.skipTrivia();
-        buf[count] = try self.parseSequence();
-        count += 1;
-    }
-
-    if (count == 1) return buf[0];
-    return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
-}
-
-/// Sequence <- Prefix*
-fn parseSequence(self: *Parser) ParseError!Ast.Node {
-    var buf: [256]Ast.Node = undefined;
-    var count: usize = 0;
-
-    while (self.isAtPrefix()) {
-        buf[count] = try self.parsePrefix();
-        count += 1;
-        self.skipTrivia();
-    }
-
-    if (count == 0) {
-        // Empty sequence — matches empty string. Represent as empty concat.
-        return .{ .concatenation = self.nodes.addSlice(buf[0..0]) };
-    }
-    if (count == 1) return buf[0];
-    return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
-}
-
-/// Prefix <- (AND / NOT)? Suffix
-fn parsePrefix(self: *Parser) ParseError!Ast.Node {
-    const tag = self.peek().tag;
-    if (tag == .@"and") {
-        _ = self.advance();
-        self.skipTrivia();
-        const inner = try self.parseSuffix();
-        return .{ .and_predicate = self.nodes.addOne(inner) };
-    }
-    if (tag == .not) {
-        _ = self.advance();
-        self.skipTrivia();
-        const inner = try self.parseSuffix();
-        return .{ .not_predicate = self.nodes.addOne(inner) };
-    }
-    return self.parseSuffix();
-}
-
-/// Suffix <- Primary (QUESTION / STAR / PLUS)?
-fn parseSuffix(self: *Parser) ParseError!Ast.Node {
-    const primary = try self.parsePrimary();
-
-    return switch (self.peek().tag) {
-        .question => {
-            _ = self.advance();
-            return .{ .repetition = .{ .min = 0, .max = 1, .element = self.nodes.addOne(primary) } };
-        },
-        .star => {
-            _ = self.advance();
-            return .{ .repetition = .{ .min = 0, .max = null, .element = self.nodes.addOne(primary) } };
-        },
-        .plus => {
-            _ = self.advance();
-            return .{ .repetition = .{ .min = 1, .max = null, .element = self.nodes.addOne(primary) } };
-        },
-        else => primary,
-    };
-}
-
-/// Primary <- Identifier !LEFTARROW
-///          / OPEN Expression CLOSE
-///          / Literal / Class / DOT
-fn parsePrimary(self: *Parser) ParseError!Ast.Node {
-    return switch (self.peek().tag) {
-        .identifier => {
-            // Only treat as reference if not followed by <-
-            const next = self.peekNextMeaningful();
-            if (next == .left_arrow) {
+            const node = try self.parseExpression();
+            // After the expression we must be at eof or the start of the next
+            // definition (`identifier <-`). Anything else (stray `)`, `/`
+            // without a follow-up sequence, etc.) is a syntax error that
+            // should abort this definition so the error-recovery path in
+            // `parse()` can sync to the next rule.
+            self.skipTrivia();
+            if (!self.isDefinitionBoundary()) {
                 self.fail(.expression, self.peek());
                 return error.SyntaxError;
             }
-            return .{ .rulename = self.advance().lexeme(self.source) };
-        },
-        .left_paren => {
-            _ = self.advance(); // consume (
-            self.skipTrivia();
-            const expr = try self.parseExpression();
-            self.skipTrivia();
-            if (self.peek().tag != .right_paren) {
-                self.fail(.right_paren, self.peek());
-                return error.SyntaxError;
+            return .{ .name = name, .node = node, .incremental = false };
+        }
+
+        /// True when the current position marks the end of a definition body:
+        /// either eof, or an `identifier` immediately followed by `<-`.
+        fn isDefinitionBoundary(self: *Self) bool {
+            const tag = self.peek().tag;
+            if (tag == .eof) return true;
+            if (tag != .identifier) return false;
+            return self.peekNextMeaningful() == .left_arrow;
+        }
+
+        /// Expression <- Sequence (SLASH Sequence)*
+        fn parseExpression(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
+
+            buf[0] = try self.parseSequence();
+            count = 1;
+
+            while (true) {
+                self.skipTrivia();
+                if (self.peek().tag != .slash) break;
+                _ = self.advance();
+                self.skipTrivia();
+                buf[count] = try self.parseSequence();
+                count += 1;
             }
-            _ = self.advance(); // consume )
-            return expr;
-        },
-        .literal => self.parseLiteral(),
-        .char_class => self.parseCharClass(),
-        .dot => {
-            _ = self.advance();
-            return .any;
-        },
-        else => {
-            self.fail(.expression, self.peek());
-            return error.SyntaxError;
-        },
-    };
-}
 
-fn parseLiteral(self: *Parser) Ast.Node {
-    const lex = self.advance().lexeme(self.source);
-    // Strip surrounding quotes, decode escapes.
-    const inner = lex[1 .. lex.len - 1];
-    const decoded = self.decodeEscapes(inner);
-    return .{ .char_val = .{ .value = decoded, .case_sensitive = true } };
-}
+            if (count == 1) return buf[0];
+            return .{ .alternation = self.nodes.addSlice(buf[0..count]) };
+        }
 
-fn decodeEscapes(self: *Parser, raw: []const u8) []const u8 {
-    // Fast path: no backslashes.
-    if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+        /// Sequence <- Prefix*
+        fn parseSequence(self: *Self) ParseError!Ast.Node {
+            var buf: [256]Ast.Node = undefined;
+            var count: usize = 0;
 
-    const start = self.bytes.count;
-    var i: usize = 0;
-    while (i < raw.len) {
-        if (raw[i] == '\\' and i + 1 < raw.len) {
-            i += 1;
-            const c = raw[i];
-            const decoded: u8 = switch (c) {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '\'', '"', '[', ']', '\\' => c,
-                '0'...'2' => blk: {
-                    // Possible octal: up to 3 digits.
-                    const result = self.decodeOctal(raw, &i);
-                    if (result) |val| break :blk val;
-                    // Not a valid octal sequence, treat as literal.
-                    _ = self.bytes.addOne('\\');
-                    break :blk c;
+            while (self.isAtPrefix()) {
+                buf[count] = try self.parsePrefix();
+                count += 1;
+                self.skipTrivia();
+            }
+
+            if (count == 0) {
+                // Empty sequence -- matches empty string. Represent as empty concat.
+                return .{ .concatenation = self.nodes.addSlice(buf[0..0]) };
+            }
+            if (count == 1) return buf[0];
+            return .{ .concatenation = self.nodes.addSlice(buf[0..count]) };
+        }
+
+        /// Prefix <- (AND / NOT)? Suffix
+        fn parsePrefix(self: *Self) ParseError!Ast.Node {
+            const tag = self.peek().tag;
+            if (tag == .@"and") {
+                _ = self.advance();
+                self.skipTrivia();
+                const inner = try self.parseSuffix();
+                return .{ .and_predicate = self.nodes.addOne(inner) };
+            }
+            if (tag == .not) {
+                _ = self.advance();
+                self.skipTrivia();
+                const inner = try self.parseSuffix();
+                return .{ .not_predicate = self.nodes.addOne(inner) };
+            }
+            return self.parseSuffix();
+        }
+
+        /// Suffix <- Primary (QUESTION / STAR / PLUS)?
+        fn parseSuffix(self: *Self) ParseError!Ast.Node {
+            const primary = try self.parsePrimary();
+
+            return switch (self.peek().tag) {
+                .question => {
+                    _ = self.advance();
+                    return .{ .repetition = .{ .min = 0, .max = 1, .element = self.nodes.addOne(primary) } };
                 },
-                else => blk: {
-                    // Unknown escape — keep backslash.
-                    _ = self.bytes.addOne('\\');
-                    break :blk c;
+                .star => {
+                    _ = self.advance();
+                    return .{ .repetition = .{ .min = 0, .max = null, .element = self.nodes.addOne(primary) } };
+                },
+                .plus => {
+                    _ = self.advance();
+                    return .{ .repetition = .{ .min = 1, .max = null, .element = self.nodes.addOne(primary) } };
+                },
+                else => primary,
+            };
+        }
+
+        /// Primary <- Identifier !LEFTARROW
+        ///          / OPEN Expression CLOSE
+        ///          / Literal / Class / DOT
+        fn parsePrimary(self: *Self) ParseError!Ast.Node {
+            return switch (self.peek().tag) {
+                .identifier => {
+                    // Only treat as reference if not followed by <-
+                    const next = self.peekNextMeaningful();
+                    if (next == .left_arrow) {
+                        self.fail(.expression, self.peek());
+                        return error.SyntaxError;
+                    }
+                    return .{ .rulename = self.advance().lexeme(self.source) };
+                },
+                .left_paren => {
+                    _ = self.advance(); // consume (
+                    self.skipTrivia();
+                    const expr = try self.parseExpression();
+                    self.skipTrivia();
+                    if (self.peek().tag != .right_paren) {
+                        self.fail(.right_paren, self.peek());
+                        return error.SyntaxError;
+                    }
+                    _ = self.advance(); // consume )
+                    return expr;
+                },
+                .literal => self.parseLiteral(),
+                .char_class => self.parseCharClass(),
+                .dot => {
+                    _ = self.advance();
+                    return .any;
+                },
+                else => {
+                    self.fail(.expression, self.peek());
+                    return error.SyntaxError;
                 },
             };
-            _ = self.bytes.addOne(decoded);
-            i += 1;
-        } else {
-            _ = self.bytes.addOne(raw[i]);
-            i += 1;
         }
-    }
-    return self.bytes.items[start..self.bytes.count];
-}
 
-/// Try to decode an octal escape starting at raw[*i].
-/// *i points to the first octal digit.
-/// Returns the decoded byte if valid, null otherwise.
-/// On success, *i is advanced to the last digit (caller will do +1).
-fn decodeOctal(self: *Parser, raw: []const u8, i: *usize) ?u8 {
-    _ = self;
-    const start = i.*;
-    // Need at least 2 digits for a valid octal escape.
-    if (start + 1 >= raw.len) return null;
-    if (!isOctalDigit(raw[start + 1])) return null;
-
-    // 3-digit octal (0-2, 0-7, 0-7)
-    if (start + 2 < raw.len and isOctalDigit(raw[start + 2])) {
-        const val = (@as(u16, raw[start] - '0') * 64) +
-            (@as(u16, raw[start + 1] - '0') * 8) +
-            @as(u16, raw[start + 2] - '0');
-        if (val <= 255) {
-            i.* = start + 2; // advance past all 3 digits (caller does +1)
-            return @intCast(val);
+        fn parseLiteral(self: *Self) Ast.Node {
+            const lex = self.advance().lexeme(self.source);
+            // Strip surrounding quotes, decode escapes.
+            const inner = lex[1 .. lex.len - 1];
+            const decoded = self.decodeEscapes(inner);
+            return .{ .char_val = .{ .value = decoded, .case_sensitive = true } };
         }
-        return null;
-    }
 
-    // 2-digit octal
-    const val = (raw[start] - '0') * 8 + (raw[start + 1] - '0');
-    i.* = start + 1;
-    return val;
-}
+        fn decodeEscapes(self: *Self, raw: []const u8) []const u8 {
+            // Fast path: no backslashes.
+            if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
 
-fn isOctalDigit(c: u8) bool {
-    return c >= '0' and c <= '7';
-}
-
-fn parseCharClass(self: *Parser) Ast.Node {
-    const lex = self.advance().lexeme(self.source);
-    // Strip surrounding brackets: [content]
-    const inner = lex[1 .. lex.len - 1];
-
-    const start = self.ranges.count;
-    var i: usize = 0;
-    while (i < inner.len) {
-        const lo = self.decodeClassChar(inner, &i) orelse break;
-        // Check for range: char '-' char
-        if (i + 1 < inner.len and inner[i] == '-') {
-            i += 1; // skip '-'
-            const hi = self.decodeClassChar(inner, &i) orelse {
-                // Malformed range — treat '-' as literal.
-                _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
-                _ = self.ranges.addOne(.{ .lo = '-', .hi = '-' });
-                break;
-            };
-            _ = self.ranges.addOne(.{ .lo = lo, .hi = hi });
-        } else {
-            _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
-        }
-    }
-
-    return .{ .char_class = self.ranges.items[start..self.ranges.count] };
-}
-
-/// Decode one character from a character class body, advancing *i past it.
-fn decodeClassChar(self: *Parser, raw: []const u8, i: *usize) ?u8 {
-    if (i.* >= raw.len) return null;
-    if (raw[i.*] == '\\' and i.* + 1 < raw.len) {
-        i.* += 1;
-        const c = raw[i.*];
-        i.* += 1;
-        return switch (c) {
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            '\'', '"', '[', ']', '\\' => c,
-            '0'...'2' => {
-                // Try octal.
-                var oi = i.* - 1;
-                if (self.decodeOctal(raw, &oi)) |val| {
-                    i.* = oi + 1;
-                    return val;
+            const start = self.bytes.count;
+            var i: usize = 0;
+            while (i < raw.len) {
+                if (raw[i] == '\\' and i + 1 < raw.len) {
+                    i += 1;
+                    const c = raw[i];
+                    const decoded: u8 = switch (c) {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '\'', '"', '[', ']', '\\' => c,
+                        '0'...'2' => blk: {
+                            // Possible octal: up to 3 digits.
+                            const result = self.decodeOctal(raw, &i);
+                            if (result) |val| break :blk val;
+                            // Not a valid octal sequence, treat as literal.
+                            _ = self.bytes.addOne('\\');
+                            break :blk c;
+                        },
+                        else => blk: {
+                            // Unknown escape -- keep backslash.
+                            _ = self.bytes.addOne('\\');
+                            break :blk c;
+                        },
+                    };
+                    _ = self.bytes.addOne(decoded);
+                    i += 1;
+                } else {
+                    _ = self.bytes.addOne(raw[i]);
+                    i += 1;
                 }
-                return c;
-            },
-            else => c,
-        };
-    }
-    const c = raw[i.*];
-    i.* += 1;
-    return c;
-}
+            }
+            return self.bytes.items[start..self.bytes.count];
+        }
 
-/// Can the current position start a Prefix?
-fn isAtPrefix(self: *Parser) bool {
-    return switch (self.peek().tag) {
-        .@"and", .not => true,
-        else => self.isAtPrimary(),
-    };
-}
+        /// Try to decode an octal escape starting at raw[*i].
+        /// *i points to the first octal digit.
+        /// Returns the decoded byte if valid, null otherwise.
+        /// On success, *i is advanced to the last digit (caller will do +1).
+        fn decodeOctal(self: *Self, raw: []const u8, i: *usize) ?u8 {
+            _ = self;
+            const start = i.*;
+            // Need at least 2 digits for a valid octal escape.
+            if (start + 1 >= raw.len) return null;
+            if (!isOctalDigit(raw[start + 1])) return null;
 
-/// Can the current position start a Primary?
-fn isAtPrimary(self: *Parser) bool {
-    return switch (self.peek().tag) {
-        .left_paren, .literal, .char_class, .dot => true,
-        .identifier => {
-            // An identifier followed by <- starts a new definition, not a reference.
-            const next = self.peekNextMeaningful();
-            return next != .left_arrow;
-        },
-        else => false,
+            // 3-digit octal (0-2, 0-7, 0-7)
+            if (start + 2 < raw.len and isOctalDigit(raw[start + 2])) {
+                const val = (@as(u16, raw[start] - '0') * 64) +
+                    (@as(u16, raw[start + 1] - '0') * 8) +
+                    @as(u16, raw[start + 2] - '0');
+                if (val <= 255) {
+                    i.* = start + 2; // advance past all 3 digits (caller does +1)
+                    return @intCast(val);
+                }
+                return null;
+            }
+
+            // 2-digit octal
+            const val = (raw[start] - '0') * 8 + (raw[start + 1] - '0');
+            i.* = start + 1;
+            return val;
+        }
+
+        fn isOctalDigit(c: u8) bool {
+            return c >= '0' and c <= '7';
+        }
+
+        fn parseCharClass(self: *Self) Ast.Node {
+            const lex = self.advance().lexeme(self.source);
+            // Strip surrounding brackets: [content]
+            const inner = lex[1 .. lex.len - 1];
+
+            const start = self.ranges.count;
+            var i: usize = 0;
+            while (i < inner.len) {
+                const lo = self.decodeClassChar(inner, &i) orelse break;
+                // Check for range: char '-' char
+                if (i + 1 < inner.len and inner[i] == '-') {
+                    i += 1; // skip '-'
+                    const hi = self.decodeClassChar(inner, &i) orelse {
+                        // Malformed range -- treat '-' as literal.
+                        _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
+                        _ = self.ranges.addOne(.{ .lo = '-', .hi = '-' });
+                        break;
+                    };
+                    _ = self.ranges.addOne(.{ .lo = lo, .hi = hi });
+                } else {
+                    _ = self.ranges.addOne(.{ .lo = lo, .hi = lo });
+                }
+            }
+
+            return .{ .char_class = self.ranges.items[start..self.ranges.count] };
+        }
+
+        /// Decode one character from a character class body, advancing *i past it.
+        fn decodeClassChar(self: *Self, raw: []const u8, i: *usize) ?u8 {
+            if (i.* >= raw.len) return null;
+            if (raw[i.*] == '\\' and i.* + 1 < raw.len) {
+                i.* += 1;
+                const c = raw[i.*];
+                i.* += 1;
+                return switch (c) {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\'', '"', '[', ']', '\\' => c,
+                    '0'...'2' => {
+                        // Try octal.
+                        var oi = i.* - 1;
+                        if (self.decodeOctal(raw, &oi)) |val| {
+                            i.* = oi + 1;
+                            return val;
+                        }
+                        return c;
+                    },
+                    else => c,
+                };
+            }
+            const c = raw[i.*];
+            i.* += 1;
+            return c;
+        }
+
+        /// Can the current position start a Prefix?
+        fn isAtPrefix(self: *Self) bool {
+            return switch (self.peek().tag) {
+                .@"and", .not => true,
+                else => self.isAtPrimary(),
+            };
+        }
+
+        /// Can the current position start a Primary?
+        fn isAtPrimary(self: *Self) bool {
+            return switch (self.peek().tag) {
+                .left_paren, .literal, .char_class, .dot => true,
+                .identifier => {
+                    // An identifier followed by <- starts a new definition, not a reference.
+                    const next = self.peekNextMeaningful();
+                    return next != .left_arrow;
+                },
+                else => false,
+            };
+        }
     };
 }
 
 const Scanner = @import("Scanner.zig").Scanner;
 
-fn parseSource(source: []const u8) ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
+fn parseSource(source: []const u8) Parser.ParseError!struct { parser: Parser, rules: []const Ast.Rule } {
     var scanner = Scanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = Parser.init(tokens, source);

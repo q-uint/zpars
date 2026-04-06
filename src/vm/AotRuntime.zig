@@ -6,7 +6,7 @@ const std = @import("std");
 const I = @import("Instruction.zig");
 const Jit = @import("Jit.zig");
 const Aot = @import("Aot.zig");
-const Vm = @import("Vm.zig");
+const Vm = @import("Vm.zig").Vm;
 
 const page_size = Jit.page_size;
 const JitCtx = Jit.JitCtx;
@@ -77,9 +77,11 @@ pub const Engine = struct {
     }
 
     pub fn getCapture(self: *const Engine, input: []const u8, i: u16) ?Vm.Span {
-        const s = self.captures_buf[i * 2];
+        const slot: usize = @as(usize, i) * 2;
+        if (slot + 1 >= Jit.max_captures) return null;
+        const s = self.captures_buf[slot];
         if (s == Jit.null_cap) return null;
-        const e = self.captures_buf[i * 2 + 1];
+        const e = self.captures_buf[slot + 1];
         if (e == Jit.null_cap) return null;
         _ = input;
         return .{ .start = @intCast(s), .end = @intCast(e) };

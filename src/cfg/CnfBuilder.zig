@@ -56,6 +56,10 @@ pub fn build(b: *CnfBuilder) Cfg {
 
 /// Append a production, copying its RHS symbols into the pool.
 fn addProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) void {
+    if (b.sym_total + rhs.len > max_symbols)
+        @panic("CnfBuilder symbol pool exhausted");
+    if (b.prod_count >= max_prods)
+        @panic("CnfBuilder production pool exhausted");
     const sym_start = b.sym_total;
     for (rhs) |sym| {
         b.sym_pool[b.sym_total] = sym;
@@ -70,6 +74,8 @@ fn addProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) void {
 
 /// Register a fresh nonterminal and return its id.
 fn addNt(b: *CnfBuilder, name: []const u8) u32 {
+    if (b.nt_count >= max_nts)
+        @panic("CnfBuilder nonterminal pool exhausted");
     const id: u32 = @intCast(b.nt_count);
     b.nts[b.nt_count] = name;
     b.nt_count += 1;

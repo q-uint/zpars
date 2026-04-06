@@ -4,9 +4,10 @@
 /// rewrite over the instruction and charset arrays. New passes are
 /// added as functions and called from `optimize`.
 const I = @import("Instruction.zig");
-const Compiler = @import("Compiler.zig");
+const compiler_mod = @import("Compiler.zig");
+const Compiler = compiler_mod.Compiler;
 
-pub fn optimize(c: *Compiler) void {
+pub fn optimize(c: anytype) void {
     singleCharSetToChar(c.code[0..c.code_len], c.charsets[0..c.charset_len]);
     fuseConsecutiveChars(c);
     factorCommonPrefix(c);
@@ -28,11 +29,11 @@ fn singleCharSetToChar(code: []I.Inst, charsets: []const I.Charset) void {
 /// Fuse runs of 2+ consecutive `char` instructions into single `string`
 /// instructions. Stores the byte sequences in the compiler's string_data
 /// buffer, then compacts the code array and remaps all offsets.
-fn fuseConsecutiveChars(c: *Compiler) void {
+fn fuseConsecutiveChars(c: anytype) void {
     const code = c.code[0..c.code_len];
 
     // Mark which instructions to keep (false = removed by fusion).
-    var keep = [_]bool{true} ** Compiler.max_code;
+    var keep = [_]bool{true} ** c.code.len;
     var any_fused = false;
 
     var i: u32 = 0;
@@ -51,7 +52,7 @@ fn fuseConsecutiveChars(c: *Compiler) void {
             // Copy bytes into string_data buffer. Clamp to both the
             // u8 StringRef.len limit and the remaining buffer space.
             const str_offset = c.string_data_len;
-            const avail = Compiler.max_string_data - c.string_data_len;
+            const avail = c.string_data.len - c.string_data_len;
             const len: u8 = @intCast(@min(run_len, @min(255, avail)));
             if (len < 2) {
                 i = run_end;
@@ -82,7 +83,7 @@ fn fuseConsecutiveChars(c: *Compiler) void {
     if (!any_fused) return;
 
     // Build remap table: old address -> new address.
-    var remap = [_]u32{0} ** Compiler.max_code;
+    var remap = [_]u32{0} ** c.code.len;
     var new_len: u32 = 0;
     for (0..c.code_len) |old| {
         remap[old] = new_len;
@@ -118,10 +119,10 @@ fn fuseConsecutiveChars(c: *Compiler) void {
 
 /// Fuse `choice[+3], char, commit[+1]` into a single `optional_char`.
 /// This pattern is emitted for `e?` when `e` is a single char.
-fn fuseOptionalChar(c: *Compiler) void {
+fn fuseOptionalChar(c: anytype) void {
     const code = c.code[0..c.code_len];
 
-    var keep = [_]bool{true} ** Compiler.max_code;
+    var keep = [_]bool{true} ** c.code.len;
     var any_fused = false;
 
     var i: u32 = 0;
@@ -146,7 +147,7 @@ fn fuseOptionalChar(c: *Compiler) void {
     if (!any_fused) return;
 
     // Build remap table and compact, same as fuseConsecutiveChars.
-    var remap = [_]u32{0} ** Compiler.max_code;
+    var remap = [_]u32{0} ** c.code.len;
     var new_len: u32 = 0;
     for (0..c.code_len) |old| {
         remap[old] = new_len;
@@ -182,11 +183,11 @@ fn fuseOptionalChar(c: *Compiler) void {
 /// After:  <prefix>; choice; <suffix_0>; commit; <suffix_1>
 ///
 /// Avoids redundant re-matching of the shared prefix on backtrack.
-fn factorCommonPrefix(c: *Compiler) void {
+fn factorCommonPrefix(c: anytype) void {
     while (factorOnePrefixPass(c)) {}
 }
 
-fn factorOnePrefixPass(c: *Compiler) bool {
+fn factorOnePrefixPass(c: anytype) bool {
     var i: u32 = 0;
     while (i + 3 < c.code_len) : (i += 1) {
         if (c.code[i].op != .choice) continue;
@@ -235,7 +236,7 @@ fn factorOnePrefixPass(c: *Compiler) bool {
         }
 
         // Both suffixes non-empty: need one extra slot.
-        if (c.code_len + 1 > Compiler.max_code) continue;
+        if (c.code_len + 1 > c.code.len) continue;
 
         const suffix0 = sliceLitInst(b0, sd, prefix_len, s0_len);
         const suffix1 = sliceLitInst(b1, sd, prefix_len, s1_len);
@@ -334,7 +335,7 @@ fn charsetSingleByte(cs: I.Charset) u8 {
 
 const testing = @import("std").testing;
 const EreScanner = @import("../ere/Scanner.zig").Scanner;
-const EreParser = @import("../ere/Parser.zig");
+const EreParser = @import("../ere/Parser.zig").Parser;
 
 fn compileEre(source: []const u8) Compiler {
     var scanner = EreScanner.init(source);

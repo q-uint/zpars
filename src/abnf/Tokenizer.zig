@@ -15,7 +15,7 @@
 const std = @import("std");
 const Ast = @import("../Ast.zig");
 const AbnfScanner = @import("Scanner.zig").Scanner;
-const AbnfParser = @import("Parser.zig");
+const AbnfParser = @import("Parser.zig").Parser;
 const tok = @import("../token.zig");
 
 pub const Config = struct {
