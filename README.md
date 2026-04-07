@@ -226,7 +226,7 @@ const result = zpars.vm.AotRuntime.run(blob2, "1+2*3");
 Try the example grammars:
 
 ```
-zpars vm examples/calc.peg "1+2*3"             # arithmetic expressions
+zpars vm examples/calc.peg "1+2*3"              # arithmetic expressions
 zpars vm examples/email.ere "user@example.com"  # email with captures
 zpars vm examples/json.peg '[1, "hello", true]' # JSON parser
 zpars vm examples/uri.peg "http://example.com"  # URI structure

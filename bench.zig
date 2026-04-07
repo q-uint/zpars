@@ -2,6 +2,7 @@ const std = @import("std");
 const zpars = @import("zpars");
 const Abnf = zpars.abnf.Compiler;
 const Matcher = zpars.Matcher;
+const StatsMatcher = zpars.MatcherWith(.{ .enable_stats = true });
 const Scanner = zpars.abnf.Scanner;
 const Parser = zpars.abnf.Parser;
 const Validator = zpars.Validator;
@@ -412,6 +413,38 @@ pub fn main() !void {
     }
 
     try stdout.print("\n  ({d} iterations per case)\n\n", .{iterations});
+
+    // ---- Matcher: plain vs packrat (with stats) ----
+    try stdout.print("  Matcher: plain vs packrat (with stats)\n", .{});
+    try printStatsHeader(stdout);
+
+    for (matcher_packrat_cases) |case| {
+        var m_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+        defer m_arena.deinit();
+        var sm = buildStatsMatcher(m_arena.allocator(), case.grammar) catch continue;
+
+        const memo_ns = benchMatcherPackrat(gpa.allocator(), &sm, case.rule, case.input);
+        const memo_per = memo_ns / iterations;
+        // Run one more packrat to capture stats (bench loop overwrites each iteration).
+        _ = sm.matchPackrat(m_arena.allocator(), case.rule, case.input) catch {};
+        const stats = sm.getStats();
+
+        if (case.left_recursive) {
+            try printStatsRow(stdout, case.name, null, memo_per, stats);
+            continue;
+        }
+
+        const plain_ns = benchMatcherPlain(&sm, case.rule, case.input);
+        const plain_per = plain_ns / iterations;
+
+        // Re-run packrat once more to get stats (plain match resets them).
+        _ = sm.matchPackrat(m_arena.allocator(), case.rule, case.input) catch {};
+        const final_stats = sm.getStats();
+
+        try printStatsRow(stdout, case.name, plain_per, memo_per, final_stats);
+    }
+
+    try stdout.print("\n  ({d} iterations per case)\n\n", .{iterations});
     try stdout.flush();
 }
 
@@ -509,6 +542,179 @@ fn benchVmPackrat(base_allocator: std.mem.Allocator, compiler: *const VmCompiler
     }
 
     return timer.read();
+}
+
+const MatcherPackratCase = struct {
+    name: []const u8,
+    grammar: []const u8,
+    rule: []const u8,
+    input: []const u8,
+    left_recursive: bool = false,
+};
+
+const matcher_packrat_cases = [_]MatcherPackratCase{
+    .{
+        .name = "redundant E",
+        .grammar =
+        \\s = (e "!") / (e "?")
+        \\e = "a" "b" "c" "d"
+        ,
+        .rule = "s",
+        .input = "abcd?",
+    },
+    .{
+        .name = "failure memo",
+        .grammar =
+        \\s = (e "x") / (e "y")
+        \\e = "a" "b" "c"
+        ,
+        .rule = "s",
+        .input = "abqy",
+    },
+    .{
+        .name = "left-rec arith",
+        .grammar =
+        \\expr = expr "+" 1*DIGIT / 1*DIGIT
+        ,
+        .rule = "expr",
+        .input = "1+2+3+4+5+6+7+8+9+0",
+        .left_recursive = true,
+    },
+    .{
+        .name = "indirect LR",
+        .grammar =
+        \\a = b
+        \\b = a "x" / "y"
+        ,
+        .rule = "a",
+        .input = "yxxxxxxxxx",
+        .left_recursive = true,
+    },
+    .{
+        .name = "multi-rule",
+        .grammar =
+        \\number = 1*DIGIT
+        \\pair   = number "," number
+        ,
+        .rule = "pair",
+        .input = "42,7!",
+    },
+    .{
+        // Deep backtracking: `s` tries N alternatives that all start
+        // with `w` but differ in suffix. Each failed alternative
+        // re-enters `w` at position 0 -- packrat caches after the
+        // first evaluation so the remaining attempts are table hits.
+        .name = "deep backtrack",
+        .grammar =
+        \\s = (w "A") / (w "B") / (w "C") / (w "D") / (w "E") / (w "F") / (w "G") / (w "!")
+        \\w = 1*ALPHA
+        ,
+        .rule = "s",
+        .input = "hello!",
+    },
+    .{
+        // Cascading alternatives: three rules each with two branches.
+        // Failing the first branch of `a` backtracks through `b` and
+        // `c`, then the second branch of `a` re-uses them at the
+        // same positions.
+        .name = "cascade alt",
+        .grammar =
+        \\a = (b "X") / (b "?")
+        \\b = (c "Y") / (c 1*ALPHA)
+        \\c = 1*DIGIT "-" 1*DIGIT
+        ,
+        .rule = "a",
+        .input = "12-34hello?",
+    },
+};
+
+fn benchMatcherPlain(matcher: *StatsMatcher, rule: []const u8, input: []const u8) u64 {
+    var inp: []const u8 = input;
+    std.mem.doNotOptimizeAway(&inp);
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    for (0..iterations) |_| {
+        const r = matcher.match(rule, inp);
+        std.mem.doNotOptimizeAway(&r);
+    }
+
+    return timer.read();
+}
+
+fn benchMatcherPackrat(
+    base_allocator: std.mem.Allocator,
+    matcher: *StatsMatcher,
+    rule: []const u8,
+    input: []const u8,
+) u64 {
+    var inp: []const u8 = input;
+    std.mem.doNotOptimizeAway(&inp);
+
+    var arena = std.heap.ArenaAllocator.init(base_allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    for (0..iterations) |_| {
+        const r = matcher.matchPackrat(arena_alloc, rule, inp) catch unreachable;
+        std.mem.doNotOptimizeAway(&r);
+        _ = arena.reset(.retain_capacity);
+    }
+
+    return timer.read();
+}
+
+fn buildStatsMatcher(allocator: std.mem.Allocator, grammar: []const u8) !StatsMatcher {
+    var scanner = Scanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, grammar);
+    const rules = try parser.parse();
+    var validator = Validator.init(allocator, rules);
+    const merged = try validator.validate();
+    return try StatsMatcher.init(allocator, merged);
+}
+
+fn printStatsHeader(stdout: anytype) !void {
+    try stdout.print("  {s:<16} {s:>11} {s:>11} {s:>8} {s:>8} {s:>8} {s:>5} {s:>8}\n", .{
+        "case", "plain", "packrat", "speedup", "hits", "misses", "h/m%", "depth",
+    });
+    try stdout.print("  {s:-<16} {s:->11} {s:->11} {s:->8} {s:->8} {s:->8} {s:->5} {s:->8}\n", .{
+        "", "", "", "", "", "", "", "",
+    });
+}
+
+fn printStatsRow(
+    stdout: anytype,
+    name: []const u8,
+    plain_per: ?u64,
+    memo_per: u64,
+    stats: StatsMatcher.Stats,
+) !void {
+    const total = stats.memo_hits + stats.memo_misses;
+    const hit_pct: f64 = if (total > 0)
+        @as(f64, @floatFromInt(stats.memo_hits)) / @as(f64, @floatFromInt(total)) * 100
+    else
+        0;
+
+    if (plain_per) |pp| {
+        const speedup: f64 = if (memo_per > 0)
+            @as(f64, @floatFromInt(pp)) / @as(f64, @floatFromInt(memo_per))
+        else
+            0;
+        try stdout.print("  {s:<16} {d:>8} ns {d:>8} ns {d:>7.2}x {d:>8} {d:>8} {d:>4.0}% {d:>8}\n", .{
+            name, pp, memo_per, speedup,
+            stats.memo_hits, stats.memo_misses, hit_pct,
+            stats.max_depth_reached,
+        });
+    } else {
+        try stdout.print("  {s:<16} {s:>11} {d:>8} ns {s:>8} {d:>8} {d:>8} {d:>4.0}% {d:>8}\n", .{
+            name, "(LR: n/a)", memo_per, "-",
+            stats.memo_hits, stats.memo_misses, hit_pct,
+            stats.max_depth_reached,
+        });
+    }
 }
 
 fn buildMatcher(allocator: std.mem.Allocator, comptime idx: usize) !Matcher {

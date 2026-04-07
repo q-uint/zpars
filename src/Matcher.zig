@@ -1,4 +1,4 @@
-/// Runtime ABNF matcher — tree-walking interpreter over `Ast.Node`.
+/// Runtime ABNF matcher -- tree-walking interpreter over `Ast.Node`.
 ///
 /// Unlike the comptime `Abnf.Compile`, this matcher works with grammars
 /// loaded at runtime. Feed it the merged rules from `Validator.validate()`
@@ -16,640 +16,728 @@
 const std = @import("std");
 const Ast = @import("Ast.zig");
 
-const Matcher = @This();
-
-pub const Result = struct {
-    /// The matched input span.
-    value: []const u8,
-    /// Unconsumed input after the match.
-    rest: []const u8,
+pub const Config = struct {
+    enable_stats: bool = false,
 };
 
-/// Maximum recursion depth to guard against stack overflow.
-const max_depth = 256;
+pub const Matcher = MatcherWith(.{});
 
-const RuleIndex = std.hash_map.StringHashMapUnmanaged(u32);
+pub fn MatcherWith(comptime config: Config) type {
+    return struct {
+        const Self = @This();
 
-pub const MemoKind = enum(u8) {
-    /// Not yet attempted.
-    empty,
-    /// Body evaluation is currently on the stack. `payload` is the
-    /// index of an LrFrame in lr_stack, whose seed is consulted on
-    /// self-recursion. This also acts as the "current best seed"
-    /// during GROW-LR: its `end_pos` is read from the frame.
-    lr,
-    /// Cached success; payload holds the end offset of the match.
-    success,
-    /// Cached failure.
-    fail,
-};
+        pub const Result = struct {
+            /// The matched input span.
+            value: []const u8,
+            /// Unconsumed input after the match.
+            rest: []const u8,
+        };
 
-pub const MemoEntry = struct {
-    kind: MemoKind,
-    payload: u32,
-};
+        /// Maximum recursion depth to guard against stack overflow.
+        const max_depth = 256;
 
-/// One active APPLY-RULE frame. While its (rule, pos) memo entry is
-/// kind=.lr, inner calls read the seed here. Once the first body
-/// evaluation returns, `head_idx` is inspected: null means no LR
-/// happened, otherwise we entered LR-ANSWER / GROW-LR.
-const LrFrame = struct {
-    rule_id: u32,
-    start_pos: u32,
-    /// null = FAIL seed; otherwise end_pos of the current seed.
-    seed_end: ?u32,
-    /// null until SETUP-LR attaches this frame to a head.
-    head_idx: ?u32,
-};
+        const RuleIndex = std.hash_map.StringHashMapUnmanaged(u32);
 
-/// Warth's Head: tracks the rules involved in a given LR cycle at a
-/// given position, plus a working set for the current grow iteration.
-const Head = struct {
-    rule_id: u32,
-    /// Bitset of rule ids involved in this LR cycle.
-    involved: std.DynamicBitSetUnmanaged,
-    /// Bitset (subset of involved) of rules still to re-evaluate in
-    /// the current grow iteration.
-    eval: std.DynamicBitSetUnmanaged,
-};
+        pub const MemoKind = enum(u8) {
+            /// Not yet attempted.
+            empty,
+            /// Body evaluation is currently on the stack. `payload` is the
+            /// index of an LrFrame in lr_stack, whose seed is consulted on
+            /// self-recursion. This also acts as the "current best seed"
+            /// during GROW-LR: its `end_pos` is read from the frame.
+            lr,
+            /// Cached success; payload holds the end offset of the match.
+            success,
+            /// Cached failure.
+            fail,
+        };
 
-allocator: std.mem.Allocator,
-rules: []const Ast.Rule,
-rule_index: RuleIndex,
-/// Start pointer of the input passed to `match()`, used for anchor_start.
-match_input_start: [*]const u8 = undefined,
-/// Total length of the input passed to match(), used for memo indexing.
-match_input_len: usize = 0,
-/// Packrat memo table. Empty unless matchPackrat is in use.
-/// Layout: entry(rule_id, pos) = packrat_memo[rule_id * memo_stride + pos],
-/// where memo_stride = match_input_len + 1.
-packrat_memo: []MemoEntry = &.{},
-memo_stride: usize = 0,
-/// Stack of active LR frames, in call order. Frames are pushed in
-/// applyRule and stay alive for the entire matchPackrat so that
-/// memo entries of kind .lr can safely reference them by index.
-lr_stack: std.ArrayListUnmanaged(LrFrame) = .empty,
-/// Per-position head pointer (index into heads_pool), or null.
-heads: []?u32 = &.{},
-heads_pool: std.ArrayListUnmanaged(Head) = .empty,
-/// Allocator used for packrat state (lr_stack, heads_pool, bitsets).
-/// Set by matchPackrat, cleared on return.
-packrat_allocator: ?std.mem.Allocator = null,
-/// Counts rule-body descents (i.e. actual work done, not memo hits).
-/// Useful for measuring the reduction from memoization.
-rule_body_entries: u64 = 0,
-/// Counts memo hits (success + fail + in_progress). Zero outside packrat.
-memo_hits: u64 = 0,
+        pub const MemoEntry = struct {
+            kind: MemoKind,
+            payload: u32,
+        };
 
-pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) !Matcher {
-    var index = RuleIndex{};
-    try index.ensureTotalCapacity(allocator, @intCast(rules.len));
-    for (rules, 0..) |rule, i| {
-        const key = try asciiLowerAlloc(allocator, rule.name);
-        // Only store first occurrence; rules are already merged by Validator.
-        _ = try index.getOrPutValue(allocator, key, @intCast(i));
-    }
-    return .{ .allocator = allocator, .rules = rules, .rule_index = index };
-}
+        /// One active APPLY-RULE frame. While its (rule, pos) memo entry is
+        /// kind=.lr, inner calls read the seed here. Once the first body
+        /// evaluation returns, `head_idx` is inspected: null means no LR
+        /// happened, otherwise we entered LR-ANSWER / GROW-LR.
+        const LrFrame = struct {
+            rule_id: u32,
+            start_pos: u32,
+            /// null = FAIL seed; otherwise end_pos of the current seed.
+            seed_end: ?u32,
+            /// null until SETUP-LR attaches this frame to a head.
+            head_idx: ?u32,
+        };
 
-pub fn deinit(self: *Matcher) void {
-    var it = self.rule_index.keyIterator();
-    while (it.next()) |key| self.allocator.free(key.*);
-    self.rule_index.deinit(self.allocator);
-}
+        /// Warth's Head: tracks the rules involved in a given LR cycle at a
+        /// given position, plus a working set for the current grow iteration.
+        const Head = struct {
+            rule_id: u32,
+            /// Bitset of rule ids involved in this LR cycle.
+            involved: std.DynamicBitSetUnmanaged,
+            /// Bitset (subset of involved) of rules still to re-evaluate in
+            /// the current grow iteration.
+            eval: std.DynamicBitSetUnmanaged,
+        };
 
-fn asciiLowerAlloc(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
-    const buf = try allocator.alloc(u8, s.len);
-    for (s, 0..) |c, i| {
-        buf[i] = std.ascii.toLower(c);
-    }
-    return buf;
-}
+        /// Per-rule statistics. Only present when `config.enable_stats` is true.
+        pub const RuleStat = struct {
+            body_entries: u64,
+            memo_hits: u64,
+            memo_misses: u64,
+        };
 
-/// Match `input` against the rule named `rule_name`.
-/// Returns null if the rule is not found or the input does not match.
-pub fn match(self: *Matcher, rule_name: []const u8, input: []const u8) ?Result {
-    self.match_input_start = input.ptr;
-    self.match_input_len = input.len;
-    self.packrat_memo = &.{};
-    self.memo_stride = 0;
-    self.rule_body_entries = 0;
-    self.memo_hits = 0;
-    return self.matchRulename(rule_name, input, 0);
-}
+        /// Snapshot of matcher statistics returned by `getStats()`.
+        pub const Stats = struct {
+            rule_body_entries: u64,
+            memo_hits: u64,
+            memo_misses: u64,
+            max_depth_reached: u32,
+            rule_stats: ?[]const RuleStat,
+        };
 
-/// Packrat-memoized match with Warth's seed-growing left-recursion
-/// support (including indirect LR via involved/eval sets). Allocates
-/// a memo table sized (num_rules * (input.len+1)) plus per-position
-/// head pointers and an LR stack. All packrat state is released
-/// before returning.
-pub fn matchPackrat(
-    self: *Matcher,
-    allocator: std.mem.Allocator,
-    rule_name: []const u8,
-    input: []const u8,
-) !?Result {
-    self.match_input_start = input.ptr;
-    self.match_input_len = input.len;
-    self.rule_body_entries = 0;
-    self.memo_hits = 0;
-    const stride = input.len + 1;
+        allocator: std.mem.Allocator,
+        rules: []const Ast.Rule,
+        rule_index: RuleIndex,
+        /// Start pointer of the input passed to `match()`, used for anchor_start.
+        match_input_start: [*]const u8 = undefined,
+        /// Total length of the input passed to match(), used for memo indexing.
+        match_input_len: usize = 0,
+        /// Packrat memo table. Empty unless matchPackrat is in use.
+        /// Layout: entry(rule_id, pos) = packrat_memo[rule_id * memo_stride + pos],
+        /// where memo_stride = match_input_len + 1.
+        packrat_memo: []MemoEntry = &.{},
+        memo_stride: usize = 0,
+        /// Stack of active LR frames, in call order. Frames are pushed in
+        /// applyRule and stay alive for the entire matchPackrat so that
+        /// memo entries of kind .lr can safely reference them by index.
+        lr_stack: std.ArrayListUnmanaged(LrFrame) = .empty,
+        /// Per-position head pointer (index into heads_pool), or null.
+        heads: []?u32 = &.{},
+        heads_pool: std.ArrayListUnmanaged(Head) = .empty,
+        /// Allocator used for packrat state (lr_stack, heads_pool, bitsets).
+        /// Set by matchPackrat, cleared on return.
+        packrat_allocator: ?std.mem.Allocator = null,
 
-    const table = try allocator.alloc(MemoEntry, self.rules.len * stride);
-    @memset(table, .{ .kind = .empty, .payload = 0 });
-    self.packrat_memo = table;
-    self.memo_stride = stride;
+        // Aggregate counters (always present for backwards compat, but
+        // only incremented when enable_stats is true).
+        /// Counts rule-body descents (i.e. actual work done, not memo hits).
+        rule_body_entries: u64 = 0,
+        /// Counts memo hits (success + fail + in_progress). Zero outside packrat.
+        memo_hits: u64 = 0,
+        /// Counts memo misses (empty entries that triggered body evaluation).
+        memo_misses: u64 = 0,
+        /// Highest recursion depth observed during the last match.
+        max_depth_reached: u32 = 0,
+        /// Per-rule counters, indexed by rule_id. Only allocated when
+        /// enable_stats is true.
+        rule_stats: if (config.enable_stats) []RuleStat else void =
+            if (config.enable_stats) &.{} else {},
 
-    const heads = try allocator.alloc(?u32, stride);
-    @memset(heads, null);
-    self.heads = heads;
-    self.heads_pool = .empty;
-    self.lr_stack = .empty;
-    self.packrat_allocator = allocator;
-
-    defer {
-        allocator.free(table);
-        allocator.free(heads);
-        for (self.heads_pool.items) |*h| {
-            h.involved.deinit(allocator);
-            h.eval.deinit(allocator);
+        pub fn init(allocator: std.mem.Allocator, rules: []const Ast.Rule) !Self {
+            var index = RuleIndex{};
+            try index.ensureTotalCapacity(allocator, @intCast(rules.len));
+            for (rules, 0..) |rule, i| {
+                const key = try asciiLowerAlloc(allocator, rule.name);
+                // Only store first occurrence; rules are already merged by Validator.
+                _ = try index.getOrPutValue(allocator, key, @intCast(i));
+            }
+            var self = Self{ .allocator = allocator, .rules = rules, .rule_index = index };
+            if (config.enable_stats) {
+                self.rule_stats = try allocator.alloc(RuleStat, rules.len);
+                @memset(self.rule_stats, .{ .body_entries = 0, .memo_hits = 0, .memo_misses = 0 });
+            }
+            return self;
         }
-        self.heads_pool.deinit(allocator);
-        self.lr_stack.deinit(allocator);
-        self.packrat_memo = &.{};
-        self.memo_stride = 0;
-        self.heads = &.{};
-        self.packrat_allocator = null;
-    }
 
-    return self.matchRulename(rule_name, input, 0);
-}
+        pub fn deinit(self: *Self) void {
+            if (config.enable_stats) {
+                if (self.rule_stats.len > 0) self.allocator.free(self.rule_stats);
+            }
+            var it = self.rule_index.keyIterator();
+            while (it.next()) |key| self.allocator.free(key.*);
+            self.rule_index.deinit(self.allocator);
+        }
 
-fn matchNode(self: *const Matcher, node: Ast.Node, input: []const u8, depth: usize) ?Result {
-    if (depth > max_depth) return null;
+        fn asciiLowerAlloc(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+            const buf = try allocator.alloc(u8, s.len);
+            for (s, 0..) |c, i| {
+                buf[i] = std.ascii.toLower(c);
+            }
+            return buf;
+        }
 
-    return switch (node) {
-        .char_val => |cv| matchCharVal(cv, input),
-        .num_val => |nv| matchNumVal(nv, input),
-        .prose_val => null,
-        .rulename => |name| self.matchRulename(name, input, depth),
-        .alternation => |alts| self.matchAlternation(alts, input, depth),
-        .concatenation => |elems| self.matchConcatenation(elems, input, depth),
-        .repetition => |rep| self.matchRepetition(rep, input, depth),
-        .and_predicate => |inner| {
-            // Succeed if inner matches, but consume nothing.
-            if (self.matchNode(inner.*, input, depth + 1)) |_|
-                return .{ .value = input[0..0], .rest = input }
-            else
-                return null;
-        },
-        .not_predicate => |inner| {
-            // Succeed if inner does NOT match, consume nothing.
-            if (self.matchNode(inner.*, input, depth + 1)) |_|
-                return null
-            else
-                return .{ .value = input[0..0], .rest = input };
-        },
-        .char_class => |ranges| matchCharClass(ranges, input),
-        .neg_char_class => |ranges| matchNegCharClass(ranges, input),
-        .anchor_start => {
-            if (input.ptr == self.match_input_start)
-                return .{ .value = input[0..0], .rest = input }
-            else
-                return null;
-        },
-        .anchor_end => {
-            if (input.len == 0)
-                return .{ .value = input[0..0], .rest = input }
-            else
-                return null;
-        },
-        .any => {
+        /// Return a snapshot of the current statistics. Only meaningful
+        /// when `config.enable_stats` is true; otherwise all counters
+        /// are zero and `rule_stats` is null.
+        pub fn getStats(self: *const Self) Stats {
+            return .{
+                .rule_body_entries = self.rule_body_entries,
+                .memo_hits = self.memo_hits,
+                .memo_misses = self.memo_misses,
+                .max_depth_reached = self.max_depth_reached,
+                .rule_stats = if (config.enable_stats) self.rule_stats else null,
+            };
+        }
+
+        fn resetStats(self: *Self) void {
+            self.rule_body_entries = 0;
+            self.memo_hits = 0;
+            self.memo_misses = 0;
+            self.max_depth_reached = 0;
+            if (config.enable_stats) {
+                @memset(self.rule_stats, .{ .body_entries = 0, .memo_hits = 0, .memo_misses = 0 });
+            }
+        }
+
+        inline fn recordBodyEntry(self: *Self, rule_id: u32) void {
+            if (config.enable_stats) {
+                self.rule_body_entries += 1;
+                self.rule_stats[rule_id].body_entries += 1;
+            }
+        }
+
+        inline fn recordMemoHit(self: *Self, rule_id: u32) void {
+            if (config.enable_stats) {
+                self.memo_hits += 1;
+                self.rule_stats[rule_id].memo_hits += 1;
+            }
+        }
+
+        inline fn recordMemoMiss(self: *Self, rule_id: u32) void {
+            if (config.enable_stats) {
+                self.memo_misses += 1;
+                self.rule_stats[rule_id].memo_misses += 1;
+            }
+        }
+
+        inline fn recordDepth(self: *Self, depth: usize) void {
+            if (config.enable_stats) {
+                const d: u32 = @intCast(@min(depth, std.math.maxInt(u32)));
+                if (d > self.max_depth_reached) self.max_depth_reached = d;
+            }
+        }
+
+        /// Match `input` against the rule named `rule_name`.
+        /// Returns null if the rule is not found or the input does not match.
+        pub fn match(self: *Self, rule_name: []const u8, input: []const u8) ?Result {
+            self.match_input_start = input.ptr;
+            self.match_input_len = input.len;
+            self.packrat_memo = &.{};
+            self.memo_stride = 0;
+            self.resetStats();
+            return self.matchRulename(rule_name, input, 0);
+        }
+
+        /// Packrat-memoized match with Warth's seed-growing left-recursion
+        /// support (including indirect LR via involved/eval sets). Allocates
+        /// a memo table sized (num_rules * (input.len+1)) plus per-position
+        /// head pointers and an LR stack. All packrat state is released
+        /// before returning.
+        pub fn matchPackrat(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            rule_name: []const u8,
+            input: []const u8,
+        ) !?Result {
+            self.match_input_start = input.ptr;
+            self.match_input_len = input.len;
+            self.resetStats();
+            const stride = input.len + 1;
+
+            const table = try allocator.alloc(MemoEntry, self.rules.len * stride);
+            @memset(table, .{ .kind = .empty, .payload = 0 });
+            self.packrat_memo = table;
+            self.memo_stride = stride;
+
+            const head_slots = try allocator.alloc(?u32, stride);
+            @memset(head_slots, null);
+            self.heads = head_slots;
+            self.heads_pool = .empty;
+            self.lr_stack = .empty;
+            self.packrat_allocator = allocator;
+
+            defer {
+                allocator.free(table);
+                allocator.free(head_slots);
+                for (self.heads_pool.items) |*h| {
+                    h.involved.deinit(allocator);
+                    h.eval.deinit(allocator);
+                }
+                self.heads_pool.deinit(allocator);
+                self.lr_stack.deinit(allocator);
+                self.packrat_memo = &.{};
+                self.memo_stride = 0;
+                self.heads = &.{};
+                self.packrat_allocator = null;
+            }
+
+            return self.matchRulename(rule_name, input, 0);
+        }
+
+        fn matchNode(self: *Self, node: Ast.Node, input: []const u8, depth: usize) ?Result {
+            if (depth > max_depth) return null;
+            self.recordDepth(depth);
+
+            return switch (node) {
+                .char_val => |cv| matchCharVal(cv, input),
+                .num_val => |nv| matchNumVal(nv, input),
+                .prose_val => null,
+                .rulename => |name| self.matchRulename(name, input, depth),
+                .alternation => |alts| self.matchAlternation(alts, input, depth),
+                .concatenation => |elems| self.matchConcatenation(elems, input, depth),
+                .repetition => |rep| self.matchRepetition(rep, input, depth),
+                .and_predicate => |inner| {
+                    // Succeed if inner matches, but consume nothing.
+                    if (self.matchNode(inner.*, input, depth + 1)) |_|
+                        return .{ .value = input[0..0], .rest = input }
+                    else
+                        return null;
+                },
+                .not_predicate => |inner| {
+                    // Succeed if inner does NOT match, consume nothing.
+                    if (self.matchNode(inner.*, input, depth + 1)) |_|
+                        return null
+                    else
+                        return .{ .value = input[0..0], .rest = input };
+                },
+                .char_class => |ranges| matchCharClass(ranges, input),
+                .neg_char_class => |ranges| matchNegCharClass(ranges, input),
+                .anchor_start => {
+                    if (input.ptr == self.match_input_start)
+                        return .{ .value = input[0..0], .rest = input }
+                    else
+                        return null;
+                },
+                .anchor_end => {
+                    if (input.len == 0)
+                        return .{ .value = input[0..0], .rest = input }
+                    else
+                        return null;
+                },
+                .any => {
+                    if (input.len == 0) return null;
+                    return .{ .value = input[0..1], .rest = input[1..] };
+                },
+                .capture => |inner| self.matchNode(inner.*, input, depth + 1),
+            };
+        }
+
+        fn matchCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
             if (input.len == 0) return null;
+            const c = input[0];
+            for (ranges) |r| {
+                if (c >= r.lo and c <= r.hi)
+                    return .{ .value = input[0..1], .rest = input[1..] };
+            }
+            return null;
+        }
+
+        fn matchNegCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
+            if (input.len == 0) return null;
+            const c = input[0];
+            for (ranges) |r| {
+                if (c >= r.lo and c <= r.hi) return null;
+            }
             return .{ .value = input[0..1], .rest = input[1..] };
-        },
-        .capture => |inner| self.matchNode(inner.*, input, depth + 1),
-    };
-}
+        }
 
-fn matchCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
-    if (input.len == 0) return null;
-    const c = input[0];
-    for (ranges) |r| {
-        if (c >= r.lo and c <= r.hi)
-            return .{ .value = input[0..1], .rest = input[1..] };
-    }
-    return null;
-}
+        fn matchCharVal(cv: Ast.CharVal, input: []const u8) ?Result {
+            if (input.len < cv.value.len) return null;
+            const span = input[0..cv.value.len];
 
-fn matchNegCharClass(ranges: []const Ast.ClassRange, input: []const u8) ?Result {
-    if (input.len == 0) return null;
-    const c = input[0];
-    for (ranges) |r| {
-        if (c >= r.lo and c <= r.hi) return null;
-    }
-    return .{ .value = input[0..1], .rest = input[1..] };
-}
+            if (cv.case_sensitive) {
+                if (!std.mem.eql(u8, span, cv.value)) return null;
+            } else {
+                if (!std.ascii.eqlIgnoreCase(span, cv.value)) return null;
+            }
 
-fn matchCharVal(cv: Ast.CharVal, input: []const u8) ?Result {
-    if (input.len < cv.value.len) return null;
-    const span = input[0..cv.value.len];
+            return .{ .value = span, .rest = input[cv.value.len..] };
+        }
 
-    if (cv.case_sensitive) {
-        if (!std.mem.eql(u8, span, cv.value)) return null;
-    } else {
-        if (!std.ascii.eqlIgnoreCase(span, cv.value)) return null;
-    }
-
-    return .{ .value = span, .rest = input[cv.value.len..] };
-}
-
-fn matchNumVal(nv: Ast.NumVal, input: []const u8) ?Result {
-    switch (nv) {
-        .single => |byte| {
-            if (input.len == 0 or input[0] != byte) return null;
-            return .{ .value = input[0..1], .rest = input[1..] };
-        },
-        .range => |r| {
-            if (input.len == 0 or input[0] < r.lo or input[0] > r.hi) return null;
-            return .{ .value = input[0..1], .rest = input[1..] };
-        },
-        .concat => |bytes| {
-            if (input.len < bytes.len) return null;
-            if (!std.mem.eql(u8, input[0..bytes.len], bytes)) return null;
-            return .{ .value = input[0..bytes.len], .rest = input[bytes.len..] };
-        },
-    }
-}
-
-fn matchAlternation(self: *const Matcher, alts: []const Ast.Node, input: []const u8, depth: usize) ?Result {
-    for (alts) |alt| {
-        if (self.matchNode(alt, input, depth)) |r| return r;
-    }
-    return null;
-}
-
-fn matchConcatenation(self: *const Matcher, elems: []const Ast.Node, input: []const u8, depth: usize) ?Result {
-    var rest = input;
-    for (elems) |elem| {
-        const r = self.matchNode(elem, rest, depth) orelse return null;
-        rest = r.rest;
-    }
-    return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
-}
-
-fn matchRepetition(self: *const Matcher, rep: Ast.Repetition, input: []const u8, depth: usize) ?Result {
-    var rest = input;
-    var count: usize = 0;
-
-    while (rep.max == null or count < rep.max.?) {
-        const r = self.matchNode(rep.element.*, rest, depth) orelse break;
-        // Guard against zero-length matches causing infinite loops.
-        if (r.rest.len == rest.len) break;
-        rest = r.rest;
-        count += 1;
-    }
-
-    if (count < rep.min) return null;
-    return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
-}
-
-fn matchRulename(self: *const Matcher, name: []const u8, input: []const u8, depth: usize) ?Result {
-    // Core rules (RFC 5234 Appendix B) bypass memoization entirely.
-    if (matchCoreRule(name, input)) |r| return r;
-
-    var lower_buf: [256]u8 = undefined;
-    const key = asciiLowerBuf(name, &lower_buf) orelse return null;
-    const idx = self.rule_index.get(key) orelse return null;
-
-    const m: *Matcher = @constCast(self);
-
-    if (self.packrat_memo.len == 0) {
-        m.rule_body_entries += 1;
-        return self.matchNode(self.rules[idx].node, input, depth + 1);
-    }
-
-    return self.applyRule(idx, input, depth);
-}
-
-/// Byte offset of `input.ptr` relative to `match_input_start`.
-fn posOf(self: *const Matcher, input: []const u8) u32 {
-    return @intCast(@intFromPtr(input.ptr) - @intFromPtr(self.match_input_start));
-}
-
-/// Reconstruct a Result from a (start, end) pair using the original input.
-fn resultFrom(self: *const Matcher, start: u32, end: u32) Result {
-    const whole = self.match_input_start[0..self.match_input_len];
-    return .{ .value = whole[start..end], .rest = whole[end..] };
-}
-
-/// Read the current memo entry for (rule_id, pos), applying RECALL's
-/// adjustments when a head is active at this position.
-fn recall(self: *const Matcher, rule_id: u32, pos: u32, depth: usize) RecallResult {
-    const entry_idx = rule_id * self.memo_stride + pos;
-    const m: *Matcher = @constCast(self);
-    var entry = self.packrat_memo[entry_idx];
-    const h_opt = self.heads[pos];
-    if (h_opt == null) return .{ .entry = entry };
-
-    const h = &m.heads_pool.items[h_opt.?];
-
-    // Rules outside the involved set (and not the head itself) must
-    // not piggyback on the current grow iteration: pretend they fail.
-    if (entry.kind == .empty and rule_id != h.rule_id and !h.involved.isSet(rule_id)) {
-        return .{ .entry = .{ .kind = .fail, .payload = 0 } };
-    }
-
-    // Rules still queued for re-evaluation this iteration: remove them
-    // from the eval set and recompute their answer now. Results must
-    // only grow monotonically across iterations; a re-eval producing
-    // a smaller end (or FAIL) is ignored so that a late failing
-    // iteration does not clobber an earlier successful seed.
-    if (h.eval.isSet(rule_id)) {
-        h.eval.unset(rule_id);
-        const whole = self.match_input_start[0..self.match_input_len];
-        const slice = whole[pos..];
-        m.rule_body_entries += 1;
-        const ans = self.matchNode(self.rules[rule_id].node, slice, depth + 1);
-        if (ans) |ok| {
-            const end: u32 = @intCast(pos + (slice.len - ok.rest.len));
-            const prev = self.packrat_memo[entry_idx];
-            const prev_end: u32 = if (prev.kind == .success) prev.payload else pos;
-            if (end > prev_end) {
-                self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
+        fn matchNumVal(nv: Ast.NumVal, input: []const u8) ?Result {
+            switch (nv) {
+                .single => |byte| {
+                    if (input.len == 0 or input[0] != byte) return null;
+                    return .{ .value = input[0..1], .rest = input[1..] };
+                },
+                .range => |r| {
+                    if (input.len == 0 or input[0] < r.lo or input[0] > r.hi) return null;
+                    return .{ .value = input[0..1], .rest = input[1..] };
+                },
+                .concat => |bytes| {
+                    if (input.len < bytes.len) return null;
+                    if (!std.mem.eql(u8, input[0..bytes.len], bytes)) return null;
+                    return .{ .value = input[0..bytes.len], .rest = input[bytes.len..] };
+                },
             }
         }
-        entry = self.packrat_memo[entry_idx];
-    }
-    return .{ .entry = entry };
-}
 
-const RecallResult = struct { entry: MemoEntry };
-
-/// Warth's APPLY-RULE on (rule_id, pos=posOf(input)).
-fn applyRule(self: *const Matcher, rule_id: u32, input: []const u8, depth: usize) ?Result {
-    const pos = self.posOf(input);
-    const entry_idx = rule_id * self.memo_stride + pos;
-    const m: *Matcher = @constCast(self);
-    const allocator = self.packrat_allocator.?;
-
-    const rc = self.recall(rule_id, pos, depth);
-    const entry = rc.entry;
-
-    switch (entry.kind) {
-        .success => {
-            m.memo_hits += 1;
-            return self.resultFrom(pos, entry.payload);
-        },
-        .fail => {
-            m.memo_hits += 1;
-            return null;
-        },
-        .lr => {
-            // Re-entering a rule whose body is still being evaluated.
-            m.memo_hits += 1;
-            const lr_idx = entry.payload;
-            self.setupLr(rule_id, lr_idx) catch return null;
-            const lr = m.lr_stack.items[lr_idx];
-            if (lr.seed_end) |end| {
-                return self.resultFrom(lr.start_pos, end);
+        fn matchAlternation(self: *Self, alts: []const Ast.Node, input: []const u8, depth: usize) ?Result {
+            for (alts) |alt| {
+                if (self.matchNode(alt, input, depth)) |r| return r;
             }
             return null;
-        },
-        .empty => {
-            // Fresh APPLY-RULE. Push an LR frame with FAIL seed and
-            // tag the memo entry .lr while the body runs.
-            const lr_idx: u32 = @intCast(m.lr_stack.items.len);
-            m.lr_stack.append(allocator, .{
-                .rule_id = rule_id,
-                .start_pos = pos,
-                .seed_end = null,
-                .head_idx = null,
-            }) catch return null;
-            self.packrat_memo[entry_idx] = .{ .kind = .lr, .payload = lr_idx };
+        }
 
-            m.rule_body_entries += 1;
-            const ans = self.matchNode(self.rules[rule_id].node, input, depth + 1);
+        fn matchConcatenation(self: *Self, elems: []const Ast.Node, input: []const u8, depth: usize) ?Result {
+            var rest = input;
+            for (elems) |elem| {
+                const r = self.matchNode(elem, rest, depth) orelse return null;
+                rest = r.rest;
+            }
+            return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
+        }
 
-            const head_idx = m.lr_stack.items[lr_idx].head_idx;
-            _ = m.lr_stack.pop();
+        fn matchRepetition(self: *Self, rep: Ast.Repetition, input: []const u8, depth: usize) ?Result {
+            var rest = input;
+            var count: usize = 0;
 
-            if (head_idx == null) {
+            while (rep.max == null or count < rep.max.?) {
+                const r = self.matchNode(rep.element.*, rest, depth) orelse break;
+                // Guard against zero-length matches causing infinite loops.
+                if (r.rest.len == rest.len) break;
+                rest = r.rest;
+                count += 1;
+            }
+
+            if (count < rep.min) return null;
+            return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
+        }
+
+        fn matchRulename(self: *Self, name: []const u8, input: []const u8, depth: usize) ?Result {
+            // Core rules (RFC 5234 Appendix B) bypass memoization entirely.
+            if (matchCoreRule(name, input)) |r| return r;
+
+            var lower_buf: [256]u8 = undefined;
+            const key = asciiLowerBuf(name, &lower_buf) orelse return null;
+            const idx = self.rule_index.get(key) orelse return null;
+
+            if (self.packrat_memo.len == 0) {
+                self.recordBodyEntry(idx);
+                return self.matchNode(self.rules[idx].node, input, depth + 1);
+            }
+
+            return self.applyRule(idx, input, depth);
+        }
+
+        /// Byte offset of `input.ptr` relative to `match_input_start`.
+        fn posOf(self: *const Self, input: []const u8) u32 {
+            return @intCast(@intFromPtr(input.ptr) - @intFromPtr(self.match_input_start));
+        }
+
+        /// Reconstruct a Result from a (start, end) pair using the original input.
+        fn resultFrom(self: *const Self, start: u32, end: u32) Result {
+            const whole = self.match_input_start[0..self.match_input_len];
+            return .{ .value = whole[start..end], .rest = whole[end..] };
+        }
+
+        /// Read the current memo entry for (rule_id, pos), applying RECALL's
+        /// adjustments when a head is active at this position.
+        fn recall(self: *Self, rule_id: u32, pos: u32, depth: usize) RecallResult {
+            const entry_idx = rule_id * self.memo_stride + pos;
+            var entry = self.packrat_memo[entry_idx];
+            const h_opt = self.heads[pos];
+            if (h_opt == null) return .{ .entry = entry };
+
+            const h = &self.heads_pool.items[h_opt.?];
+
+            // Rules outside the involved set (and not the head itself) must
+            // not piggyback on the current grow iteration: pretend they fail.
+            if (entry.kind == .empty and rule_id != h.rule_id and !h.involved.isSet(rule_id)) {
+                return .{ .entry = .{ .kind = .fail, .payload = 0 } };
+            }
+
+            // Rules still queued for re-evaluation this iteration: remove them
+            // from the eval set and recompute their answer now. Results must
+            // only grow monotonically across iterations; a re-eval producing
+            // a smaller end (or FAIL) is ignored so that a late failing
+            // iteration does not clobber an earlier successful seed.
+            if (h.eval.isSet(rule_id)) {
+                h.eval.unset(rule_id);
+                const whole = self.match_input_start[0..self.match_input_len];
+                const slice = whole[pos..];
+                self.recordBodyEntry(rule_id);
+                const ans = self.matchNode(self.rules[rule_id].node, slice, depth + 1);
                 if (ans) |ok| {
+                    const end: u32 = @intCast(pos + (slice.len - ok.rest.len));
+                    const prev = self.packrat_memo[entry_idx];
+                    const prev_end: u32 = if (prev.kind == .success) prev.payload else pos;
+                    if (end > prev_end) {
+                        self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
+                    }
+                }
+                entry = self.packrat_memo[entry_idx];
+            }
+            return .{ .entry = entry };
+        }
+
+        const RecallResult = struct { entry: MemoEntry };
+
+        /// Warth's APPLY-RULE on (rule_id, pos=posOf(input)).
+        fn applyRule(self: *Self, rule_id: u32, input: []const u8, depth: usize) ?Result {
+            const pos = self.posOf(input);
+            const entry_idx = rule_id * self.memo_stride + pos;
+            const allocator = self.packrat_allocator.?;
+
+            const rc = self.recall(rule_id, pos, depth);
+            const entry = rc.entry;
+
+            switch (entry.kind) {
+                .success => {
+                    self.recordMemoHit(rule_id);
+                    return self.resultFrom(pos, entry.payload);
+                },
+                .fail => {
+                    self.recordMemoHit(rule_id);
+                    return null;
+                },
+                .lr => {
+                    // Re-entering a rule whose body is still being evaluated.
+                    self.recordMemoHit(rule_id);
+                    const lr_idx = entry.payload;
+                    self.setupLr(rule_id, lr_idx) catch return null;
+                    const lr = self.lr_stack.items[lr_idx];
+                    if (lr.seed_end) |end| {
+                        return self.resultFrom(lr.start_pos, end);
+                    }
+                    return null;
+                },
+                .empty => {
+                    // Fresh APPLY-RULE. Push an LR frame with FAIL seed and
+                    // tag the memo entry .lr while the body runs.
+                    self.recordMemoMiss(rule_id);
+                    const lr_idx: u32 = @intCast(self.lr_stack.items.len);
+                    self.lr_stack.append(allocator, .{
+                        .rule_id = rule_id,
+                        .start_pos = pos,
+                        .seed_end = null,
+                        .head_idx = null,
+                    }) catch return null;
+                    self.packrat_memo[entry_idx] = .{ .kind = .lr, .payload = lr_idx };
+
+                    self.recordBodyEntry(rule_id);
+                    const ans = self.matchNode(self.rules[rule_id].node, input, depth + 1);
+
+                    const head_idx = self.lr_stack.items[lr_idx].head_idx;
+                    _ = self.lr_stack.pop();
+
+                    if (head_idx == null) {
+                        if (ans) |ok| {
+                            const end: u32 = @intCast(pos + (input.len - ok.rest.len));
+                            self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
+                        } else {
+                            self.packrat_memo[entry_idx] = .{ .kind = .fail, .payload = 0 };
+                        }
+                        return ans;
+                    }
+
+                    // LR was detected. Run LR-ANSWER.
+                    return self.lrAnswer(rule_id, pos, head_idx.?, ans, input, depth);
+                },
+            }
+        }
+
+        /// Warth's SETUP-LR: attach a Head to the frame at lr_idx (creating
+        /// one if needed) and drag every frame above it into the Head's
+        /// involved set.
+        fn setupLr(self: *Self, rule_id: u32, lr_idx: u32) !void {
+            const allocator = self.packrat_allocator.?;
+            const num_rules = self.rules.len;
+
+            if (self.lr_stack.items[lr_idx].head_idx == null) {
+                var involved = try std.DynamicBitSetUnmanaged.initEmpty(allocator, num_rules);
+                const eval = try std.DynamicBitSetUnmanaged.initEmpty(allocator, num_rules);
+                involved.set(rule_id);
+                try self.heads_pool.append(allocator, .{
+                    .rule_id = rule_id,
+                    .involved = involved,
+                    .eval = eval,
+                });
+                self.lr_stack.items[lr_idx].head_idx = @intCast(self.heads_pool.items.len - 1);
+            }
+            const head_idx = self.lr_stack.items[lr_idx].head_idx.?;
+
+            // Walk from the top of lr_stack down until we hit a frame already
+            // pointing at this head; everything we cross is in the cycle.
+            var i: usize = self.lr_stack.items.len;
+            while (i > 0) {
+                i -= 1;
+                const fr = &self.lr_stack.items[i];
+                if (fr.head_idx != null and fr.head_idx.? == head_idx) break;
+                fr.head_idx = head_idx;
+                self.heads_pool.items[head_idx].involved.set(fr.rule_id);
+            }
+        }
+
+        /// Warth's LR-ANSWER: the body finished; if the memo still points
+        /// at a head whose rule matches ours, we're the outer frame and must
+        /// grow. Otherwise we were just a participant and return the seed.
+        fn lrAnswer(
+            self: *Self,
+            rule_id: u32,
+            pos: u32,
+            head_idx: u32,
+            first_ans: ?Result,
+            input: []const u8,
+            depth: usize,
+        ) ?Result {
+            const entry_idx = rule_id * self.memo_stride + pos;
+
+            if (self.heads_pool.items[head_idx].rule_id != rule_id) {
+                // Someone else is the head of this cycle; finalise our own
+                // memo with whatever the first eval produced and hand the
+                // answer back up. Leaving the memo as .lr would leave a
+                // dangling lr_stack index since our frame has been popped.
+                if (first_ans) |ok| {
                     const end: u32 = @intCast(pos + (input.len - ok.rest.len));
                     self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
                 } else {
                     self.packrat_memo[entry_idx] = .{ .kind = .fail, .payload = 0 };
                 }
-                return ans;
+                return first_ans;
             }
 
-            // LR was detected. Run LR-ANSWER.
-            return self.lrAnswer(rule_id, pos, head_idx.?, ans, input, depth);
-        },
-    }
-}
-
-/// Warth's SETUP-LR: attach a Head to the frame at lr_idx (creating
-/// one if needed) and drag every frame above it into the Head's
-/// involved set.
-fn setupLr(self: *const Matcher, rule_id: u32, lr_idx: u32) !void {
-    const m: *Matcher = @constCast(self);
-    const allocator = self.packrat_allocator.?;
-    const num_rules = self.rules.len;
-
-    if (m.lr_stack.items[lr_idx].head_idx == null) {
-        var involved = try std.DynamicBitSetUnmanaged.initEmpty(allocator, num_rules);
-        const eval = try std.DynamicBitSetUnmanaged.initEmpty(allocator, num_rules);
-        involved.set(rule_id);
-        try m.heads_pool.append(allocator, .{
-            .rule_id = rule_id,
-            .involved = involved,
-            .eval = eval,
-        });
-        m.lr_stack.items[lr_idx].head_idx = @intCast(m.heads_pool.items.len - 1);
-    }
-    const head_idx = m.lr_stack.items[lr_idx].head_idx.?;
-
-    // Walk from the top of lr_stack down until we hit a frame already
-    // pointing at this head; everything we cross is in the cycle.
-    var i: usize = m.lr_stack.items.len;
-    while (i > 0) {
-        i -= 1;
-        const fr = &m.lr_stack.items[i];
-        if (fr.head_idx != null and fr.head_idx.? == head_idx) break;
-        fr.head_idx = head_idx;
-        m.heads_pool.items[head_idx].involved.set(fr.rule_id);
-    }
-}
-
-/// Warth's LR-ANSWER: the body finished; if the memo still points
-/// at a head whose rule matches ours, we're the outer frame and must
-/// grow. Otherwise we were just a participant and return the seed.
-fn lrAnswer(
-    self: *const Matcher,
-    rule_id: u32,
-    pos: u32,
-    head_idx: u32,
-    first_ans: ?Result,
-    input: []const u8,
-    depth: usize,
-) ?Result {
-    const m: *Matcher = @constCast(self);
-    const entry_idx = rule_id * self.memo_stride + pos;
-
-    if (m.heads_pool.items[head_idx].rule_id != rule_id) {
-        // Someone else is the head of this cycle; finalise our own
-        // memo with whatever the first eval produced and hand the
-        // answer back up. Leaving the memo as .lr would leave a
-        // dangling lr_stack index since our frame has been popped.
-        if (first_ans) |ok| {
-            const end: u32 = @intCast(pos + (input.len - ok.rest.len));
-            self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
-        } else {
-            self.packrat_memo[entry_idx] = .{ .kind = .fail, .payload = 0 };
+            if (first_ans == null) {
+                self.packrat_memo[entry_idx] = .{ .kind = .fail, .payload = 0 };
+                return null;
+            }
+            const first_end: u32 = @intCast(pos + (input.len - first_ans.?.rest.len));
+            self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = first_end };
+            return self.growLr(rule_id, pos, head_idx, input, depth);
         }
-        return first_ans;
-    }
 
-    if (first_ans == null) {
-        self.packrat_memo[entry_idx] = .{ .kind = .fail, .payload = 0 };
-        return null;
-    }
-    const first_end: u32 = @intCast(pos + (input.len - first_ans.?.rest.len));
-    self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = first_end };
-    return self.growLr(rule_id, pos, head_idx, input, depth);
-}
+        /// Warth's GROW-LR: iteratively re-run the head's body. Each
+        /// iteration resets eval_set = involved_set so all participants get
+        /// re-evaluated exactly once; memo success is consulted otherwise.
+        fn growLr(
+            self: *Self,
+            rule_id: u32,
+            pos: u32,
+            head_idx: u32,
+            input: []const u8,
+            depth: usize,
+        ) ?Result {
+            const entry_idx = rule_id * self.memo_stride + pos;
+            self.heads[pos] = head_idx;
 
-/// Warth's GROW-LR: iteratively re-run the head's body. Each
-/// iteration resets eval_set = involved_set so all participants get
-/// re-evaluated exactly once; memo success is consulted otherwise.
-fn growLr(
-    self: *const Matcher,
-    rule_id: u32,
-    pos: u32,
-    head_idx: u32,
-    input: []const u8,
-    depth: usize,
-) ?Result {
-    const m: *Matcher = @constCast(self);
-    const entry_idx = rule_id * self.memo_stride + pos;
-    m.heads[pos] = head_idx;
+            while (true) {
+                // Reset eval_set = involved_set for this iteration.
+                const h = &self.heads_pool.items[head_idx];
+                var it = h.involved.iterator(.{});
+                h.eval.setRangeValue(.{ .start = 0, .end = h.eval.bit_length }, false);
+                while (it.next()) |bit| h.eval.set(bit);
 
-    while (true) {
-        // Reset eval_set = involved_set for this iteration.
-        const h = &m.heads_pool.items[head_idx];
-        var it = h.involved.iterator(.{});
-        h.eval.setRangeValue(.{ .start = 0, .end = h.eval.bit_length }, false);
-        while (it.next()) |bit| h.eval.set(bit);
+                self.recordBodyEntry(rule_id);
+                const ans = self.matchNode(self.rules[rule_id].node, input, depth + 1);
+                if (ans == null) break;
+                const end: u32 = @intCast(pos + (input.len - ans.?.rest.len));
+                const cur = self.packrat_memo[entry_idx];
+                const cur_end: u32 = if (cur.kind == .success) cur.payload else pos;
+                if (end <= cur_end) break;
+                self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
+            }
 
-        m.rule_body_entries += 1;
-        const ans = self.matchNode(self.rules[rule_id].node, input, depth + 1);
-        if (ans == null) break;
-        const end: u32 = @intCast(pos + (input.len - ans.?.rest.len));
-        const cur = self.packrat_memo[entry_idx];
-        const cur_end: u32 = if (cur.kind == .success) cur.payload else pos;
-        if (end <= cur_end) break;
-        self.packrat_memo[entry_idx] = .{ .kind = .success, .payload = end };
-    }
+            self.heads[pos] = null;
 
-    m.heads[pos] = null;
-
-    const final = self.packrat_memo[entry_idx];
-    if (final.kind == .success) return self.resultFrom(pos, final.payload);
-    return null;
-}
-
-fn asciiLowerBuf(s: []const u8, buf: *[256]u8) ?[]const u8 {
-    if (s.len > buf.len) return null;
-    for (s, 0..) |c, i| {
-        buf[i] = std.ascii.toLower(c);
-    }
-    return buf[0..s.len];
-}
-
-fn matchCoreRule(name: []const u8, input: []const u8) ?Result {
-    // Special cases: multi-byte or always-true rules.
-    if (std.ascii.eqlIgnoreCase("CRLF", name)) {
-        if (input.len >= 2 and input[0] == 0x0D and input[1] == 0x0A)
-            return .{ .value = input[0..2], .rest = input[2..] };
-        return null;
-    }
-    if (std.ascii.eqlIgnoreCase("LWSP", name)) {
-        // *(WSP / CRLF WSP) — zero or more.
-        var rest = input;
-        while (rest.len > 0) {
-            if (rest[0] == 0x20 or rest[0] == 0x09) {
-                rest = rest[1..];
-            } else if (rest.len >= 3 and rest[0] == 0x0D and rest[1] == 0x0A and
-                (rest[2] == 0x20 or rest[2] == 0x09))
-            {
-                rest = rest[3..];
-            } else break;
+            const final = self.packrat_memo[entry_idx];
+            if (final.kind == .success) return self.resultFrom(pos, final.payload);
+            return null;
         }
-        return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
-    }
-    if (std.ascii.eqlIgnoreCase("OCTET", name)) {
-        if (input.len == 0) return null;
-        return .{ .value = input[0..1], .rest = input[1..] };
-    }
 
-    // Single-byte predicate rules — table-driven dispatch.
-    const pred_rules = comptime .{
-        .{ "ALPHA", std.ascii.isAlphabetic },
-        .{ "BIT", isBit },
-        .{ "CHAR", isChar },
-        .{ "CR", matchExact(0x0D) },
-        .{ "LF", matchExact(0x0A) },
-        .{ "CTL", isCtl },
-        .{ "DIGIT", std.ascii.isDigit },
-        .{ "DQUOTE", matchExact(0x22) },
-        .{ "HEXDIG", std.ascii.isHex },
-        .{ "HTAB", matchExact(0x09) },
-        .{ "SP", matchExact(0x20) },
-        .{ "VCHAR", isVchar },
-        .{ "WSP", isWsp },
+        fn asciiLowerBuf(s: []const u8, buf: *[256]u8) ?[]const u8 {
+            if (s.len > buf.len) return null;
+            for (s, 0..) |c, i| {
+                buf[i] = std.ascii.toLower(c);
+            }
+            return buf[0..s.len];
+        }
+
+        fn matchCoreRule(name: []const u8, input: []const u8) ?Result {
+            // Special cases: multi-byte or always-true rules.
+            if (std.ascii.eqlIgnoreCase("CRLF", name)) {
+                if (input.len >= 2 and input[0] == 0x0D and input[1] == 0x0A)
+                    return .{ .value = input[0..2], .rest = input[2..] };
+                return null;
+            }
+            if (std.ascii.eqlIgnoreCase("LWSP", name)) {
+                // *(WSP / CRLF WSP) -- zero or more.
+                var rest = input;
+                while (rest.len > 0) {
+                    if (rest[0] == 0x20 or rest[0] == 0x09) {
+                        rest = rest[1..];
+                    } else if (rest.len >= 3 and rest[0] == 0x0D and rest[1] == 0x0A and
+                        (rest[2] == 0x20 or rest[2] == 0x09))
+                    {
+                        rest = rest[3..];
+                    } else break;
+                }
+                return .{ .value = input[0 .. input.len - rest.len], .rest = rest };
+            }
+            if (std.ascii.eqlIgnoreCase("OCTET", name)) {
+                if (input.len == 0) return null;
+                return .{ .value = input[0..1], .rest = input[1..] };
+            }
+
+            // Single-byte predicate rules -- table-driven dispatch.
+            const pred_rules = comptime .{
+                .{ "ALPHA", std.ascii.isAlphabetic },
+                .{ "BIT", isBit },
+                .{ "CHAR", isChar },
+                .{ "CR", matchExact(0x0D) },
+                .{ "LF", matchExact(0x0A) },
+                .{ "CTL", isCtl },
+                .{ "DIGIT", std.ascii.isDigit },
+                .{ "DQUOTE", matchExact(0x22) },
+                .{ "HEXDIG", std.ascii.isHex },
+                .{ "HTAB", matchExact(0x09) },
+                .{ "SP", matchExact(0x20) },
+                .{ "VCHAR", isVchar },
+                .{ "WSP", isWsp },
+            };
+
+            inline for (pred_rules) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry[0], name))
+                    return matchPred(input, entry[1]);
+            }
+            return null;
+        }
+
+        fn matchPred(input: []const u8, comptime pred: *const fn (u8) bool) ?Result {
+            if (input.len == 0) return null;
+            if (pred(input[0])) return .{ .value = input[0..1], .rest = input[1..] };
+            return null;
+        }
+
+        fn matchExact(comptime expected: u8) *const fn (u8) bool {
+            return struct {
+                fn f(c: u8) bool {
+                    return c == expected;
+                }
+            }.f;
+        }
+
+        fn isBit(c: u8) bool {
+            return c == '0' or c == '1';
+        }
+
+        fn isChar(c: u8) bool {
+            return c >= 0x01 and c <= 0x7F;
+        }
+
+        fn isCtl(c: u8) bool {
+            return c <= 0x1F or c == 0x7F;
+        }
+
+        fn isVchar(c: u8) bool {
+            return c >= 0x21 and c <= 0x7E;
+        }
+
+        fn isWsp(c: u8) bool {
+            return c == 0x20 or c == 0x09;
+        }
     };
-
-    inline for (pred_rules) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry[0], name))
-            return matchPred(input, entry[1]);
-    }
-    return null;
-}
-
-fn matchPred(input: []const u8, comptime pred: *const fn (u8) bool) ?Result {
-    if (input.len == 0) return null;
-    if (pred(input[0])) return .{ .value = input[0..1], .rest = input[1..] };
-    return null;
-}
-
-fn matchExact(comptime expected: u8) *const fn (u8) bool {
-    return struct {
-        fn f(c: u8) bool {
-            return c == expected;
-        }
-    }.f;
-}
-
-fn isBit(c: u8) bool {
-    return c == '0' or c == '1';
-}
-
-fn isChar(c: u8) bool {
-    return c >= 0x01 and c <= 0x7F;
-}
-
-fn isCtl(c: u8) bool {
-    return c <= 0x1F or c == 0x7F;
-}
-
-fn isVchar(c: u8) bool {
-    return c >= 0x21 and c <= 0x7E;
-}
-
-fn isWsp(c: u8) bool {
-    return c == 0x20 or c == 0x09;
 }
 
 const Scanner = @import("abnf/Scanner.zig").Scanner;
@@ -667,6 +755,19 @@ fn compileMatcher(allocator: std.mem.Allocator, grammar: []const u8) !struct { m
     var validator = Validator.init(arena.allocator(), rules);
     const merged = try validator.validate();
     return .{ .matcher = try Matcher.init(arena.allocator(), merged), .arena = arena };
+}
+
+fn compileStatsMatcher(allocator: std.mem.Allocator, grammar: []const u8) !struct { matcher: MatcherWith(.{ .enable_stats = true }), arena: std.heap.ArenaAllocator } {
+    const StatsMatcher = MatcherWith(.{ .enable_stats = true });
+    var scanner = Scanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var parser = Parser.init(tokens, grammar);
+    const rules = try parser.parse();
+    std.debug.assert(parser.getDiagnostics().len == 0);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    var validator = Validator.init(arena.allocator(), rules);
+    const merged = try validator.validate();
+    return .{ .matcher = try StatsMatcher.init(arena.allocator(), merged), .arena = arena };
 }
 
 test "single char_val rule (case-insensitive)" {
@@ -878,7 +979,7 @@ test "packrat: redundant rule re-entry is cached" {
     // "!" fails, so s backtracks to the second alternative which calls
     // e at position 0 again. Without packrat, e is re-evaluated; with
     // packrat, the second call is a table hit.
-    var ctx = try compileMatcher(std.testing.allocator,
+    var ctx = try compileStatsMatcher(std.testing.allocator,
         \\s = (e "!") / (e "?")
         \\e = "a" "b" "c" "d"
     );
@@ -1013,4 +1114,58 @@ test "packrat: indirect LR with three rules in cycle" {
     defer ctx.arena.deinit();
     const r = (try ctx.matcher.matchPackrat(std.testing.allocator, "a", "yxxx")).?;
     try std.testing.expectEqualStrings("yxxx", r.value);
+}
+
+test "stats: counters are zero with default config" {
+    var ctx = try compileMatcher(std.testing.allocator,
+        \\number = 1*DIGIT
+        \\pair   = number "," number
+    );
+    defer ctx.arena.deinit();
+    _ = ctx.matcher.match("pair", "42,7!");
+    const stats = ctx.matcher.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.rule_body_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.memo_hits);
+    try std.testing.expectEqual(@as(u32, 0), stats.max_depth_reached);
+    try std.testing.expect(stats.rule_stats == null);
+}
+
+test "stats: per-rule counters with enable_stats" {
+    var ctx = try compileStatsMatcher(std.testing.allocator,
+        \\s = (e "!") / (e "?")
+        \\e = "a" "b" "c" "d"
+    );
+    defer ctx.arena.deinit();
+
+    _ = try ctx.matcher.matchPackrat(std.testing.allocator, "s", "abcd?");
+    const stats = ctx.matcher.getStats();
+
+    try std.testing.expect(stats.rule_body_entries > 0);
+    try std.testing.expect(stats.memo_hits > 0);
+    try std.testing.expect(stats.max_depth_reached > 0);
+
+    const rs = stats.rule_stats.?;
+    try std.testing.expectEqual(@as(usize, 2), rs.len);
+    // `e` should have at least one memo hit from the second alternative.
+    try std.testing.expect(rs[1].memo_hits > 0);
+}
+
+test "stats: max_depth_reached tracks recursion" {
+    var ctx = try compileStatsMatcher(std.testing.allocator,
+        \\expr = expr "+" DIGIT / DIGIT
+    );
+    defer ctx.arena.deinit();
+    _ = try ctx.matcher.matchPackrat(std.testing.allocator, "expr", "1+2+3");
+    try std.testing.expect(ctx.matcher.max_depth_reached > 0);
+}
+
+test "stats: memo_misses counted on empty entries" {
+    var ctx = try compileStatsMatcher(std.testing.allocator,
+        \\s = (e "!") / (e "?")
+        \\e = "a" "b" "c"
+    );
+    defer ctx.arena.deinit();
+    _ = try ctx.matcher.matchPackrat(std.testing.allocator, "s", "abc?");
+    // First lookup of each (rule, pos) pair is a miss.
+    try std.testing.expect(ctx.matcher.memo_misses > 0);
 }
