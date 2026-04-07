@@ -8,6 +8,10 @@ const I = @import("Instruction.zig");
 pub const Config = struct {
     max_stack: u32 = 1024,
     max_captures: u16 = 64,
+    enable_stats: bool = false,
+    /// Upper bound on code length for per-instruction profiling arrays.
+    /// Only used when `enable_stats` is true.
+    max_code: u32 = 4096,
 };
 
 pub const Vm = VmWith(.{});
@@ -96,6 +100,23 @@ pub fn VmWith(comptime config: Config) type {
             writer: *Writer,
         };
 
+        const opcode_count = std.meta.fields(I.Opcode).len;
+
+        /// Per-instruction profiling counters.
+        pub const InstStat = struct {
+            exec_count: u64,
+            backtrack_count: u64,
+        };
+
+        /// Snapshot of VM profiling statistics.
+        pub const Stats = struct {
+            steps: u64,
+            opcode_exec_counts: [opcode_count]u64,
+            opcode_backtrack_counts: [opcode_count]u64,
+            /// Per-instruction stats, sliced to the actual code length.
+            inst_stats: ?[]const InstStat,
+        };
+
         code: []const I.Inst,
         charsets: []const I.Charset,
         string_data: []const u8,
@@ -115,7 +136,46 @@ pub fn VmWith(comptime config: Config) type {
         heads: []u32 = &.{},
         heads_pool: std.ArrayListUnmanaged(Head) = .empty,
 
+        opcode_exec_counts: [opcode_count]u64 = .{0} ** opcode_count,
+        opcode_backtrack_counts: [opcode_count]u64 = .{0} ** opcode_count,
+        inst_stats: if (config.enable_stats) [config.max_code]InstStat else void =
+            if (config.enable_stats) .{InstStat{ .exec_count = 0, .backtrack_count = 0 }} ** config.max_code else {},
+
         pub const Writer = @TypeOf(@as(std.fs.File.Writer, undefined).interface);
+
+        pub fn getStats(self: *const Self) Stats {
+            return .{
+                .steps = self.steps,
+                .opcode_exec_counts = self.opcode_exec_counts,
+                .opcode_backtrack_counts = self.opcode_backtrack_counts,
+                .inst_stats = if (config.enable_stats)
+                    self.inst_stats[0..self.code.len]
+                else
+                    null,
+            };
+        }
+
+        fn resetStats(self: *Self) void {
+            self.opcode_exec_counts = .{0} ** opcode_count;
+            self.opcode_backtrack_counts = .{0} ** opcode_count;
+            if (config.enable_stats) {
+                @memset(self.inst_stats[0..self.code.len], .{ .exec_count = 0, .backtrack_count = 0 });
+            }
+        }
+
+        inline fn recordExec(self: *Self, pc: u32, op: I.Opcode) void {
+            self.opcode_exec_counts[@intFromEnum(op)] += 1;
+            if (config.enable_stats) {
+                self.inst_stats[pc].exec_count += 1;
+            }
+        }
+
+        inline fn recordBacktrack(self: *Self, pc: u32, op: I.Opcode) void {
+            self.opcode_backtrack_counts[@intFromEnum(op)] += 1;
+            if (config.enable_stats) {
+                self.inst_stats[pc].backtrack_count += 1;
+            }
+        }
 
         pub fn init(code: []const I.Inst, charsets: []const I.Charset, string_data: []const u8, input: []const u8) Self {
             return .{ .code = code, .charsets = charsets, .string_data = string_data, .input = input };
@@ -178,9 +238,11 @@ pub fn VmWith(comptime config: Config) type {
             var sp: usize = 0;
 
             self.steps = 0;
+            self.resetStats();
             while (pc < self.code.len) {
                 const inst = self.code[pc];
                 self.steps += 1;
+                self.recordExec(pc, inst.op);
                 self.traceStep(pc, pos, sp, inst);
                 switch (inst.op) {
                     .char => {
@@ -475,6 +537,7 @@ pub fn VmWith(comptime config: Config) type {
                         if (self.trace) |t| {
                             t.writer.print("      backtrack -> pc={d} pos={d}\n", .{ c.pc, c.pos }) catch {};
                         }
+                        self.recordBacktrack(c.pc, self.code[c.pc].op);
                         pc.* = c.pc;
                         pos.* = c.pos;
                         return true;
@@ -1062,4 +1125,64 @@ test "packrat: captures keep rule out of memoization" {
     );
     defer vm.deinit();
     try testing.expectEqual(@as(?usize, 2), try vm.execute());
+}
+
+const StatsVm = VmWith(.{ .enable_stats = true });
+const StatsCompiler = @import("Compiler.zig").CompilerWith(.{});
+
+test "stats: per-instruction and per-opcode counts" {
+    // "a|b" matching "b" must try "a" (fail), backtrack, then match "b".
+    var compiler = compileEre("a|b");
+    const code = compiler.getCode();
+    var vm = StatsVm.init(code, compiler.getCharsets(), compiler.getStringData(), "b");
+    const result = try vm.execute();
+    try testing.expectEqual(@as(?usize, 1), result);
+
+    const stats = vm.getStats();
+    // At least one instruction executed.
+    try testing.expect(stats.steps > 0);
+    // The choice opcode must have been executed at least once.
+    try testing.expect(stats.opcode_exec_counts[@intFromEnum(I.Opcode.choice)] >= 1);
+    // Since "a" fails and backtracks to "b", there must be at least one backtrack.
+    try testing.expect(stats.opcode_backtrack_counts[@intFromEnum(I.Opcode.char)] >= 1);
+
+    // Per-instruction stats are available.
+    const inst_stats = stats.inst_stats.?;
+    try testing.expectEqual(code.len, inst_stats.len);
+    // Every instruction that executed should have a non-zero exec_count.
+    var total_exec: u64 = 0;
+    for (inst_stats) |s| total_exec += s.exec_count;
+    try testing.expectEqual(stats.steps, total_exec);
+}
+
+test "stats: backtrack counts on choice points" {
+    // "(ab|cd)e" matching "cde": first alternative "ab" fails at 'a',
+    // backtracks to try "cd", which succeeds.
+    var compiler = compileEre("(ab|cd)e");
+    var vm = StatsVm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "cde");
+    const result = try vm.execute();
+    try testing.expectEqual(@as(?usize, 3), result);
+
+    const stats = vm.getStats();
+    const inst_stats = stats.inst_stats.?;
+    // Find choice instructions and verify at least one was backtracked to.
+    var found_backtrack = false;
+    for (inst_stats) |s| {
+        if (s.backtrack_count > 0) found_backtrack = true;
+    }
+    try testing.expect(found_backtrack);
+}
+
+test "stats: reset between executions" {
+    var compiler = compileEre("a|b");
+    var vm = StatsVm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "a");
+    _ = try vm.execute();
+    const steps1 = vm.getStats().steps;
+
+    // Re-run on same input.
+    _ = try vm.execute();
+    const steps2 = vm.getStats().steps;
+
+    // Steps should reflect only the latest execution, not accumulate.
+    try testing.expectEqual(steps1, steps2);
 }
