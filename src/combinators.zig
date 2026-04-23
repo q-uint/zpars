@@ -55,6 +55,26 @@ pub fn CharRange(comptime lo: u8, comptime hi: u8) type {
     }.f);
 }
 
+/// Match a single byte that appears in `chars`.
+pub fn AnyOf(comptime chars: []const u8) type {
+    return Char(struct {
+        fn f(c: u8) bool {
+            inline for (chars) |x| if (c == x) return true;
+            return false;
+        }
+    }.f);
+}
+
+/// Match a single byte that does not appear in `chars`.
+pub fn NoneOf(comptime chars: []const u8) type {
+    return Char(struct {
+        fn f(c: u8) bool {
+            inline for (chars) |x| if (c == x) return false;
+            return true;
+        }
+    }.f);
+}
+
 /// Match any single byte.
 pub const Any = struct {
     pub const Value = u8;
@@ -256,6 +276,40 @@ test "CharRange matches inclusive range" {
 test "CharRange rejects out-of-range" {
     const P = CharRange('a', 'z');
     try std.testing.expect(P.parse("A") == null);
+}
+
+test "AnyOf matches member byte" {
+    const P = AnyOf("+-*/");
+    const r = P.parse("*x").?;
+    try std.testing.expectEqual('*', r.value);
+    try std.testing.expectEqualStrings("x", r.rest);
+}
+
+test "AnyOf rejects non-member" {
+    const P = AnyOf("+-*/");
+    try std.testing.expect(P.parse("a") == null);
+}
+
+test "AnyOf rejects empty input" {
+    const P = AnyOf("+-*/");
+    try std.testing.expect(P.parse("") == null);
+}
+
+test "NoneOf matches non-member byte" {
+    const P = NoneOf("\"\\");
+    const r = P.parse("ab").?;
+    try std.testing.expectEqual('a', r.value);
+    try std.testing.expectEqualStrings("b", r.rest);
+}
+
+test "NoneOf rejects member" {
+    const P = NoneOf("\"\\");
+    try std.testing.expect(P.parse("\"x") == null);
+}
+
+test "NoneOf rejects empty input" {
+    const P = NoneOf("\"\\");
+    try std.testing.expect(P.parse("") == null);
 }
 
 test "Any matches single byte" {
