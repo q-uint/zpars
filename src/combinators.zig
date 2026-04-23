@@ -97,28 +97,63 @@ pub const Eof = struct {
 
 // Combinators
 
-/// Run `A` then `B`; produce a tuple of both values.
-pub fn Sequence(comptime A: type, comptime B: type) type {
+/// Run each parser in `parsers` in order; produce a tuple of their values.
+/// `parsers` must be a tuple of parser types, e.g. `Seq(.{A, B, C})`.
+pub fn Seq(comptime parsers: anytype) type {
+    const N = parsers.len;
+    if (N == 0) @compileError("Seq requires at least one parser");
+
+    comptime var types: [N]type = undefined;
+    inline for (parsers, 0..) |P, i| types[i] = P.Value;
+    const ValueT = std.meta.Tuple(&types);
+
     return struct {
-        pub const Value = struct { A.Value, B.Value };
+        pub const Value = ValueT;
 
         pub fn parse(input: []const u8) ?Result(Value) {
-            const ra = A.parse(input) orelse return null;
-            const rb = B.parse(ra.rest) orelse return null;
-            return .{ .value = .{ ra.value, rb.value }, .rest = rb.rest };
+            var value: Value = undefined;
+            var rest = input;
+            inline for (parsers, 0..) |P, i| {
+                const r = P.parse(rest) orelse return null;
+                value[i] = r.value;
+                rest = r.rest;
+            }
+            return .{ .value = value, .rest = rest };
         }
     };
 }
 
-/// Try `A`; if it fails, try `B`. Both must produce the same Value type.
-pub fn Choice(comptime A: type, comptime B: type) type {
-    if (A.Value != B.Value) @compileError("Choice requires both parsers to have the same Value type");
+/// Try each parser in `parsers` in order; return the first success.
+/// All parsers must produce the same `Value` type.
+pub fn Alt(comptime parsers: anytype) type {
+    const N = parsers.len;
+    if (N == 0) @compileError("Alt requires at least one parser");
+
+    const ValueT = parsers[0].Value;
+    inline for (parsers) |P| {
+        if (P.Value != ValueT) @compileError("Alt requires all parsers to have the same Value type");
+    }
 
     return struct {
-        pub const Value = A.Value;
+        pub const Value = ValueT;
 
         pub fn parse(input: []const u8) ?Result(Value) {
-            return A.parse(input) orelse B.parse(input);
+            inline for (parsers) |P| {
+                if (P.parse(input)) |r| return r;
+            }
+            return null;
+        }
+    };
+}
+
+/// Zero-width negative lookahead: succeed iff `P` fails, consuming no input.
+pub fn Not(comptime P: type) type {
+    return struct {
+        pub const Value = void;
+
+        pub fn parse(input: []const u8) ?Result(Value) {
+            if (P.parse(input) != null) return null;
+            return .{ .value = {}, .rest = input };
         }
     };
 }
@@ -331,37 +366,60 @@ test "Eof rejects non-empty input" {
     try std.testing.expect(Eof.parse("x") == null);
 }
 
-test "Sequence chains two parsers" {
-    const P = Sequence(Literal("ab"), Literal("cd"));
+test "Seq chains two parsers" {
+    const P = Seq(.{ Literal("ab"), Literal("cd") });
     const r = P.parse("abcdef").?;
     try std.testing.expectEqualStrings("ef", r.rest);
 }
 
-test "Sequence fails if first fails" {
-    const P = Sequence(Literal("ab"), Literal("cd"));
+test "Seq fails if first fails" {
+    const P = Seq(.{ Literal("ab"), Literal("cd") });
     try std.testing.expect(P.parse("xxcd") == null);
 }
 
-test "Sequence fails if second fails" {
-    const P = Sequence(Literal("ab"), Literal("cd"));
+test "Seq fails if second fails" {
+    const P = Seq(.{ Literal("ab"), Literal("cd") });
     try std.testing.expect(P.parse("abxx") == null);
 }
 
-test "Choice picks first on success" {
-    const P = Choice(Literal("ab"), Literal("cd"));
+test "Seq chains three parsers" {
+    const P = Seq(.{ Literal("ab"), Literal("cd"), Literal("ef") });
+    const r = P.parse("abcdefgh").?;
+    try std.testing.expectEqualStrings("gh", r.rest);
+}
+
+test "Seq exposes tuple of values" {
+    const P = Seq(.{ CharRange('0', '9'), CharRange('a', 'z'), CharRange('0', '9') });
+    const r = P.parse("1a2rest").?;
+    try std.testing.expectEqual('1', r.value[0]);
+    try std.testing.expectEqual('a', r.value[1]);
+    try std.testing.expectEqual('2', r.value[2]);
+    try std.testing.expectEqualStrings("rest", r.rest);
+}
+
+test "Alt picks first on success" {
+    const P = Alt(.{ Literal("ab"), Literal("cd") });
     const r = P.parse("abXX").?;
     try std.testing.expectEqualStrings("XX", r.rest);
 }
 
-test "Choice falls back to second" {
-    const P = Choice(Literal("ab"), Literal("cd"));
+test "Alt falls back to second" {
+    const P = Alt(.{ Literal("ab"), Literal("cd") });
     const r = P.parse("cdXX").?;
     try std.testing.expectEqualStrings("XX", r.rest);
 }
 
-test "Choice fails if both fail" {
-    const P = Choice(Literal("ab"), Literal("cd"));
+test "Alt fails if all fail" {
+    const P = Alt(.{ Literal("ab"), Literal("cd") });
     try std.testing.expect(P.parse("efgh") == null);
+}
+
+test "Alt with three branches" {
+    const P = Alt(.{ Literal("ab"), Literal("cd"), Literal("ef") });
+    try std.testing.expect(P.parse("abX") != null);
+    try std.testing.expect(P.parse("cdX") != null);
+    try std.testing.expect(P.parse("efX") != null);
+    try std.testing.expect(P.parse("ghX") == null);
 }
 
 test "Many zero-or-more collects matches" {
@@ -404,6 +462,31 @@ test "Optional returns null on no match" {
     try std.testing.expectEqualStrings("xxxx", r.rest);
 }
 
+test "Not succeeds when inner fails, consuming nothing" {
+    const P = Not(Literal("let"));
+    const r = P.parse("foo").?;
+    try std.testing.expectEqualStrings("foo", r.rest);
+}
+
+test "Not fails when inner succeeds" {
+    const P = Not(Literal("let"));
+    try std.testing.expect(P.parse("let x") == null);
+}
+
+test "Not succeeds on empty input when inner needs input" {
+    const P = Not(Literal("x"));
+    const r = P.parse("").?;
+    try std.testing.expectEqualStrings("", r.rest);
+}
+
+test "Not enables keyword vs identifier disambiguation" {
+    // `Word("let")` — match "let" only if not followed by an identifier char.
+    const Alpha = Char(std.ascii.isAlphabetic);
+    const Word = Seq(.{ Literal("let"), Not(Alpha) });
+    try std.testing.expect(Word.parse("let x") != null);
+    try std.testing.expect(Word.parse("letter") == null);
+}
+
 test "Map transforms value" {
     const P = Map(CharRange('0', '9'), struct {
         fn f(c: u8) u8 {
@@ -429,8 +512,8 @@ test "composed: keyword then identifier" {
     const Space = Literal(" ");
     const Alpha = Char(std.ascii.isAlphabetic);
     const AlphaNum = Char(std.ascii.isAlphanumeric);
-    const Ident = Sequence(Alpha, Many(AlphaNum, .{}));
-    const P = Sequence(Sequence(Let, Space), Ident);
+    const Ident = Seq(.{ Alpha, Many(AlphaNum, .{}) });
+    const P = Seq(.{ Let, Space, Ident });
 
     const r = P.parse("let foo123 = 1").?;
     try std.testing.expectEqualStrings(" = 1", r.rest);
@@ -461,7 +544,7 @@ test "CaseInsensitiveLiteral rejects mismatch" {
 }
 
 test "Capture returns matched span" {
-    const P = Capture(Sequence(Literal("ab"), Literal("cd")));
+    const P = Capture(Seq(.{ Literal("ab"), Literal("cd") }));
     const r = P.parse("abcdef").?;
     try std.testing.expectEqualStrings("abcd", r.value);
     try std.testing.expectEqualStrings("ef", r.rest);
@@ -474,13 +557,13 @@ test "Capture with Many returns full span" {
     try std.testing.expectEqualStrings("abc", r.rest);
 }
 
-test "Capture enables heterogeneous Choice" {
-    // Without Capture, Choice(Literal, CharRange) would fail because
+test "Capture enables heterogeneous Alt" {
+    // Without Capture, Alt(.{Literal, CharRange}) would fail because
     // void != u8. Capture makes both produce []const u8.
-    const P = Choice(
+    const P = Alt(.{
         Capture(Literal("ab")),
         Capture(CharRange('0', '9')),
-    );
+    });
     const r1 = P.parse("abXX").?;
     try std.testing.expectEqualStrings("ab", r1.value);
     const r2 = P.parse("5XX").?;

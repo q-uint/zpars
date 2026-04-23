@@ -61,26 +61,26 @@ fn compileNode(comptime node: Ast.Node, comptime rules: []const Ast.Rule, compti
 
 fn compileAlts(comptime alts: []const Ast.Node, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     if (alts.len == 1) return compileNode(alts[0], rules, visited);
-    return c.Choice(
+    return c.Alt(.{
         compileNode(alts[0], rules, visited),
         compileAlts(alts[1..], rules, visited),
-    );
+    });
 }
 
 fn compileConcats(comptime elems: []const Ast.Node, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     if (elems.len == 1) return compileNode(elems[0], rules, visited);
-    return c.Capture(c.Sequence(
+    return c.Capture(c.Seq(.{
         compileNode(elems[0], rules, visited),
         compileConcatsInner(elems[1..], rules, visited),
-    ));
+    }));
 }
 
 fn compileConcatsInner(comptime elems: []const Ast.Node, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
     if (elems.len == 1) return compileNode(elems[0], rules, visited);
-    return c.Sequence(
+    return c.Seq(.{
         compileNode(elems[0], rules, visited),
         compileConcatsInner(elems[1..], rules, visited),
-    );
+    });
 }
 
 fn compileByteSeq(comptime bytes: []const u8) type {
@@ -90,7 +90,7 @@ fn compileByteSeq(comptime bytes: []const u8) type {
 
 fn compileByteSeqInner(comptime bytes: []const u8) type {
     if (bytes.len == 1) return c.ByteLiteral(bytes[0]);
-    return c.Sequence(c.ByteLiteral(bytes[0]), compileByteSeqInner(bytes[1..]));
+    return c.Seq(.{ c.ByteLiteral(bytes[0]), compileByteSeqInner(bytes[1..]) });
 }
 
 fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, comptime visited: anytype) type {
@@ -100,25 +100,25 @@ fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, 
     }
 
     // Core rules (RFC 5234 Appendix B).
-    if (eqlIgnoreCase(name, "ALPHA")) return c.Capture(c.Choice(c.CharRange(0x41, 0x5A), c.CharRange(0x61, 0x7A)));
-    if (eqlIgnoreCase(name, "BIT")) return c.Capture(c.Choice(c.ByteLiteral('0'), c.ByteLiteral('1')));
+    if (eqlIgnoreCase(name, "ALPHA")) return c.Capture(c.Alt(.{ c.CharRange(0x41, 0x5A), c.CharRange(0x61, 0x7A) }));
+    if (eqlIgnoreCase(name, "BIT")) return c.Capture(c.Alt(.{ c.ByteLiteral('0'), c.ByteLiteral('1') }));
     if (eqlIgnoreCase(name, "CHAR")) return c.Capture(c.CharRange(0x01, 0x7F));
     if (eqlIgnoreCase(name, "CR")) return c.Capture(c.ByteLiteral(0x0D));
     if (eqlIgnoreCase(name, "LF")) return c.Capture(c.ByteLiteral(0x0A));
-    if (eqlIgnoreCase(name, "CRLF")) return c.Capture(c.Sequence(c.ByteLiteral(0x0D), c.ByteLiteral(0x0A)));
-    if (eqlIgnoreCase(name, "CTL")) return c.Capture(c.Choice(c.CharRange(0x00, 0x1F), c.ByteLiteral(0x7F)));
+    if (eqlIgnoreCase(name, "CRLF")) return c.Capture(c.Seq(.{ c.ByteLiteral(0x0D), c.ByteLiteral(0x0A) }));
+    if (eqlIgnoreCase(name, "CTL")) return c.Capture(c.Alt(.{ c.CharRange(0x00, 0x1F), c.ByteLiteral(0x7F) }));
     if (eqlIgnoreCase(name, "DIGIT")) return c.Capture(c.CharRange(0x30, 0x39));
     if (eqlIgnoreCase(name, "DQUOTE")) return c.Capture(c.ByteLiteral(0x22));
-    if (eqlIgnoreCase(name, "HEXDIG")) return c.Capture(c.Choice(c.CharRange(0x30, 0x39), c.Choice(c.CharRange(0x41, 0x46), c.CharRange(0x61, 0x66))));
+    if (eqlIgnoreCase(name, "HEXDIG")) return c.Capture(c.Alt(.{ c.CharRange(0x30, 0x39), c.CharRange(0x41, 0x46), c.CharRange(0x61, 0x66) }));
     if (eqlIgnoreCase(name, "HTAB")) return c.Capture(c.ByteLiteral(0x09));
     if (eqlIgnoreCase(name, "OCTET")) return c.Capture(c.CharRange(0x00, 0xFF));
     if (eqlIgnoreCase(name, "SP")) return c.Capture(c.ByteLiteral(0x20));
     if (eqlIgnoreCase(name, "VCHAR")) return c.Capture(c.CharRange(0x21, 0x7E));
-    if (eqlIgnoreCase(name, "WSP")) return c.Capture(c.Choice(c.ByteLiteral(0x20), c.ByteLiteral(0x09)));
-    if (eqlIgnoreCase(name, "LWSP")) return c.Capture(c.Many(c.Choice(
-        c.Capture(c.Choice(c.ByteLiteral(0x20), c.ByteLiteral(0x09))),
-        c.Capture(c.Sequence(c.Sequence(c.ByteLiteral(0x0D), c.ByteLiteral(0x0A)), c.Choice(c.ByteLiteral(0x20), c.ByteLiteral(0x09)))),
-    ), .{}));
+    if (eqlIgnoreCase(name, "WSP")) return c.Capture(c.Alt(.{ c.ByteLiteral(0x20), c.ByteLiteral(0x09) }));
+    if (eqlIgnoreCase(name, "LWSP")) return c.Capture(c.Many(c.Alt(.{
+        c.Capture(c.Alt(.{ c.ByteLiteral(0x20), c.ByteLiteral(0x09) })),
+        c.Capture(c.Seq(.{ c.ByteLiteral(0x0D), c.ByteLiteral(0x0A), c.Alt(.{ c.ByteLiteral(0x20), c.ByteLiteral(0x09) }) })),
+    }), .{}));
 
     // User-defined rules: collect all definitions (handles =/).
     const new_visited = visited ++ .{name};
@@ -303,7 +303,7 @@ test "README: pair" {
 test "README: combinators" {
     const Digit = c.CharRange('0', '9');
     const Number = c.Capture(c.Many(Digit, .{ .min = 1 }));
-    const P = c.Sequence(Number, c.Sequence(c.Literal(","), Number));
+    const P = c.Seq(.{ Number, c.Literal(","), Number });
     const r = c.Capture(P).parse("42,7!").?;
     try std.testing.expectEqualStrings("42,7", r.value);
 }

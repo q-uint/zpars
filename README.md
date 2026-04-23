@@ -67,7 +67,7 @@ const c = zpars.combinators;
 
 const Digit = c.CharRange('0', '9');
 const Number = c.Capture(c.Many(Digit, .{ .min = 1 }));
-const P = c.Sequence(Number, c.Sequence(c.Literal(","), Number));
+const P = c.Seq(.{ Number, c.Literal(","), Number });
 
 const r = c.Capture(P).parse("42,7!").?;
 // r.value == "42,7"
@@ -75,7 +75,7 @@ const r = c.Capture(P).parse("42,7!").?;
 
 Available primitives: `Literal`, `Char`, `CharRange`, `ByteLiteral`, `CaseInsensitiveLiteral`, `Any`, `Eof`.
 
-Available combinators: `Sequence`, `Choice`, `Many`, `Optional`, `Map`, `Capture`.
+Available combinators: `Seq`, `Alt`, `Many`, `Optional`, `Not`, `Map`, `Capture`.
 
 ## Runtime Matcher
 
