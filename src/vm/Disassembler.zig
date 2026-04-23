@@ -108,14 +108,14 @@ test "disassemble literal" {
     var compiler = Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream: std.Io.Writer = .fixed(&buf);
     const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
-    try dis.dump(stream.writer());
+    try dis.dump(&stream);
     try testing.expectEqualStrings(
         \\   0: string  "abc"
         \\   1: match
         \\
-    , stream.getWritten());
+    , stream.buffered());
 }
 
 test "disassemble alternation" {
@@ -126,9 +126,9 @@ test "disassemble alternation" {
     var compiler = Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream: std.Io.Writer = .fixed(&buf);
     const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
-    try dis.dump(stream.writer());
+    try dis.dump(&stream);
     try testing.expectEqualStrings(
         \\   0: choice  -> 3
         \\   1: char    'a'
@@ -136,7 +136,7 @@ test "disassemble alternation" {
         \\   3: char    'b'
         \\   4: match
         \\
-    , stream.getWritten());
+    , stream.buffered());
 }
 
 test "disassemble star" {
@@ -147,16 +147,16 @@ test "disassemble star" {
     var compiler = Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream: std.Io.Writer = .fixed(&buf);
     const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
-    try dis.dump(stream.writer());
+    try dis.dump(&stream);
     try testing.expectEqualStrings(
         \\   0: choice  -> 3
         \\   1: char    'a'
         \\   2: commit  -> 0
         \\   3: match
         \\
-    , stream.getWritten());
+    , stream.buffered());
 }
 
 test "disassemble charset" {
@@ -167,9 +167,9 @@ test "disassemble charset" {
     var compiler = Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream: std.Io.Writer = .fixed(&buf);
     const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
-    try dis.dump(stream.writer());
+    try dis.dump(&stream);
     try testing.expectEqualStrings(
         \\   0: set     [a-z]
         \\   1: choice  -> 4
@@ -177,7 +177,7 @@ test "disassemble charset" {
         \\   3: commit  -> 1
         \\   4: match
         \\
-    , stream.getWritten());
+    , stream.buffered());
 }
 
 test "disassemble capture" {
@@ -188,9 +188,9 @@ test "disassemble capture" {
     var compiler = Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
+    var stream: std.Io.Writer = .fixed(&buf);
     const dis = Disassembler.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData());
-    try dis.dump(stream.writer());
+    try dis.dump(&stream);
     try testing.expectEqualStrings(
         \\   0: char    'a'
         \\   1: save    0
@@ -199,5 +199,5 @@ test "disassemble capture" {
         \\   4: char    'c'
         \\   5: match
         \\
-    , stream.getWritten());
+    , stream.buffered());
 }

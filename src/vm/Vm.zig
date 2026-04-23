@@ -141,7 +141,7 @@ pub fn VmWith(comptime config: Config) type {
         inst_stats: if (config.enable_stats) [config.max_code]InstStat else void =
             if (config.enable_stats) .{InstStat{ .exec_count = 0, .backtrack_count = 0 }} ** config.max_code else {},
 
-        pub const Writer = @TypeOf(@as(std.fs.File.Writer, undefined).interface);
+        pub const Writer = std.Io.Writer;
 
         pub fn getStats(self: *const Self) Stats {
             return .{

@@ -1,5 +1,20 @@
 const std = @import("std");
 const zpars = @import("zpars");
+
+const bench_io = std.Io.Threaded.global_single_threaded.io();
+
+const Timer = struct {
+    start_ns: i96,
+
+    fn start() Timer {
+        return .{ .start_ns = std.Io.Clock.awake.now(bench_io).nanoseconds };
+    }
+
+    fn read(self: Timer) u64 {
+        const now_ns = std.Io.Clock.awake.now(bench_io).nanoseconds;
+        return @intCast(now_ns - self.start_ns);
+    }
+};
 const Abnf = zpars.abnf.Compiler;
 const Matcher = zpars.Matcher;
 const StatsMatcher = zpars.MatcherWith(.{ .enable_stats = true });
@@ -73,7 +88,7 @@ fn benchComptime(comptime idx: usize) u64 {
     var input: []const u8 = cases[idx].input;
     std.mem.doNotOptimizeAway(&input);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         const r = P.parse(input);
@@ -87,7 +102,7 @@ fn benchRuntime(comptime idx: usize, matcher: *Matcher) u64 {
     var input: []const u8 = cases[idx].input;
     std.mem.doNotOptimizeAway(&input);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         const r = matcher.match(cases[idx].rule, input);
@@ -177,7 +192,7 @@ fn benchVm(compiler: *const VmCompiler, input: []const u8) u64 {
     var inp: []const u8 = input;
     std.mem.doNotOptimizeAway(&inp);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), inp);
@@ -195,7 +210,7 @@ fn benchJit(compiler: *const VmCompiler, input: []const u8) u64 {
     var jit = Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), inp) catch unreachable;
     defer jit.deinit();
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         const r = jit.execute();
@@ -227,7 +242,7 @@ fn benchAot(allocator: std.mem.Allocator, compiler: *const VmCompiler, input: []
     var engine = AotRuntime.Engine.init(blob2) catch unreachable;
     defer engine.deinit();
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         const r = engine.execute(inp);
@@ -237,12 +252,12 @@ fn benchAot(allocator: std.mem.Allocator, compiler: *const VmCompiler, input: []
     return timer.read();
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa_allocator = init.gpa;
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     try stdout.print("\n  Comptime vs Runtime (tree-walker)\n", .{});
@@ -255,7 +270,7 @@ pub fn main() !void {
 
     inline for (0..cases.len) |idx| {
         // Build the runtime matcher once (not timed).
-        var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+        var arena = std.heap.ArenaAllocator.init(gpa_allocator);
         defer arena.deinit();
         var matcher = try buildMatcher(arena.allocator(), idx);
 
@@ -352,7 +367,7 @@ pub fn main() !void {
         const comp = compileEre(case.pattern, true);
 
         const jit_ns = benchJit(&comp, case.input);
-        const aot_ns = benchAot(gpa.allocator(), &comp, case.input);
+        const aot_ns = benchAot(gpa_allocator, &comp, case.input);
 
         const jit_per_op = jit_ns / iterations;
         const aot_per_op = aot_ns / iterations;
@@ -382,7 +397,7 @@ pub fn main() !void {
 
     for (packrat_cases) |case| {
         const memo_comp = compilePeg(case.grammar, .{ .memoize = true });
-        const memo_ns = benchVmPackrat(gpa.allocator(), &memo_comp, case.input);
+        const memo_ns = benchVmPackrat(gpa_allocator, &memo_comp, case.input);
         const memo_per = memo_ns / iterations;
 
         if (case.left_recursive) {
@@ -419,11 +434,11 @@ pub fn main() !void {
     try printStatsHeader(stdout);
 
     for (matcher_packrat_cases) |case| {
-        var m_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+        var m_arena = std.heap.ArenaAllocator.init(gpa_allocator);
         defer m_arena.deinit();
         var sm = buildStatsMatcher(m_arena.allocator(), case.grammar) catch continue;
 
-        const memo_ns = benchMatcherPackrat(gpa.allocator(), &sm, case.rule, case.input);
+        const memo_ns = benchMatcherPackrat(gpa_allocator, &sm, case.rule, case.input);
         const memo_per = memo_ns / iterations;
         // Run one more packrat to capture stats (bench loop overwrites each iteration).
         _ = sm.matchPackrat(m_arena.allocator(), case.rule, case.input) catch {};
@@ -506,7 +521,7 @@ fn benchVmPlain(compiler: *const VmCompiler, input: []const u8) u64 {
     var inp: []const u8 = input;
     std.mem.doNotOptimizeAway(&inp);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), inp);
@@ -525,7 +540,7 @@ fn benchVmPackrat(base_allocator: std.mem.Allocator, compiler: *const VmCompiler
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         var vm = Vm.initPackrat(
@@ -632,7 +647,7 @@ fn benchMatcherPlain(matcher: *StatsMatcher, rule: []const u8, input: []const u8
     var inp: []const u8 = input;
     std.mem.doNotOptimizeAway(&inp);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         const r = matcher.match(rule, inp);
@@ -655,7 +670,7 @@ fn benchMatcherPackrat(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Timer.start();
 
     for (0..iterations) |_| {
         const r = matcher.matchPackrat(arena_alloc, rule, inp) catch unreachable;

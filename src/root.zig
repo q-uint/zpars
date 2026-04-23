@@ -99,8 +99,24 @@ test {
     // actually compiled and run. Without this, zig's test runner only
     // pulls in tests transitively reachable from `_ = @import(...)`
     // statements, silently skipping many files.
-    @import("std").testing.refAllDeclsRecursive(@This());
+    //
+    // std.testing.refAllDeclsRecursive was removed in Zig 0.16.0, so we
+    // inline the equivalent here.
+    refAllDeclsRecursive(@This());
     // CnfBuilder is not exposed in the public API above (see comment on
     // `cfg` namespace). Pull its tests in explicitly so they still run.
     _ = @import("cfg/CnfBuilder.zig");
+}
+
+fn refAllDeclsRecursive(comptime T: type) void {
+    if (!@import("builtin").is_test) return;
+    inline for (comptime @import("std").meta.declarations(T)) |decl| {
+        if (@TypeOf(@field(T, decl.name)) == type) {
+            switch (@typeInfo(@field(T, decl.name))) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, decl.name)),
+                else => {},
+            }
+        }
+        _ = &@field(T, decl.name);
+    }
 }

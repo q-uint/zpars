@@ -111,17 +111,20 @@ pub const Bounds = struct {
 
 /// Match `P` repeatedly within the given bounds. Produces a slice of values.
 ///
-/// Allocates into a comptime-sized buffer and returns a slice into the
-/// input-adjacent stack frame, so this is safe for bounded repetitions.
-/// For unbounded repetitions, caps at 4096 to avoid blowing the stack.
+/// Results are written into a per-instantiation threadlocal buffer of size
+/// `bounds.max orelse 4096`. The returned `.value` slice points into that
+/// buffer, so callers must consume it before the next call to
+/// `Many(P, bounds).parse` on the same thread — a second call clobbers the
+/// first's results. Wrap with `Capture` if you need a slice of `input` instead.
 pub fn Many(comptime P: type, comptime bounds: Bounds) type {
     const limit = bounds.max orelse 4096;
 
     return struct {
         pub const Value = []const P.Value;
 
+        threadlocal var buf: [limit]P.Value = undefined;
+
         pub fn parse(input: []const u8) ?Result(Value) {
-            var buf: [limit]P.Value = undefined;
             var count: usize = 0;
             var rest = input;
 

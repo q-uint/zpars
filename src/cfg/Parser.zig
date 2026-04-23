@@ -26,6 +26,8 @@ pub fn ParserWith(comptime config: Config) type {
     return struct {
         const Self = @This();
 
+        pub const max_diagnostics = config.max_diagnostics;
+
         const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{.newline}, .{
             .name_tag = .identifier,
             .def_tags = &.{.arrow},
@@ -327,13 +329,13 @@ test "format round-trip" {
     );
 
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.fmt.format(fbs.writer(), "{f}", .{result.cfg});
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try fbs.print("{f}", .{result.cfg});
     try std.testing.expectEqualStrings(
         \\S → A %x78
         \\A → "hello"
         \\A → ε
-    , fbs.getWritten());
+    , fbs.buffered());
 }
 
 test "recovery: missing arrow" {

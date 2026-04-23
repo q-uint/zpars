@@ -186,7 +186,7 @@ const Parser = struct {
         }
         // Decode.
         const decoder = std.base64.standard.decoderWithIgnore("");
-        const decoded_len = decoder.calcSizeUpperBound(clean.items.len) catch return error.InvalidSexp;
+        const decoded_len = decoder.calcSizeUpperBound(clean.items.len);
         const out = try allocator.alloc(u8, decoded_len);
         const actual_len = decoder.decode(out, clean.items) catch return error.InvalidSexp;
         if (actual_len < out.len) {

@@ -31,6 +31,8 @@ pub fn ParserWith(comptime config: Config) type {
     return struct {
         const Self = @This();
 
+        pub const max_diagnostics = config.max_diagnostics;
+
         const primitives = parser_base.ParserBase(Self, Token, Diagnostic, &.{}, .{
             .name_tag = .eof,
             .def_tags = &.{},

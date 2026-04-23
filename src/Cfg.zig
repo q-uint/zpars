@@ -263,13 +263,13 @@ test "format produces readable output" {
     };
 
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try cfg.formatProduction(cfg.productions[0], fbs.writer());
-    try std.testing.expectEqualStrings("S → A %x78", fbs.getWritten());
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try cfg.formatProduction(cfg.productions[0], &fbs);
+    try std.testing.expectEqualStrings("S → A %x78", fbs.buffered());
 
-    fbs.reset();
-    try cfg.formatProduction(cfg.productions[2], fbs.writer());
-    try std.testing.expectEqualStrings("A → ε", fbs.getWritten());
+    fbs.end = 0;
+    try cfg.formatProduction(cfg.productions[2], &fbs);
+    try std.testing.expectEqualStrings("A → ε", fbs.buffered());
 }
 
 test "parse: basic nonterminal and string terminal" {

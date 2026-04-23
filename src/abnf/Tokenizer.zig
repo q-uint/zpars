@@ -41,28 +41,31 @@ fn buildScannerType(comptime rules: []const Ast.Rule, comptime config: Config) t
     const has_catch_all = config.catch_all != null;
     const tag_count = rule_count + @as(usize, if (has_catch_all) 1 else 0) + 2; // +eof +invalid
 
-    const GeneratedTag = @Type(.{ .@"enum" = .{
-        .tag_type = std.math.IntFittingRange(0, tag_count - 1),
-        .fields = blk: {
-            var fields: [tag_count]std.builtin.Type.EnumField = undefined;
-            var i: usize = 0;
-            for (rules) |rule| {
-                const name_z: [:0]const u8 = (rule.name ++ .{0})[0..rule.name.len :0];
-                fields[i] = .{ .name = name_z, .value = i };
-                i += 1;
-            }
-            if (has_catch_all) {
-                fields[i] = .{ .name = config.catch_all.?, .value = i };
-                i += 1;
-            }
-            fields[i] = .{ .name = "eof", .value = i };
+    const IntTag = std.math.IntFittingRange(0, tag_count - 1);
+    const GeneratedTag = gen: {
+        var names: [tag_count][:0]const u8 = undefined;
+        var values: [tag_count]IntTag = undefined;
+        var i: usize = 0;
+        for (rules) |rule| {
+            const name_z: [:0]const u8 = (rule.name ++ .{0})[0..rule.name.len :0];
+            names[i] = name_z;
+            values[i] = @intCast(i);
             i += 1;
-            fields[i] = .{ .name = "invalid", .value = i };
-            break :blk &fields;
-        },
-        .decls = &.{},
-        .is_exhaustive = true,
-    } });
+        }
+        if (has_catch_all) {
+            names[i] = config.catch_all.?;
+            values[i] = @intCast(i);
+            i += 1;
+        }
+        names[i] = "eof";
+        values[i] = @intCast(i);
+        i += 1;
+        names[i] = "invalid";
+        values[i] = @intCast(i);
+        const names_final = names;
+        const values_final = values;
+        break :gen @Enum(IntTag, .exhaustive, &names_final, &values_final);
+    };
 
     const GeneratedToken = tok.Token(GeneratedTag);
 

@@ -114,9 +114,9 @@ fn isMetachar(c: u8) bool {
 
 fn format(node: Ast.Node) ![]const u8 {
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try formatRule(.{ .name = "", .node = node, .incremental = false }, fbs.writer());
-    const written = fbs.getWritten();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try formatRule(.{ .name = "", .node = node, .incremental = false }, &fbs);
+    const written = fbs.buffered();
     // Copy to test allocator so we can return it.
     const copy = try std.testing.allocator.alloc(u8, written.len);
     @memcpy(copy, written);

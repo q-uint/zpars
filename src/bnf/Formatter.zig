@@ -62,9 +62,9 @@ fn expectFmt(expected: []const u8, input: []const u8) !void {
     const rules = try parser.parse();
     std.debug.assert(parser.getDiagnostics().len == 0);
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try formatGrammar(rules, fbs.writer());
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try formatGrammar(rules, &fbs);
+    try std.testing.expectEqualStrings(expected, fbs.buffered());
 }
 
 test "simple rule" {

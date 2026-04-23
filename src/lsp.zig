@@ -10,6 +10,7 @@ const std = @import("std");
 const zpars = @import("zpars");
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 const Language = enum { abnf, bnf, peg, cfg };
 
@@ -201,14 +202,16 @@ const DiagInfo = struct {
 
 const Server = struct {
     allocator: Allocator,
+    io: Io,
     documents: std.StringHashMap(Document),
-    stdout: std.fs.File,
+    stdout: Io.File,
 
-    fn init(allocator: Allocator) Server {
+    fn init(allocator: Allocator, io: Io) Server {
         return .{
             .allocator = allocator,
+            .io = io,
             .documents = std.StringHashMap(Document).init(allocator),
-            .stdout = std.fs.File.stdout(),
+            .stdout = Io.File.stdout(),
         };
     }
 
@@ -224,8 +227,8 @@ const Server = struct {
     fn send(self: *Server, json: []const u8) !void {
         var header_buf: [64]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{json.len}) catch unreachable;
-        _ = try self.stdout.write(header);
-        _ = try self.stdout.write(json);
+        try self.stdout.writeStreamingAll(self.io, header);
+        try self.stdout.writeStreamingAll(self.io, json);
     }
 
     fn sendJson(self: *Server, buf: *std.ArrayListUnmanaged(u8)) !void {
@@ -271,7 +274,7 @@ const Server = struct {
     }
 
     fn respondNull(self: *Server, id: std.json.Value) !void {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         const jw = JsonWriter.init(&buf, self.allocator);
         try jw.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
@@ -281,7 +284,7 @@ const Server = struct {
     }
 
     fn handleInitialize(self: *Server, id: std.json.Value) !void {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         const jw = JsonWriter.init(&buf, self.allocator);
 
@@ -356,7 +359,7 @@ const Server = struct {
         const uri = jsonGetString(td, "uri") orelse return;
 
         // Clear diagnostics.
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         const jw = JsonWriter.init(&buf, self.allocator);
         try jw.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
@@ -381,7 +384,7 @@ const Server = struct {
             .cfg => collectDiags(zpars.cfg.Scanner, zpars.cfg.Parser, doc.text, arena) catch &.{},
         };
 
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         const jw = JsonWriter.init(&buf, self.allocator);
 
@@ -458,7 +461,7 @@ const Server = struct {
             .cfg => encodeSemanticTokensGeneric(zpars.cfg.Scanner, &cfg_tag_map, doc.text),
         };
 
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         const jw = JsonWriter.init(&buf, self.allocator);
 
@@ -528,7 +531,7 @@ const Server = struct {
             return;
         };
 
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         const jw = JsonWriter.init(&buf, self.allocator);
 
@@ -624,17 +627,18 @@ fn jsonGetString(val: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
-fn readMessage(stdin: std.fs.File, allocator: Allocator) !?std.json.Parsed(std.json.Value) {
+fn readMessage(stdin: *Io.Reader, allocator: Allocator) !?std.json.Parsed(std.json.Value) {
     var content_length: ?usize = null;
     var header_buf: [256]u8 = undefined;
     var header_pos: usize = 0;
 
     while (true) {
-        var byte: [1]u8 = undefined;
-        const n = try stdin.read(&byte);
-        if (n == 0) return null;
+        const b = stdin.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return err,
+        };
 
-        if (byte[0] == '\n') {
+        if (b == '\n') {
             const line = header_buf[0..header_pos];
             const trimmed = if (line.len > 0 and line[line.len - 1] == '\r')
                 line[0 .. line.len - 1]
@@ -651,7 +655,7 @@ fn readMessage(stdin: std.fs.File, allocator: Allocator) !?std.json.Parsed(std.j
             header_pos = 0;
         } else {
             if (header_pos < header_buf.len) {
-                header_buf[header_pos] = byte[0];
+                header_buf[header_pos] = b;
                 header_pos += 1;
             }
         }
@@ -661,27 +665,26 @@ fn readMessage(stdin: std.fs.File, allocator: Allocator) !?std.json.Parsed(std.j
     const body = try allocator.alloc(u8, len);
     defer allocator.free(body);
 
-    var read_so_far: usize = 0;
-    while (read_so_far < len) {
-        const n = try stdin.read(body[read_so_far..]);
-        if (n == 0) return null;
-        read_so_far += n;
-    }
+    stdin.readSliceAll(body) catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => return err,
+    };
 
     return try std.json.parseFromSlice(std.json.Value, allocator, body, .{
         .allocate = .alloc_always,
     });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    var server = Server.init(allocator);
+    var server = Server.init(allocator, io);
     defer server.deinit();
 
-    const stdin = std.fs.File.stdin();
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = Io.File.stdin().reader(io, &stdin_buf);
+    const stdin = &stdin_reader.interface;
 
     while (true) {
         var parsed = readMessage(stdin, allocator) catch continue orelse break;

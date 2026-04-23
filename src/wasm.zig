@@ -254,7 +254,7 @@ fn analyzeSexp(source_ptr: [*]const u8, source_len: usize) ?[*]const u8 {
 }
 
 export fn analyze(lang: u8, ptr: [*]const u8, len: usize) ?[*]const u8 {
-    const language = std.meta.intToEnum(Language, lang) catch return null;
+    const language = std.enums.fromInt(Language, lang) orelse return null;
     return switch (language) {
         .abnf => analyzeGeneric(root.abnf.Scanner, root.abnf.Parser, ptr, len),
         .bnf => analyzeGeneric(root.bnf.Scanner, root.bnf.Parser, ptr, len),
@@ -285,24 +285,24 @@ fn formatGeneric(
     const rules = parser.parse() catch return null;
     if (rules.len == 0) return null;
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    defer out.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
     // Reserve 4 bytes for length header.
-    out.appendNTimes(allocator, 0, 4) catch return null;
+    aw.writer.writeAll(&[_]u8{ 0, 0, 0, 0 }) catch return null;
 
-    const writer = out.writer(allocator);
     if (with_tokens) {
-        Formatter.formatGrammar(rules, tokens, source, writer) catch return null;
+        Formatter.formatGrammar(rules, tokens, source, &aw.writer) catch return null;
     } else {
-        Formatter.formatGrammar(rules, writer) catch return null;
+        Formatter.formatGrammar(rules, &aw.writer) catch return null;
     }
 
-    const str_len: u32 = @intCast(out.items.len - 4);
-    @memcpy(out.items[0..4], std.mem.asBytes(&str_len));
+    const written = aw.writer.buffered();
+    const str_len: u32 = @intCast(written.len - 4);
+    @memcpy(written[0..4], std.mem.asBytes(&str_len));
 
     // Transfer ownership to caller.
-    const slice = out.toOwnedSlice(allocator) catch return null;
+    const slice = aw.toOwnedSlice() catch return null;
     return slice.ptr;
 }
 
@@ -316,21 +316,22 @@ fn formatEre(source_ptr: [*]const u8, source_len: usize) ?[*]const u8 {
     const rules = parser.parse() catch return null;
     if (rules.len == 0) return null;
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    defer out.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    out.appendNTimes(allocator, 0, 4) catch return null;
-    root.ere.Formatter.formatRule(rules[0], out.writer(allocator)) catch return null;
+    aw.writer.writeAll(&[_]u8{ 0, 0, 0, 0 }) catch return null;
+    root.ere.Formatter.formatRule(rules[0], &aw.writer) catch return null;
 
-    const str_len: u32 = @intCast(out.items.len - 4);
-    @memcpy(out.items[0..4], std.mem.asBytes(&str_len));
+    const written = aw.writer.buffered();
+    const str_len: u32 = @intCast(written.len - 4);
+    @memcpy(written[0..4], std.mem.asBytes(&str_len));
 
-    const slice = out.toOwnedSlice(allocator) catch return null;
+    const slice = aw.toOwnedSlice() catch return null;
     return slice.ptr;
 }
 
 export fn format(lang: u8, ptr: [*]const u8, len: usize) ?[*]const u8 {
-    const language = std.meta.intToEnum(Language, lang) catch return null;
+    const language = std.enums.fromInt(Language, lang) orelse return null;
     return switch (language) {
         .abnf => formatGeneric(root.abnf.Scanner, root.abnf.Parser, root.abnf.Formatter, true, ptr, len),
         .bnf => formatGeneric(root.bnf.Scanner, root.bnf.Parser, root.bnf.Formatter, false, ptr, len),
@@ -401,7 +402,7 @@ export fn match(
     input_ptr: [*]const u8,
     input_len: usize,
 ) ?[*]const u8 {
-    const language = std.meta.intToEnum(Language, lang) catch return null;
+    const language = std.enums.fromInt(Language, lang) orelse return null;
     return switch (language) {
         .abnf => matchGeneric(root.abnf.Scanner, root.abnf.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),
         .peg => matchGeneric(root.peg.Scanner, root.peg.Parser, grammar_ptr, grammar_len, rule_ptr, rule_len, input_ptr, input_len),

@@ -1,13 +1,14 @@
 const std = @import("std");
 const zpars = @import("zpars");
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+const Io = std.Io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
+    const arena = init.arena.allocator();
+
+    const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
         printUsage();
@@ -16,17 +17,17 @@ pub fn main() !void {
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "check")) {
-        try runCheck(allocator, args[2..]);
+        try runCheck(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "compile")) {
-        try runCompile(allocator, args[2..]);
+        try runCompile(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "fmt")) {
-        try runFmt(allocator, args[2..]);
+        try runFmt(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "match")) {
-        try runMatch(allocator, args[2..]);
+        try runMatch(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "run")) {
-        try runAot(allocator, args[2..]);
+        try runAot(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "vm")) {
-        try runVm(allocator, args[2..]);
+        try runVm(io, allocator, args[2..]);
     } else {
         printUsage();
         std.process.exit(1);
@@ -86,18 +87,18 @@ fn parseGrammar(
     return .{ .rules = rules, .tokens = tokens };
 }
 
-fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runCheck(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("usage: zpars check <file>\n", .{});
         std.process.exit(1);
     }
 
     const filename = args[0];
-    const source = try readSource(allocator, filename);
+    const source = try readSource(io, allocator, filename);
     defer allocator.free(source);
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     const rules = switch (detectFormat(filename)) {
@@ -120,22 +121,22 @@ fn runCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     stderr.flush() catch {};
 }
 
-fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runFmt(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 1) {
         std.debug.print("usage: zpars fmt <file>\n", .{});
         std.process.exit(1);
     }
 
     const filename = args[0];
-    const source = try readSource(allocator, filename);
+    const source = try readSource(io, allocator, filename);
     defer allocator.free(source);
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     switch (detectFormat(filename)) {
@@ -168,7 +169,7 @@ fn runFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.flush();
 }
 
-fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runMatch(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var rule_name: ?[]const u8 = null;
     var filename: ?[]const u8 = null;
     var input: ?[]const u8 = null;
@@ -201,11 +202,11 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    const source = try readSource(allocator, filename.?);
+    const source = try readSource(io, allocator, filename.?);
     defer allocator.free(source);
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     const rules = switch (fmt) {
@@ -234,14 +235,14 @@ fn runMatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     try stdout.print("{s}\n", .{result.value});
     try stdout.flush();
 }
 
-fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runVm(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var filename: ?[]const u8 = null;
     var input: ?[]const u8 = null;
     var trace_enabled = false;
@@ -264,11 +265,11 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    const source = try readSource(allocator, filename.?);
+    const source = try readSource(io, allocator, filename.?);
     defer allocator.free(source);
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     const rules = switch (detectFormat(filename.?)) {
@@ -284,7 +285,7 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const string_data = compiler.getStringData();
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     const dis = zpars.vm.Disassembler.init(code, charsets, string_data);
@@ -330,7 +331,7 @@ fn runVm(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.flush();
 }
 
-fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runCompile(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var filename: ?[]const u8 = null;
     var output: ?[]const u8 = null;
 
@@ -353,11 +354,11 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    const source = try readSource(allocator, filename.?);
+    const source = try readSource(io, allocator, filename.?);
     defer allocator.free(source);
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     const rules = switch (detectFormat(filename.?)) {
@@ -378,14 +379,14 @@ fn runCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     );
     defer zpars.vm.Aot.freeBlob(allocator, &blob);
 
-    const file = try std.fs.cwd().createFile(output.?, .{});
-    defer file.close();
+    const file = try Io.Dir.cwd().createFile(io, output.?, .{});
+    defer file.close(io);
     const data = try zpars.vm.Aot.serializeBlob(allocator, blob);
     defer allocator.free(data);
-    try file.writeAll(data);
+    try file.writeStreamingAll(io, data);
 }
 
-fn runAot(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runAot(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 2) {
         std.debug.print("usage: zpars run <blob> <input>\n", .{});
         std.process.exit(1);
@@ -394,7 +395,7 @@ fn runAot(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const blob_path = args[0];
     const input = args[1];
 
-    const blob_data = try readSource(allocator, blob_path);
+    const blob_data = try readSource(io, allocator, blob_path);
     defer allocator.free(blob_data);
 
     var blob = zpars.vm.Aot.deserializeBlob(allocator, blob_data) catch |err| {
@@ -404,7 +405,7 @@ fn runAot(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer zpars.vm.Aot.freeBlob(allocator, &blob);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     if (zpars.vm.AotRuntime.run(blob, input)) |pos| {
@@ -415,8 +416,8 @@ fn runAot(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.flush();
 }
 
-fn readSource(allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {
-    return std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024);
+fn readSource(io: Io, allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {
+    return Io.Dir.cwd().readFileAlloc(io, filename, allocator, .limited(1024 * 1024));
 }
 
 /// Report validation diagnostics. Returns true if any errors were found.

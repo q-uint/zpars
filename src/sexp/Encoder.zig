@@ -11,6 +11,7 @@ const Value = sexp.Value;
 const String = sexp.String;
 const Scanner = @import("Scanner.zig");
 
+const Writer = std.Io.Writer;
 const hex_chars = "0123456789abcdef";
 
 /// Encode in canonical transport representation (RFC 9804 §6.2).
@@ -18,7 +19,7 @@ const hex_chars = "0123456789abcdef";
 /// Every octet-string uses verbatim `length:data` encoding, no whitespace
 /// appears anywhere, and display hints use `[len:hint]len:data`. This is
 /// the unique, deterministic representation used for digital signatures.
-pub fn canonical(value: Value, writer: anytype) @TypeOf(writer).Error!void {
+pub fn canonical(value: Value, writer: *Writer) Writer.Error!void {
     switch (value) {
         .string => |str| try writeCanonicalString(str, writer),
         .list => |items| {
@@ -35,15 +36,15 @@ pub fn canonical(value: Value, writer: anytype) @TypeOf(writer).Error!void {
 ///
 /// The entire canonical form is base64-encoded and wrapped in `{…}`.
 /// Needs an allocator for the intermediate canonical buffer.
-pub fn basic(value: Value, allocator: std.mem.Allocator, writer: anytype) (std.mem.Allocator.Error || @TypeOf(writer).Error)!void {
+pub fn basic(value: Value, allocator: std.mem.Allocator, writer: *Writer) (std.mem.Allocator.Error || Writer.Error)!void {
     // Buffer the canonical form.
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try canonical(value, buf.writer(allocator));
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try canonical(value, &aw.writer);
     // Wrap in {base64}.
     try writer.writeByte('{');
     const encoder = std.base64.standard.Encoder;
-    try encoder.encodeWriter(writer, buf.items);
+    try encoder.encodeWriter(writer, aw.writer.buffered());
     try writer.writeByte('}');
 }
 
@@ -53,7 +54,7 @@ pub fn basic(value: Value, allocator: std.mem.Allocator, writer: anytype) (std.m
 /// tokens where possible, quoted strings for printable ASCII, and
 /// hexadecimal `#…#` for binary data. List elements are separated
 /// by a single space.
-pub fn advanced(value: Value, writer: anytype) @TypeOf(writer).Error!void {
+pub fn advanced(value: Value, writer: *Writer) Writer.Error!void {
     switch (value) {
         .string => |str| try writeAdvancedString(str, writer),
         .list => |items| {
@@ -68,13 +69,13 @@ pub fn advanced(value: Value, writer: anytype) @TypeOf(writer).Error!void {
 }
 
 /// Write verbatim encoding: `length:data`.
-fn writeVerbatim(data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
+fn writeVerbatim(data: []const u8, writer: *Writer) Writer.Error!void {
     try writer.print("{d}:", .{data.len});
     try writer.writeAll(data);
 }
 
 /// Write a canonical octet-string, with optional display hint.
-fn writeCanonicalString(str: String, writer: anytype) @TypeOf(writer).Error!void {
+fn writeCanonicalString(str: String, writer: *Writer) Writer.Error!void {
     if (str.display) |hint| {
         try writer.writeByte('[');
         try writeVerbatim(hint, writer);
@@ -102,7 +103,7 @@ fn isPrintable(data: []const u8) bool {
 }
 
 /// Write a quoted string with C-style escapes.
-fn writeQuoted(data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
+fn writeQuoted(data: []const u8, writer: *Writer) Writer.Error!void {
     try writer.writeByte('"');
     for (data) |c| {
         switch (c) {
@@ -130,7 +131,7 @@ fn writeQuoted(data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
 }
 
 /// Write hexadecimal encoding: `#hex_pairs#`.
-fn writeHex(data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
+fn writeHex(data: []const u8, writer: *Writer) Writer.Error!void {
     try writer.writeByte('#');
     for (data) |c| {
         try writer.writeByte(hex_chars[c >> 4]);
@@ -142,7 +143,7 @@ fn writeHex(data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
 /// Write an advanced-transport octet-string atom (without display hint).
 ///
 /// Strategy: token > quoted string > hex.
-fn writeAdvancedAtom(data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
+fn writeAdvancedAtom(data: []const u8, writer: *Writer) Writer.Error!void {
     if (isToken(data)) {
         try writer.writeAll(data);
     } else if (isPrintable(data)) {
@@ -153,7 +154,7 @@ fn writeAdvancedAtom(data: []const u8, writer: anytype) @TypeOf(writer).Error!vo
 }
 
 /// Write an advanced-transport octet-string with optional display hint.
-fn writeAdvancedString(str: String, writer: anytype) @TypeOf(writer).Error!void {
+fn writeAdvancedString(str: String, writer: *Writer) Writer.Error!void {
     if (str.display) |hint| {
         try writer.writeByte('[');
         try writeAdvancedAtom(hint, writer);
@@ -164,23 +165,23 @@ fn writeAdvancedString(str: String, writer: anytype) @TypeOf(writer).Error!void 
 
 fn expectCanonical(expected: []const u8, value: Value) !void {
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try canonical(value, fbs.writer());
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    var fbs: Writer = .fixed(&buf);
+    try canonical(value, &fbs);
+    try std.testing.expectEqualStrings(expected, fbs.buffered());
 }
 
 fn expectAdvanced(expected: []const u8, value: Value) !void {
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try advanced(value, fbs.writer());
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    var fbs: Writer = .fixed(&buf);
+    try advanced(value, &fbs);
+    try std.testing.expectEqualStrings(expected, fbs.buffered());
 }
 
 fn expectBasic(expected: []const u8, value: Value) !void {
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try basic(value, std.testing.allocator, fbs.writer());
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    var fbs: Writer = .fixed(&buf);
+    try basic(value, std.testing.allocator, &fbs);
+    try std.testing.expectEqualStrings(expected, fbs.buffered());
 }
 
 fn expectValuesEqual(a: Value, b: Value) !void {
@@ -372,11 +373,11 @@ test "round-trip: advanced -> canonical -> parse" {
 
     // Encode canonical.
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try canonical(r1.value, fbs.writer());
+    var fbs: Writer = .fixed(&buf);
+    try canonical(r1.value, &fbs);
 
     // Parse the canonical output.
-    const r2 = try sexp.parse(a, fbs.getWritten());
+    const r2 = try sexp.parse(a, fbs.buffered());
 
     // Values must match.
     try expectValuesEqual(r1.value, r2.value);
@@ -390,10 +391,10 @@ test "round-trip: canonical -> advanced -> parse" {
     const r1 = try sexp.parse(a, "(6:issuer3:bob)");
 
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try advanced(r1.value, fbs.writer());
+    var fbs: Writer = .fixed(&buf);
+    try advanced(r1.value, &fbs);
 
-    const r2 = try sexp.parse(a, fbs.getWritten());
+    const r2 = try sexp.parse(a, fbs.buffered());
     try expectValuesEqual(r1.value, r2.value);
 }
 
@@ -406,10 +407,10 @@ test "round-trip: snicker example" {
 
     // Encode canonical, then parse back.
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try canonical(r1.value, fbs.writer());
+    var fbs: Writer = .fixed(&buf);
+    try canonical(r1.value, &fbs);
 
-    const r2 = try sexp.parse(a, fbs.getWritten());
+    const r2 = try sexp.parse(a, fbs.buffered());
     try expectValuesEqual(r1.value, r2.value);
 }
 
@@ -425,11 +426,11 @@ test "round-trip: basic transport" {
 
     // Encode as basic.
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try basic(original, std.testing.allocator, fbs.writer());
+    var fbs: Writer = .fixed(&buf);
+    try basic(original, std.testing.allocator, &fbs);
 
     // Parse the basic output.
-    const r = try sexp.parse(a, fbs.getWritten());
+    const r = try sexp.parse(a, fbs.buffered());
     try expectValuesEqual(original, r.value);
 }
 
@@ -441,11 +442,11 @@ test "round-trip: display hint through canonical" {
     const r1 = try sexp.parse(a, "(4:icon[12:image/bitmap]9:xxxxxxxxx)");
 
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try canonical(r1.value, fbs.writer());
-    try std.testing.expectEqualStrings("(4:icon[12:image/bitmap]9:xxxxxxxxx)", fbs.getWritten());
+    var fbs: Writer = .fixed(&buf);
+    try canonical(r1.value, &fbs);
+    try std.testing.expectEqualStrings("(4:icon[12:image/bitmap]9:xxxxxxxxx)", fbs.buffered());
 
-    const r2 = try sexp.parse(a, fbs.getWritten());
+    const r2 = try sexp.parse(a, fbs.buffered());
     try expectValuesEqual(r1.value, r2.value);
 }
 
@@ -457,9 +458,9 @@ test "round-trip: display hint through advanced" {
     const r1 = try sexp.parse(a, "[image/gif]\"data\"");
 
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try advanced(r1.value, fbs.writer());
+    var fbs: Writer = .fixed(&buf);
+    try advanced(r1.value, &fbs);
 
-    const r2 = try sexp.parse(a, fbs.getWritten());
+    const r2 = try sexp.parse(a, fbs.buffered());
     try expectValuesEqual(r1.value, r2.value);
 }

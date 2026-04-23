@@ -424,7 +424,7 @@ pub fn compile(self: *Jit) !void {
     self.native_code = try std.posix.mmap(
         null,
         size,
-        std.c.PROT.READ | std.c.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -434,9 +434,9 @@ pub fn compile(self: *Jit) !void {
     self.native_len = result.native_len;
     self.jump_table = result.jump_table;
 
-    try std.posix.mprotect(
+    try std.process.protectMemory(
         @alignCast(self.native_code[0..size]),
-        std.c.PROT.READ | std.c.PROT.EXEC,
+        .{ .read = true, .execute = true },
     );
 }
 

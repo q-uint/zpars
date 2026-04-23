@@ -24,6 +24,8 @@ pub fn ScannerWith(comptime config: Config) type {
     return struct {
         const Self = @This();
 
+        pub const max_tokens = config.max_tokens;
+
         source: []const u8,
         tokens: [config.max_tokens]Token = undefined,
         token_count: usize = 0,

@@ -23,15 +23,15 @@ pub const Engine = struct {
         const exec_mem = try std.posix.mmap(
             null,
             size,
-            std.c.PROT.READ | std.c.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
             -1,
             0,
         );
         @memcpy(exec_mem[0..blob.native_code.len], blob.native_code);
-        try std.posix.mprotect(
+        try std.process.protectMemory(
             @alignCast(exec_mem[0..size]),
-            std.c.PROT.READ | std.c.PROT.EXEC,
+            .{ .read = true, .execute = true },
         );
 
         var jt = [_]u64{0} ** 4096;
