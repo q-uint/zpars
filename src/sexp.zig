@@ -64,7 +64,7 @@ const Parser = struct {
             .hexadecimal => .{ .string = .{ .data = try self.decodeHex(tok.lexeme(self.source)) } },
             .base64 => .{ .string = .{ .data = try self.decodeBase64(tok.lexeme(self.source)) } },
             .decimal => {
-                // Bare decimal with no following encoding — treat as error.
+                // Bare decimal with no following encoding - treat as error.
                 return error.InvalidSexp;
             },
             else => error.InvalidSexp,
@@ -89,7 +89,7 @@ const Parser = struct {
         return .{ .list = try items.toOwnedSlice(self.allocator) };
     }
 
-    /// Parse `[hint] string` — display hint.
+    /// Parse `[hint] string` - display hint.
     fn parseDisplayHint(self: *Parser) Error!Value {
         // Parse the hint string.
         const hint_tok = self.scanner.next();
@@ -128,15 +128,13 @@ const Parser = struct {
         return result.value;
     }
 
-    // ── Decoders ───────────────────────────────────────────────────
-
-    /// Decode verbatim: `decimal:octets` → octets.
+    /// Decode verbatim: `decimal:octets` -> octets.
     fn decodeVerbatim(lex: []const u8) []const u8 {
         const colon = std.mem.indexOfScalar(u8, lex, ':') orelse return lex;
         return lex[colon + 1 ..];
     }
 
-    /// Decode quoted string: optional length prefix + `"..escaped.."` → raw bytes.
+    /// Decode quoted string: optional length prefix + `"..escaped.."` -> raw bytes.
     fn decodeQuoted(self: *Parser, lex: []const u8) Error![]const u8 {
         // Find the opening double-quote.
         const dq = std.mem.indexOfScalar(u8, lex, '"') orelse return error.InvalidSexp;
@@ -144,7 +142,7 @@ const Parser = struct {
         return self.decodeEscapes(inner);
     }
 
-    /// Decode hex: optional length prefix + `#hex-with-ws#` → raw bytes.
+    /// Decode hex: optional length prefix + `#hex-with-ws#` -> raw bytes.
     fn decodeHex(self: *Parser, lex: []const u8) Error![]const u8 {
         // Find first '#'.
         const open = std.mem.indexOfScalar(u8, lex, '#') orelse return error.InvalidSexp;
@@ -170,7 +168,7 @@ const Parser = struct {
         return try buf.toOwnedSlice(self.allocator);
     }
 
-    /// Decode base64: optional length prefix + `|base64-with-ws|` → raw bytes.
+    /// Decode base64: optional length prefix + `|base64-with-ws|` -> raw bytes.
     fn decodeBase64(self: *Parser, lex: []const u8) Error![]const u8 {
         const open = std.mem.indexOfScalar(u8, lex, '|') orelse return error.InvalidSexp;
         const inner = lex[open + 1 .. lex.len - 1]; // strip '|' delimiters
@@ -320,8 +318,6 @@ fn stripOuter(lex: []const u8) []const u8 {
     if (lex.len < 2) return lex;
     return lex[1 .. lex.len - 1];
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "parse token" {
     const r = try parse(std.testing.allocator, "subject");
@@ -481,11 +477,9 @@ test "RFC 9804 example: SPKI cert body" {
     try std.testing.expectEqualStrings("Alice", issuer[1].string.data);
 }
 
-// ── RFC 9804 edge case tests ───────────────────────────────────────
-
-// §4.1 Verbatim — binary data with special characters
+// §4.1 Verbatim - binary data with special characters
 test "verbatim with colons and quotes" {
-    // 4:::": — four octets: : : " :
+    // 4:::": - four octets: : : " :
     const r = try parse(std.testing.allocator, "4:::\":");
     try std.testing.expectEqualStrings("::\":", r.value.string.data);
 }
@@ -508,7 +502,7 @@ test "verbatim with null byte" {
     try std.testing.expectEqual('b', r.value.string.data[2]);
 }
 
-// §4.2 Token — pseudo-alphabetic start characters
+// §4.2 Token - pseudo-alphabetic start characters
 test "token colon-equals-dots" {
     const r = try parse(std.testing.allocator, ":=..");
     try std.testing.expectEqualStrings(":=..", r.value.string.data);
@@ -529,7 +523,7 @@ test "token class-of-1997" {
     try std.testing.expectEqualStrings("class-of-1997", r.value.string.data);
 }
 
-// §4.3 Quoted string — all escape sequences per RFC 9804
+// §4.3 Quoted string - all escape sequences per RFC 9804
 test "escape: alert" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -638,7 +632,7 @@ test "escape: three newlines via octal" {
     try std.testing.expectEqual('\n', r.value.string.data[2]);
 }
 
-// §4.3 Line continuation — backslash followed by newline is ignored
+// §4.3 Line continuation - backslash followed by newline is ignored
 test "escape: LF line continuation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -667,19 +661,19 @@ test "escape: LFCR line continuation" {
     try std.testing.expectEqualStrings("helloworld", r.value.string.data);
 }
 
-// §4.3 Quoted string — empty
+// §4.3 Quoted string - empty
 test "quoted string empty" {
     const r = try parse(std.testing.allocator, "\"\"");
     try std.testing.expectEqualStrings("", r.value.string.data);
 }
 
-// §4.3 Quoted string — no escapes (fast path)
+// §4.3 Quoted string - no escapes (fast path)
 test "quoted string no escapes" {
     const r = try parse(std.testing.allocator, "\"hi there\"");
     try std.testing.expectEqualStrings("hi there", r.value.string.data);
 }
 
-// §4.4 Hexadecimal — whitespace inside hex digits
+// §4.4 Hexadecimal - whitespace inside hex digits
 test "hex with spaces between pairs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -702,7 +696,7 @@ test "hex single null byte" {
     try std.testing.expectEqual(0x00, r.value.string.data[0]);
 }
 
-// §4.5 Base-64 — with whitespace
+// §4.5 Base-64 - with whitespace
 test "base64 with spaces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -710,7 +704,7 @@ test "base64 with spaces" {
     try std.testing.expectEqualStrings("abc", r.value.string.data);
 }
 
-// §4.5 Base-64 — empty
+// §4.5 Base-64 - empty
 test "base64 empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -718,7 +712,7 @@ test "base64 empty" {
     try std.testing.expectEqualStrings("", r.value.string.data);
 }
 
-// §4.5 Base-64 — with padding
+// §4.5 Base-64 - with padding
 test "base64 with double padding" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -733,7 +727,7 @@ test "base64 with single padding" {
     try std.testing.expectEqualStrings("abcde", r.value.string.data);
 }
 
-// §3 Display hints — various encoding types for hint
+// §3 Display hints - various encoding types for hint
 test "display hint with quoted hint" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -758,7 +752,7 @@ test "display hint with whitespace around" {
     try std.testing.expectEqualStrings("image/gif", r.value.string.display.?);
 }
 
-// §5 Canonical form — display hint in canonical
+// §5 Canonical form - display hint in canonical
 test "canonical display hint" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -769,7 +763,7 @@ test "canonical display hint" {
     try std.testing.expectEqualStrings("image/bitmap", r.value.list[1].string.display.?);
 }
 
-// §5 Canonical form — nested
+// §5 Canonical form - nested
 test "canonical nested" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -783,7 +777,7 @@ test "canonical nested" {
     try std.testing.expectEqualStrings("mother", inner[2].string.data);
 }
 
-// §5 Canonical — bare verbatim (not in list)
+// §5 Canonical - bare verbatim (not in list)
 test "canonical bare verbatim" {
     const r = try parse(std.testing.allocator, "10:abcdefghij");
     try std.testing.expectEqualStrings("abcdefghij", r.value.string.data);

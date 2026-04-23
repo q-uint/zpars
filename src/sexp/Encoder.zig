@@ -1,4 +1,4 @@
-/// S-expression encoder — serializes a `Value` into RFC 9804 transport
+/// S-expression encoder - serializes a `Value` into RFC 9804 transport
 /// representations.
 ///
 /// Supports all three forms:
@@ -34,7 +34,7 @@ pub fn canonical(value: Value, writer: *Writer) Writer.Error!void {
 
 /// Encode in basic transport representation (RFC 9804 §6.3).
 ///
-/// The entire canonical form is base64-encoded and wrapped in `{…}`.
+/// The entire canonical form is base64-encoded and wrapped in `{...}`.
 /// Needs an allocator for the intermediate canonical buffer.
 pub fn basic(value: Value, allocator: std.mem.Allocator, writer: *Writer) (std.mem.Allocator.Error || Writer.Error)!void {
     // Buffer the canonical form.
@@ -52,7 +52,7 @@ pub fn basic(value: Value, allocator: std.mem.Allocator, writer: *Writer) (std.m
 ///
 /// Uses the most readable encoding for each octet-string: bareword
 /// tokens where possible, quoted strings for printable ASCII, and
-/// hexadecimal `#…#` for binary data. List elements are separated
+/// hexadecimal `#..#` for binary data. List elements are separated
 /// by a single space.
 pub fn advanced(value: Value, writer: *Writer) Writer.Error!void {
     switch (value) {
@@ -94,7 +94,7 @@ fn isToken(data: []const u8) bool {
     return true;
 }
 
-/// Check if all bytes are printable ASCII (0x20–0x7E).
+/// Check if all bytes are printable ASCII (0x20-0x7E).
 fn isPrintable(data: []const u8) bool {
     for (data) |c| {
         if (c < 0x20 or c > 0x7E) return false;
@@ -203,8 +203,6 @@ fn expectValuesEqual(a: Value, b: Value) !void {
     }
 }
 
-// ── Canonical encoding tests (RFC 9804 §6.2) ─────────────────────
-
 test "canonical: simple string" {
     try expectCanonical("3:abc", .{ .string = .{ .data = "abc" } });
 }
@@ -257,8 +255,6 @@ test "canonical: binary data with null bytes" {
     try expectCanonical("3:\x00\x01\x02", .{ .string = .{ .data = "\x00\x01\x02" } });
 }
 
-// ── Basic transport tests (RFC 9804 §6.3) ─────────────────────────
-
 test "basic: (a b c)" {
     // Canonical of (a b c) is (1:a1:b1:c), base64 is KDE6YTE6YjE6Yyk=
     try expectBasic("{KDE6YTE6YjE6Yyk=}", .{ .list = &.{
@@ -277,8 +273,6 @@ test "basic: simple string" {
     // Canonical of "abc" is "3:abc", base64 of "3:abc" is "MzphYmM="
     try expectBasic("{MzphYmM=}", .{ .string = .{ .data = "abc" } });
 }
-
-// ── Advanced transport tests (RFC 9804 §6.4) ──────────────────────
 
 test "advanced: token-eligible string" {
     try expectAdvanced("subject", .{ .string = .{ .data = "subject" } });
@@ -354,14 +348,12 @@ test "advanced: control characters use hex" {
 }
 
 test "advanced: mixed printable and non-printable uses quoted with escapes" {
-    // "hello\nworld" — has a non-printable char but it's a named escape
+    // "hello\nworld" - has a non-printable char but it's a named escape
     // isPrintable returns false because \n < 0x20, so this goes to hex path...
     // Actually, let's verify: \n = 0x0A which is < 0x20, so isPrintable is false.
     // This means it goes to hex encoding.
     try expectAdvanced("#68656c6c6f0a776f726c64#", .{ .string = .{ .data = "hello\nworld" } });
 }
-
-// ── Round-trip tests ──────────────────────────────────────────────
 
 test "round-trip: advanced -> canonical -> parse" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

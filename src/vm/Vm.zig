@@ -4,6 +4,7 @@
 /// stack for ordered choice and a call stack for rule invocations.
 const std = @import("std");
 const I = @import("Instruction.zig");
+const CaptureTree = @import("CaptureTree.zig");
 
 pub const Config = struct {
     max_stack: u32 = 1024,
@@ -12,6 +13,13 @@ pub const Config = struct {
     /// Upper bound on code length for per-instruction profiling arrays.
     /// Only used when `enable_stats` is true.
     max_code: u32 = 4096,
+    /// Record open/close events for each capture save so a tree can be
+    /// built in a post-pass. Off by default: execution stays
+    /// allocation-free and JIT/AOT backends stay untouched. When enabled,
+    /// construct the VM with `initEvents` (the plain `init` constructor
+    /// is gated off in this config because it has no allocator to back
+    /// the event log).
+    capture_events: bool = false,
 };
 
 pub const Vm = VmWith(.{});
@@ -32,9 +40,14 @@ pub fn VmWith(comptime config: Config) type {
             /// Return address for rule calls.
             ret: u32,
             /// Undo log for a save instruction: restore old value on backtrack.
+            /// When `capture_events` is enabled, `event_len` holds the length
+            /// of the event log prior to this save, so the log can be
+            /// truncated back on backtrack in lockstep with the slot restore.
             save: struct {
                 slot: u16,
                 old: ?usize,
+                event_len: if (config.capture_events) u32 else void =
+                    if (config.capture_events) 0 else {},
             },
             /// Memo frame: pushed by `memo_call` on a table miss. Holds the
             /// information needed for (a) left-recursion detection via
@@ -141,6 +154,15 @@ pub fn VmWith(comptime config: Config) type {
         inst_stats: if (config.enable_stats) [config.max_code]InstStat else void =
             if (config.enable_stats) .{InstStat{ .exec_count = 0, .backtrack_count = 0 }} ** config.max_code else {},
 
+        /// Open/close capture events appended during execution and truncated
+        /// on backtrack. Only present when `config.capture_events` is true.
+        events: if (config.capture_events)
+            std.ArrayListUnmanaged(CaptureTree.Event)
+        else
+            void = if (config.capture_events) .empty else {},
+        events_allocator: if (config.capture_events) ?std.mem.Allocator else void =
+            if (config.capture_events) null else {},
+
         pub const Writer = std.Io.Writer;
 
         pub fn getStats(self: *const Self) Stats {
@@ -177,40 +199,75 @@ pub fn VmWith(comptime config: Config) type {
             }
         }
 
-        pub fn init(code: []const I.Inst, charsets: []const I.Charset, string_data: []const u8, input: []const u8) Self {
-            return .{ .code = code, .charsets = charsets, .string_data = string_data, .input = input };
-        }
+        /// Default constructor. Unavailable when `config.capture_events`
+        /// is true — use `initEvents` instead, which supplies the
+        /// allocator that backs the event log.
+        pub const init = if (config.capture_events) {} else struct {
+            fn f(code: []const I.Inst, charsets: []const I.Charset, string_data: []const u8, input: []const u8) Self {
+                return .{ .code = code, .charsets = charsets, .string_data = string_data, .input = input };
+            }
+        }.f;
+
+        /// Constructor for event-recording runs. Only available when
+        /// `config.capture_events` is true. The allocator backs the event
+        /// log; call `deinit` to release it.
+        pub const initEvents = if (config.capture_events)
+            struct {
+                fn f(
+                    allocator: std.mem.Allocator,
+                    code: []const I.Inst,
+                    charsets: []const I.Charset,
+                    string_data: []const u8,
+                    input: []const u8,
+                ) Self {
+                    return .{
+                        .code = code,
+                        .charsets = charsets,
+                        .string_data = string_data,
+                        .input = input,
+                        .events_allocator = allocator,
+                    };
+                }
+            }.f
+        else {};
 
         /// Packrat constructor. Allocates a memo table sized for `memo_rule_count`
         /// rules and `input.len + 1` positions. Call `deinit` to free it. If
         /// `memo_rule_count` is 0 the call is equivalent to `init`.
-        pub fn initPackrat(
-            allocator: std.mem.Allocator,
-            code: []const I.Inst,
-            charsets: []const I.Charset,
-            string_data: []const u8,
-            memo_rule_count: u16,
-            input: []const u8,
-        ) !Self {
-            var vm = Self{
-                .code = code,
-                .charsets = charsets,
-                .string_data = string_data,
-                .input = input,
-                .memo_rule_count = memo_rule_count,
-            };
-            if (memo_rule_count > 0) {
-                const stride = input.len + 1;
-                const table = try allocator.alloc(MemoEntry, @as(usize, memo_rule_count) * stride);
-                @memset(table, .{ .state = .empty, .next_pos_or_frame = 0 });
-                const heads = try allocator.alloc(u32, stride);
-                @memset(heads, no_head);
-                vm.memo_table = table;
-                vm.heads = heads;
-                vm.memo_allocator = allocator;
+        ///
+        /// Unavailable when `config.capture_events` is true: the memo
+        /// entry does not yet carry capture state, so memoizing a
+        /// capture-bearing rule would desync the event log from the
+        /// match. See the TODO in Compiler.rewriteMemoCalls.
+        pub const initPackrat = if (config.capture_events) {} else struct {
+            fn f(
+                allocator: std.mem.Allocator,
+                code: []const I.Inst,
+                charsets: []const I.Charset,
+                string_data: []const u8,
+                memo_rule_count: u16,
+                input: []const u8,
+            ) !Self {
+                var vm = Self{
+                    .code = code,
+                    .charsets = charsets,
+                    .string_data = string_data,
+                    .input = input,
+                    .memo_rule_count = memo_rule_count,
+                };
+                if (memo_rule_count > 0) {
+                    const stride = input.len + 1;
+                    const table = try allocator.alloc(MemoEntry, @as(usize, memo_rule_count) * stride);
+                    @memset(table, .{ .state = .empty, .next_pos_or_frame = 0 });
+                    const heads = try allocator.alloc(u32, stride);
+                    @memset(heads, no_head);
+                    vm.memo_table = table;
+                    vm.heads = heads;
+                    vm.memo_allocator = allocator;
+                }
+                return vm;
             }
-            return vm;
-        }
+        }.f;
 
         pub fn deinit(self: *Self) void {
             if (self.memo_allocator) |a| {
@@ -224,6 +281,11 @@ pub fn VmWith(comptime config: Config) type {
                 self.memo_table = &.{};
                 self.heads = &.{};
                 self.memo_allocator = null;
+            }
+            if (config.capture_events) {
+                if (self.events_allocator) |a| {
+                    self.events.deinit(a);
+                }
             }
         }
 
@@ -239,6 +301,9 @@ pub fn VmWith(comptime config: Config) type {
 
             self.steps = 0;
             self.resetStats();
+            if (config.capture_events) {
+                self.events.clearRetainingCapacity();
+            }
             while (pc < self.code.len) {
                 const inst = self.code[pc];
                 self.steps += 1;
@@ -516,7 +581,28 @@ pub fn VmWith(comptime config: Config) type {
                     .save => {
                         if (sp >= max_stack) return null;
                         const slot = inst.data.slot;
-                        stack[sp] = .{ .save = .{ .slot = slot, .old = self.captures[slot] } };
+                        if (config.capture_events) {
+                            const a = self.events_allocator orelse
+                                @panic("capture_events enabled but no events allocator; use Self.initEvents");
+                            const event_len: u32 = @intCast(self.events.items.len);
+                            stack[sp] = .{ .save = .{
+                                .slot = slot,
+                                .old = self.captures[slot],
+                                .event_len = event_len,
+                            } };
+                            const group_id: u16 = slot >> 1;
+                            const marker: CaptureTree.Event.Marker = .{
+                                .group_id = group_id,
+                                .pos = @intCast(pos),
+                            };
+                            const ev: CaptureTree.Event = if (slot & 1 == 0)
+                                .{ .open = marker }
+                            else
+                                .{ .close = marker };
+                            try self.events.append(a, ev);
+                        } else {
+                            stack[sp] = .{ .save = .{ .slot = slot, .old = self.captures[slot] } };
+                        }
                         sp += 1;
                         self.captures[slot] = pos;
                         pc += 1;
@@ -545,6 +631,9 @@ pub fn VmWith(comptime config: Config) type {
                     .ret => {},
                     .save => |s| {
                         self.captures[s.slot] = s.old;
+                        if (config.capture_events) {
+                            self.events.shrinkRetainingCapacity(s.event_len);
+                        }
                     },
                     .memo => |m| {
                         if (m.is_recall) {
@@ -594,6 +683,30 @@ pub fn VmWith(comptime config: Config) type {
             const span = self.getCapture(i) orelse return null;
             return self.input[span.start..span.end];
         }
+
+        /// Build a capture tree from the recorded open/close events of the
+        /// last `execute()` call. Only available when `config.capture_events`
+        /// is true. The returned `Tree` owns its nodes via `tree_allocator`
+        /// (which may differ from the VM's events allocator); call
+        /// `tree.deinit()` to release them.
+        pub const buildCaptureTree = if (config.capture_events)
+            struct {
+                fn f(self: *const Self, tree_allocator: std.mem.Allocator) CaptureTree.BuildError!CaptureTree.Tree {
+                    return CaptureTree.buildFromEvents(tree_allocator, self.events.items);
+                }
+            }.f
+        else {};
+
+        /// Raw view of recorded capture events. Valid until the next
+        /// `execute()` call or `deinit()`. Only available when
+        /// `config.capture_events` is true.
+        pub const getCaptureEvents = if (config.capture_events)
+            struct {
+                fn f(self: *const Self) []const CaptureTree.Event {
+                    return self.events.items;
+                }
+            }.f
+        else {};
 
         /// Warth's SETUP-LR. Ensure the memo frame at `frame_idx` has a
         /// head, then walk the stack downward from `sp_top` until we find a
@@ -897,6 +1010,22 @@ test "capture: group with repetition" {
     try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
 }
 
+test "capture: repeated capture is one group (POSIX)" {
+    // `(a)+` must be a single group whose flat slot holds the last
+    // match, not one fresh group per bytecode-level iteration.
+    var compiler = compileEre("(a)+");
+    try testing.expectEqual(@as(u16, 1), compiler.getCaptureCount());
+    var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaa");
+    try testing.expectEqual(@as(?usize, 3), try vm.execute());
+    try testing.expectEqualStrings("a", vm.getCaptureSlice(0).?);
+    try testing.expectEqual(@as(?Vm.Span, null), vm.getCapture(1));
+}
+
+test "capture: bounded repetition of capture is one group" {
+    var compiler = compileEre("(ab){2,3}");
+    try testing.expectEqual(@as(u16, 1), compiler.getCaptureCount());
+}
+
 test "capture: no match clears captures" {
     var compiler = compileEre("(a)b");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "ac");
@@ -996,7 +1125,7 @@ test "packrat: redundant rule re-entry is cached" {
 }
 
 test "packrat: failure memoization" {
-    // Same idea but E fails — the failure must be cached too, so the
+    // Same idea but E fails - the failure must be cached too, so the
     // second call to E returns fail without re-running the body.
     const src =
         \\S <- E "x" / E "y"
@@ -1125,6 +1254,183 @@ test "packrat: captures keep rule out of memoization" {
     );
     defer vm.deinit();
     try testing.expectEqual(@as(?usize, 2), try vm.execute());
+}
+
+test "TODO(incremental): memoized capture-bearing rule replays events on hit" {
+    // Pinned placeholder for the capture+memo integration needed by
+    // incremental parsing. Today `rewriteMemoCalls` excludes any rule
+    // containing `save`, so a capture-bearing rule is re-executed on
+    // every call and its events are regenerated naturally.
+    //
+    // When that exclusion is lifted, the memo entry must additionally
+    // store the `events[start..end]` slice produced by the rule's
+    // first invocation and replay (re-append) it on a cache hit, with
+    // matching truncation on backtrack. Delete this test as part of
+    // that change - a passing test will assert the replay behaviour.
+    return error.SkipZigTest;
+}
+
+test "TODO(capture_events): JIT path records events into the VM's log" {
+    // The JIT backends compile `save` as a pure slot write; they do
+    // not touch the VM's events ArrayList. Running a capture_events-
+    // enabled program via JIT therefore silently produces an empty
+    // event log and a broken capture tree. Delete this test when the
+    // JIT either learns to append events or is explicitly gated off
+    // whenever capture_events is enabled.
+    return error.SkipZigTest;
+}
+
+const EventVm = VmWith(.{ .capture_events = true });
+const CaptureTreeMod = @import("CaptureTree.zig");
+
+test "capture events: flat single group" {
+    var compiler = compileEre("a(bc)d");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "abcd",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 4), try vm.execute());
+
+    // Flat API still works alongside events.
+    try testing.expectEqualStrings("bc", vm.getCaptureSlice(0).?);
+
+    const events = vm.getCaptureEvents();
+    try testing.expectEqual(@as(usize, 2), events.len);
+    try testing.expectEqual(CaptureTreeMod.Event{ .open = .{ .group_id = 0, .pos = 1 } }, events[0]);
+    try testing.expectEqual(CaptureTreeMod.Event{ .close = .{ .group_id = 0, .pos = 3 } }, events[1]);
+}
+
+test "capture events: tree with nested groups" {
+    var compiler = compileEre("((a)(b))");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "ab",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 2), try vm.execute());
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 1), tree.roots.len);
+    const outer = tree.roots[0];
+    try testing.expectEqual(@as(u16, 0), outer.group_id);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 0, .end = 2 }, outer.span);
+    try testing.expectEqual(@as(usize, 2), outer.children.len);
+    try testing.expectEqual(@as(u16, 1), outer.children[0].group_id);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 0, .end = 1 }, outer.children[0].span);
+    try testing.expectEqual(@as(u16, 2), outer.children[1].group_id);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 1, .end = 2 }, outer.children[1].span);
+}
+
+test "capture events: repetition yields sibling nodes" {
+    // Non-obvious: the flat-slot API only retains the LAST (a) match, but
+    // the event stream preserves every successful iteration so the tree
+    // shows all three.
+    var compiler = compileEre("(a)(a)(a)");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "aaa",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 3), try vm.execute());
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 3), tree.roots.len);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 0, .end = 1 }, tree.roots[0].span);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 1, .end = 2 }, tree.roots[1].span);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 2, .end = 3 }, tree.roots[2].span);
+}
+
+test "capture events: same group repeated via +" {
+    var compiler = compileEre("(a)+");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "aaa",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 3), try vm.execute());
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    // Each iteration leaves its own sibling event pair, all with group_id 0.
+    try testing.expectEqual(@as(usize, 3), tree.roots.len);
+    for (tree.roots) |n| try testing.expectEqual(@as(u16, 0), n.group_id);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 0, .end = 1 }, tree.roots[0].span);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 1, .end = 2 }, tree.roots[1].span);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 2, .end = 3 }, tree.roots[2].span);
+}
+
+test "capture events: backtrack discards failed-branch events" {
+    // First alternative matches (a)(b), fails on "c", backtracks; second
+    // alternative matches (x)(y). Events from the discarded branch must
+    // be truncated from the log.
+    var compiler = compileEre("(a)(b)c|(x)(y)");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "xy",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 2), try vm.execute());
+
+    const events = vm.getCaptureEvents();
+    // Only the two surviving captures (groups 2 and 3, since 0/1 were
+    // compiled into the failing branch) should appear in the log.
+    try testing.expectEqual(@as(usize, 4), events.len);
+    try testing.expectEqual(CaptureTreeMod.Event{ .open = .{ .group_id = 2, .pos = 0 } }, events[0]);
+    try testing.expectEqual(CaptureTreeMod.Event{ .close = .{ .group_id = 2, .pos = 1 } }, events[1]);
+    try testing.expectEqual(CaptureTreeMod.Event{ .open = .{ .group_id = 3, .pos = 1 } }, events[2]);
+    try testing.expectEqual(CaptureTreeMod.Event{ .close = .{ .group_id = 3, .pos = 2 } }, events[3]);
+}
+
+test "capture events: failed match produces empty log" {
+    var compiler = compileEre("(a)b");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "ac",
+    );
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, null), try vm.execute());
+    try testing.expectEqual(@as(usize, 0), vm.getCaptureEvents().len);
+}
+
+test "capture events: cleared between runs" {
+    var compiler = compileEre("(a)");
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        "a",
+    );
+    defer vm.deinit();
+    _ = try vm.execute();
+    try testing.expectEqual(@as(usize, 2), vm.getCaptureEvents().len);
+    // Re-run on same input; events should not accumulate.
+    _ = try vm.execute();
+    try testing.expectEqual(@as(usize, 2), vm.getCaptureEvents().len);
 }
 
 const StatsVm = VmWith(.{ .enable_stats = true });

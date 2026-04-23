@@ -57,7 +57,7 @@ pub const Validation = struct {
     };
 };
 
-/// Core rules from RFC 5234 Appendix B — implicitly defined in every
+/// Core rules from RFC 5234 Appendix B - implicitly defined in every
 /// ABNF grammar.
 const core_rules = [_][]const u8{
     "ALPHA",  "BIT",  "CHAR",  "CR",
@@ -253,7 +253,7 @@ fn mergeAlternation(self: *Validator, a: Ast.Node, b: Ast.Node) !Ast.Node {
     }
 
     const slice = try alts.toOwnedSlice(self.allocator);
-    // Track the slice so callers can free it via `freeMerges` — merged
+    // Track the slice so callers can free it via `freeMerges` - merged
     // alternation slices live beyond `validate()` (they're embedded in
     // the returned rules), so the validator holds onto them.
     try self.merges.append(self.allocator, slice);
@@ -316,7 +316,7 @@ fn isProductive(
         .rulename => |name| {
             if (isCoreRule(name)) return true;
             if (name_index.get(name)) |idx| return productive[idx];
-            // Undefined — treat as non-productive (already reported).
+            // Undefined - treat as non-productive (already reported).
             return false;
         },
         .alternation => |items| for (items) |item| {
@@ -542,7 +542,7 @@ fn pegParseAndValidate(allocator: std.mem.Allocator, source: []const u8) !TestRe
     };
 }
 
-test "clean grammar — no diagnostics" {
+test "clean grammar - no diagnostics" {
     const allocator = std.testing.allocator;
     const result = try parseAndValidate(allocator, "foo = bar\nbar = \"hello\"");
     defer result.deinit();
@@ -677,7 +677,7 @@ test "mixed-case reference counts as used" {
 
 test "mixed-case undefined reference reports correct owner" {
     const allocator = std.testing.allocator;
-    // "foo" references "Missing" which is undefined — diagnostic should
+    // "foo" references "Missing" which is undefined - diagnostic should
     // identify "foo" as the rule containing the bad reference regardless
     // of casing.
     const result = try parseAndValidate(allocator, "foo = Missing");
@@ -750,7 +750,7 @@ test "zero-width loop detected" {
 
 test "bounded repetition of nullable body is not zero-width loop" {
     const allocator = std.testing.allocator;
-    // 3*5b where b is nullable — bounded, will terminate.
+    // 3*5b where b is nullable - bounded, will terminate.
     const result = try parseAndValidate(allocator, "a = 3*5b\nb = *\"x\"");
     defer result.deinit();
     for (result.diagnostics) |d| {

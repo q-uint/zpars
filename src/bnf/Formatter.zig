@@ -1,4 +1,4 @@
-/// BNF formatter — pretty-prints an AST back into canonical BNF text
+/// BNF formatter - pretty-prints an AST back into canonical BNF text
 /// (ALGOL 60 variant).
 ///
 /// Rule names are padded to align the `::=` operators across all rules.

@@ -512,6 +512,13 @@ fn emitInst(
             buf.emit(encBr(t2));
         },
         .save => {
+            // TODO(capture_events): the VM records open/close events
+            // here when `VmConfig.capture_events` is true. The JIT path
+            // only writes the capture slot and does NOT append events,
+            // so running a capture_events-enabled program via JIT yields
+            // an empty event log and a broken capture tree. Either teach
+            // the JIT to call into the VM's events list, or gate JIT
+            // execution off when capture_events is enabled.
             const slot: u12 = @intCast(inst.data.slot);
             buf.emit(encMovz(t0, slot, 0));
             buf.emit(encLdrReg(t1, cap, t0));

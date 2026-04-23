@@ -332,9 +332,9 @@ test "format round-trip" {
     var fbs: std.Io.Writer = .fixed(&buf);
     try fbs.print("{f}", .{result.cfg});
     try std.testing.expectEqualStrings(
-        \\S → A %x78
-        \\A → "hello"
-        \\A → ε
+        \\S -> A %x78
+        \\A -> "hello"
+        \\A -> ε
     , fbs.buffered());
 }
 

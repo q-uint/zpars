@@ -192,7 +192,7 @@ fn runMatch(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
 
     const fmt = if (filename) |f| detectFormat(f) else Format.abnf;
 
-    // ERE has a single unnamed rule — -r is optional.
+    // ERE has a single unnamed rule - -r is optional.
     if (fmt == .ere) {
         if (rule_name == null) rule_name = "";
     }

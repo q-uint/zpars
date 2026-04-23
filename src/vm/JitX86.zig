@@ -631,6 +631,11 @@ fn emitInst(
             emitJmpR(buf, t0);
         },
         .save => {
+            // TODO(capture_events): see JitAarch64.zig - JIT path does
+            // not append to the VM's open/close event log, so a
+            // capture_events-enabled program executed via JIT produces
+            // a broken capture tree. Teach the JIT to populate events,
+            // or refuse to JIT when capture_events is on.
             const slot: u12 = @intCast(inst.data.slot);
             emitMovRI32(buf, t0, @intCast(slot));
             emitMovRMSib8(buf, t1, cap, t0);

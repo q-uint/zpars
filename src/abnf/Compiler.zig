@@ -135,7 +135,7 @@ fn compileRulename(comptime name: []const u8, comptime rules: []const Ast.Rule, 
     if (count == 0) @compileError("undefined rule: " ++ name);
     if (count == 1) return compileNode(matching[0], rules, new_visited);
 
-    // Multiple definitions (=/) → alternation.
+    // Multiple definitions (=/) -> alternation.
     return compileAlts(matching[0..count], rules, new_visited);
 }
 

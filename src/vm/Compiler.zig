@@ -32,6 +32,13 @@ pub fn CompilerWith(comptime config: Config) type {
         patch_len: u32 = 0,
 
         capture_count: u16 = 0,
+        /// AST capture nodes that have already been assigned a slot. A
+        /// capture node can be compiled multiple times (e.g. when its
+        /// parent is a repetition lowered into several visits); pointer
+        /// identity here keeps its group id stable across visits, so
+        /// `(a)+` is one group, not N.
+        capture_node_ptrs: [config.max_captures / 2]?*const Ast.Node =
+            [_]?*const Ast.Node{null} ** (config.max_captures / 2),
         memo_rule_count: u16 = 0,
 
         optimize_enabled: bool = true,
@@ -60,7 +67,7 @@ pub fn CompilerWith(comptime config: Config) type {
             if (rules.len == 0) {
                 c.emit(.{ .op = .match });
             } else if (rules.len == 1) {
-                c.compileNode(rules[0].node);
+                c.compileNode(&rules[0].node);
                 c.emit(.{ .op = .match });
                 c.patchCalls(&.{0}, rules);
             } else {
@@ -71,7 +78,7 @@ pub fn CompilerWith(comptime config: Config) type {
                 var rule_ends: [256]u32 = undefined;
                 for (rules, 0..) |rule, i| {
                     rule_addrs[i] = c.code_len;
-                    c.compileNode(rule.node);
+                    c.compileNode(&rule.node);
                     c.emit(.{ .op = .ret });
                     rule_ends[i] = c.code_len;
                 }
@@ -93,6 +100,24 @@ pub fn CompilerWith(comptime config: Config) type {
         fn rewriteMemoCalls(self: *Self, rule_addrs: []const u32, rule_ends: []const u32) void {
             var memo_id: [256]?u16 = [_]?u16{null} ** 256;
             for (rule_addrs, rule_ends, 0..) |start, end, i| {
+                // TODO(incremental): this is the interface between
+                // captures and packrat memoization. Today, any rule
+                // containing a `save` is excluded from memoization so
+                // the memo entry never has to carry capture state. When
+                // incremental parsing lands, the memo entry must
+                // additionally store the `events[start..end]` range
+                // produced by this rule invocation so it can be
+                // replayed on a cache hit. Remove the `has_save`
+                // exclusion only together with that replay logic.
+                //
+                // The VM's `initPackrat` constructor is currently gated
+                // off when `capture_events` is true for the same
+                // reason: without the replay logic above, a memo hit
+                // would return the cached end position without
+                // appending the corresponding open/close events,
+                // leaving the event log out of sync with the match.
+                // Re-enable that constructor when this exclusion is
+                // lifted.
                 var has_save = false;
                 for (self.code[start..end]) |inst| {
                     if (inst.op == .save) {
@@ -137,8 +162,8 @@ pub fn CompilerWith(comptime config: Config) type {
             }
         }
 
-        fn compileNode(self: *Self, node: Ast.Node) void {
-            switch (node) {
+        fn compileNode(self: *Self, node: *const Ast.Node) void {
+            switch (node.*) {
                 .char_val => |cv| {
                     for (cv.value) |b| {
                         self.emit(.{ .op = .char, .data = .{ .byte = b } });
@@ -146,7 +171,7 @@ pub fn CompilerWith(comptime config: Config) type {
                 },
                 .any => self.emit(.{ .op = .any }),
                 .concatenation => |nodes| {
-                    for (nodes) |n| self.compileNode(n);
+                    for (nodes) |*n| self.compileNode(n);
                 },
                 .alternation => |alts| self.compileAlternation(alts),
                 .repetition => |rep| self.compileRepetition(rep),
@@ -172,7 +197,7 @@ pub fn CompilerWith(comptime config: Config) type {
                 .and_predicate => |inner| {
                     const outer = self.emitPlaceholder();
                     const inner_choice = self.emitPlaceholder();
-                    self.compileNode(inner.*);
+                    self.compileNode(inner);
                     const commit_addr = self.emitPlaceholder();
                     self.emit(.{ .op = .fail_twice });
                     self.code[inner_choice] = .{ .op = .choice, .data = .{ .offset = self.code_len - 1 } };
@@ -182,34 +207,47 @@ pub fn CompilerWith(comptime config: Config) type {
                 },
                 .not_predicate => |inner| {
                     const choice_addr = self.emitPlaceholder();
-                    self.compileNode(inner.*);
+                    self.compileNode(inner);
                     self.emit(.{ .op = .fail_twice });
                     self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
                 },
                 .capture => |inner| {
-                    if (self.capture_count >= config.max_captures / 2)
-                        @panic("too many capture groups");
-                    const slot = self.capture_count * 2;
-                    self.capture_count += 1;
+                    const slot = self.captureSlotFor(node);
                     self.emit(.{ .op = .save, .data = .{ .slot = slot } });
-                    self.compileNode(inner.*);
+                    self.compileNode(inner);
                     self.emit(.{ .op = .save, .data = .{ .slot = slot + 1 } });
                 },
                 .anchor_start, .anchor_end, .prose_val => {},
             }
         }
 
+        /// Return the start-of-capture slot for this AST capture node,
+        /// assigning a fresh group id on first visit. Subsequent visits
+        /// of the same node (e.g. via a parent repetition compiled
+        /// multiple times) reuse the same slot so `(a)+` is one group.
+        fn captureSlotFor(self: *Self, node_ptr: *const Ast.Node) u16 {
+            for (self.capture_node_ptrs[0..self.capture_count], 0..) |stored, i| {
+                if (stored == node_ptr) return @as(u16, @intCast(i)) * 2;
+            }
+            if (self.capture_count >= config.max_captures / 2)
+                @panic("too many capture groups");
+            const slot = self.capture_count * 2;
+            self.capture_node_ptrs[self.capture_count] = node_ptr;
+            self.capture_count += 1;
+            return slot;
+        }
+
         fn compileAlternation(self: *Self, alts: []const Ast.Node) void {
             if (alts.len == 0) return;
             if (alts.len == 1) {
-                self.compileNode(alts[0]);
+                self.compileNode(&alts[0]);
                 return;
             }
 
             var commits: [256]u32 = undefined;
             var commit_count: usize = 0;
 
-            for (alts[0 .. alts.len - 1]) |alt| {
+            for (alts[0 .. alts.len - 1]) |*alt| {
                 const choice_addr = self.emitPlaceholder();
                 self.compileNode(alt);
                 commits[commit_count] = self.emitPlaceholder();
@@ -217,7 +255,7 @@ pub fn CompilerWith(comptime config: Config) type {
                 self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
             }
 
-            self.compileNode(alts[alts.len - 1]);
+            self.compileNode(&alts[alts.len - 1]);
 
             const end = self.code_len;
             for (commits[0..commit_count]) |addr| {
@@ -227,14 +265,14 @@ pub fn CompilerWith(comptime config: Config) type {
 
         fn compileRepetition(self: *Self, rep: Ast.Repetition) void {
             for (0..rep.min) |_| {
-                self.compileNode(rep.element.*);
+                self.compileNode(rep.element);
             }
 
             if (rep.max) |max| {
                 const optional = max - rep.min;
                 for (0..optional) |_| {
                     const choice_addr = self.emitPlaceholder();
-                    self.compileNode(rep.element.*);
+                    self.compileNode(rep.element);
                     const commit_addr = self.emitPlaceholder();
                     self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
                     self.code[commit_addr] = .{ .op = .commit, .data = .{ .offset = self.code_len } };
@@ -242,7 +280,7 @@ pub fn CompilerWith(comptime config: Config) type {
             } else {
                 const loop_start = self.code_len;
                 const choice_addr = self.emitPlaceholder();
-                self.compileNode(rep.element.*);
+                self.compileNode(rep.element);
                 self.emit(.{ .op = .commit, .data = .{ .offset = loop_start } });
                 self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
             }

@@ -5,17 +5,17 @@
 //! to a result buffer containing serialized tokens and diagnostics.
 //!
 //! Result format (little-endian):
-//!   bytes 0..3  — token count (u32)
-//!   bytes 4..7  — diagnostic count (u32)
+//!   bytes 0..3  - token count (u32)
+//!   bytes 4..7  - diagnostic count (u32)
 //!   then for each token (12 bytes):
-//!     bytes 0..3  — tag (u32)
-//!     bytes 4..7  — start offset (u32)
-//!     bytes 8..11 — length (u32)
+//!     bytes 0..3  - tag (u32)
+//!     bytes 4..7  - start offset (u32)
+//!     bytes 8..11 - length (u32)
 //!   then for each diagnostic (16 bytes):
-//!     bytes 0..3  — start offset (u32)
-//!     bytes 4..7  — length (u32)
-//!     bytes 8..11 — message offset (u32, relative to message data start)
-//!     bytes 12..15 — message length (u32)
+//!     bytes 0..3  - start offset (u32)
+//!     bytes 4..7  - length (u32)
+//!     bytes 8..11 - message offset (u32, relative to message data start)
+//!     bytes 12..15 - message length (u32)
 //!   then: concatenated message strings
 
 const std = @import("std");
@@ -342,9 +342,9 @@ export fn format(lang: u8, ptr: [*]const u8, len: usize) ?[*]const u8 {
 }
 
 /// Match result format (little-endian):
-///   byte 0       — 1 if matched, 0 if not
-///   bytes 1..4   — matched value length (u32), only present if matched
-///   bytes 5..    — matched value bytes
+///   byte 0       - 1 if matched, 0 if not
+///   bytes 1..4   - matched value length (u32), only present if matched
+///   bytes 5..    - matched value bytes
 ///
 /// Caller must free the returned buffer.
 fn matchGeneric(
@@ -378,7 +378,7 @@ fn matchGeneric(
     // Match.
     var matcher = root.Matcher.init(arena.allocator(), merged) catch return null;
     const result = matcher.match(rule_name, input) orelse {
-        // No match — return single byte 0.
+        // No match - return single byte 0.
         const buf = allocator.alloc(u8, 1) catch return null;
         buf[0] = 0;
         return buf.ptr;

@@ -1,4 +1,4 @@
-/// ERE formatter — reconstructs a POSIX Extended Regular Expression from AST.
+/// ERE formatter - reconstructs a POSIX Extended Regular Expression from AST.
 const std = @import("std");
 const Ast = @import("../Ast.zig");
 
@@ -109,8 +109,6 @@ fn isMetachar(c: u8) bool {
         else => false,
     };
 }
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 fn format(node: Ast.Node) ![]const u8 {
     var buf: [4096]u8 = undefined;

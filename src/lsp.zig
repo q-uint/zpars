@@ -39,64 +39,64 @@ const abnf_tag_map = [_]i8{
     skip, // right_paren
     skip, // left_bracket
     skip, // right_bracket
-    4, // slash → operator
-    4, // star → operator
-    4, // equals → operator
-    4, // equals_slash → operator
-    0, // rulename → type
-    2, // number → number
-    1, // char_val → string
-    1, // char_val_ci → string
-    1, // char_val_cs → string
-    1, // prose_val → string
-    2, // bin_val → number
-    2, // dec_val → number
-    2, // hex_val → number
-    3, // comment → comment
+    4, // slash -> operator
+    4, // star -> operator
+    4, // equals -> operator
+    4, // equals_slash -> operator
+    0, // rulename -> type
+    2, // number -> number
+    1, // char_val -> string
+    1, // char_val_ci -> string
+    1, // char_val_cs -> string
+    1, // prose_val -> string
+    2, // bin_val -> number
+    2, // dec_val -> number
+    2, // hex_val -> number
+    3, // comment -> comment
     skip, // newline
     skip, // eof
     skip, // invalid
 };
 
 const bnf_tag_map = [_]i8{
-    0, // rulename → type
-    4, // definition → operator
-    4, // pipe → operator
-    1, // terminal → string
+    0, // rulename -> type
+    4, // definition -> operator
+    4, // pipe -> operator
+    1, // terminal -> string
     skip, // newline
     skip, // eof
     skip, // invalid
 };
 
 const peg_tag_map = [_]i8{
-    0, // identifier → type
-    4, // left_arrow → operator
-    4, // slash → operator
-    4, // and → operator
-    4, // not → operator
-    4, // question → operator
-    4, // star → operator
-    4, // plus → operator
+    0, // identifier -> type
+    4, // left_arrow -> operator
+    4, // slash -> operator
+    4, // and -> operator
+    4, // not -> operator
+    4, // question -> operator
+    4, // star -> operator
+    4, // plus -> operator
     skip, // left_paren
     skip, // right_paren
-    4, // dot → operator
-    1, // literal → string
-    5, // char_class → regexp
-    3, // comment → comment
+    4, // dot -> operator
+    1, // literal -> string
+    5, // char_class -> regexp
+    3, // comment -> comment
     skip, // newline
     skip, // eof
     skip, // invalid
 };
 
 const cfg_tag_map = [_]i8{
-    0, // identifier → type
-    1, // string → string
-    1, // string_cs → string
-    1, // string_ci → string
-    2, // hex_byte → number
-    2, // hex_range → number
-    4, // arrow → operator
-    4, // pipe → operator
+    0, // identifier -> type
+    1, // string -> string
+    1, // string_cs -> string
+    1, // string_ci -> string
+    2, // hex_byte -> number
+    2, // hex_range -> number
+    4, // arrow -> operator
+    4, // pipe -> operator
     skip, // newline
     skip, // eof
     skip, // invalid
@@ -490,7 +490,7 @@ const Server = struct {
         var scanner = Scanner.init(source);
         const tokens = scanner.scanTokens();
 
-        // We use a static buffer — max 4096 tokens × 5 = 20480 u32s.
+        // We use a static buffer - max 4096 tokens x 5 = 20480 u32s.
         const max_entries = Scanner.max_tokens * 5;
         const S = struct {
             var data: [max_entries]u32 = undefined;
@@ -563,7 +563,7 @@ const Server = struct {
     }
 
     fn writeCompletionItems(jw: JsonWriter, tokens: anytype, rulename_tag: u32, source: []const u8) !void {
-        // Collect unique names — use a simple linear scan since we have at most 4096 tokens.
+        // Collect unique names - use a simple linear scan since we have at most 4096 tokens.
         var names: [256][]const u8 = undefined;
         var name_count: usize = 0;
 

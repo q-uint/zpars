@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zpars — Grammar Validator</title>
+<title>zpars - Grammar Validator</title>
 <style>
   :root {
     --bg: #1e1e2e;
@@ -323,7 +323,7 @@
     <span class="match-label">Test input</span>
     <input class="rule-input hidden" id="rule-input" type="text" placeholder="rule name">
   </div>
-  <textarea class="match-input" id="match-input" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter text to match…"></textarea>
+  <textarea class="match-input" id="match-input" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter text to match..."></textarea>
   <div class="match-result" id="match-result"></div>
 </div>
 
@@ -741,7 +741,7 @@ function selectLang(name) {
   currentLang = name;
   const lang = LANGUAGES[name];
   editor.value = lang.example;
-  editor.placeholder = `Enter ${lang.label}…`;
+  editor.placeholder = `Enter ${lang.label}...`;
   document.querySelectorAll(".lang-btn").forEach(btn => {
     btn.classList.toggle("active", btn.dataset.lang === name);
   });

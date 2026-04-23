@@ -14,7 +14,7 @@ const tokenTypes = [
 
 const tokenLegend = new vscode.SemanticTokensLegend(tokenTypes);
 
-// Token tag → semantic type index mappings per grammar format.
+// Token tag -> semantic type index mappings per grammar format.
 // Values are indices into `tokenTypes` above, or -1 to skip.
 
 // ABNF Tag enum order (from Token.zig):
@@ -28,20 +28,20 @@ const abnfTagMap: number[] = [
   -1, // right_paren
   -1, // left_bracket
   -1, // right_bracket
-  4, // slash → operator
-  4, // star → operator
-  4, // equals → operator
-  4, // equals_slash → operator
-  0, // rulename → type
-  2, // number → number
-  1, // char_val → string
-  1, // char_val_ci → string
-  1, // char_val_cs → string
-  1, // prose_val → string
-  2, // bin_val → number
-  2, // dec_val → number
-  2, // hex_val → number
-  3, // comment → comment
+  4, // slash -> operator
+  4, // star -> operator
+  4, // equals -> operator
+  4, // equals_slash -> operator
+  0, // rulename -> type
+  2, // number -> number
+  1, // char_val -> string
+  1, // char_val_ci -> string
+  1, // char_val_cs -> string
+  1, // prose_val -> string
+  2, // bin_val -> number
+  2, // dec_val -> number
+  2, // hex_val -> number
+  3, // comment -> comment
   -1, // newline
   -1, // eof
   -1, // invalid
@@ -51,10 +51,10 @@ const abnfTagMap: number[] = [
 //   0: rulename, 1: definition, 2: pipe, 3: terminal,
 //   4: newline, 5: eof, 6: invalid
 const bnfTagMap: number[] = [
-  0, // rulename → type
-  4, // definition → operator
-  4, // pipe → operator
-  1, // terminal → string
+  0, // rulename -> type
+  4, // definition -> operator
+  4, // pipe -> operator
+  1, // terminal -> string
   -1, // newline
   -1, // eof
   -1, // invalid
@@ -66,20 +66,20 @@ const bnfTagMap: number[] = [
 //   10: dot, 11: literal, 12: char_class, 13: comment,
 //   14: newline, 15: eof, 16: invalid
 const pegTagMap: number[] = [
-  0, // identifier → type
-  4, // left_arrow → operator
-  4, // slash → operator
-  4, // and → operator
-  4, // not → operator
-  4, // question → operator
-  4, // star → operator
-  4, // plus → operator
+  0, // identifier -> type
+  4, // left_arrow -> operator
+  4, // slash -> operator
+  4, // and -> operator
+  4, // not -> operator
+  4, // question -> operator
+  4, // star -> operator
+  4, // plus -> operator
   -1, // left_paren
   -1, // right_paren
-  4, // dot → operator
-  1, // literal → string
-  5, // char_class → regexp
-  3, // comment → comment
+  4, // dot -> operator
+  1, // literal -> string
+  5, // char_class -> regexp
+  3, // comment -> comment
   -1, // newline
   -1, // eof
   -1, // invalid
@@ -90,14 +90,14 @@ const pegTagMap: number[] = [
 //   4: hex_byte, 5: hex_range, 6: arrow, 7: pipe,
 //   8: newline, 9: eof, 10: invalid
 const cfgTagMap: number[] = [
-  0, // identifier → type
-  1, // string → string
-  1, // string_cs → string
-  1, // string_ci → string
-  2, // hex_byte → number
-  2, // hex_range → number
-  4, // arrow → operator
-  4, // pipe → operator
+  0, // identifier -> type
+  1, // string -> string
+  1, // string_cs -> string
+  1, // string_ci -> string
+  2, // hex_byte -> number
+  2, // hex_range -> number
+  4, // arrow -> operator
+  4, // pipe -> operator
   -1, // newline
   -1, // eof
   -1, // invalid
@@ -115,12 +115,12 @@ const sexpTagMap: number[] = [
   -1, // rbracket
   -1, // lbrace
   -1, // rbrace
-  1, // verbatim → string
-  1, // quoted_string → string
-  0, // sexp_token → type
-  2, // hexadecimal → number
-  2, // base64 → number
-  2, // decimal → number
+  1, // verbatim -> string
+  1, // quoted_string -> string
+  0, // sexp_token -> type
+  2, // hexadecimal -> number
+  2, // base64 -> number
+  2, // decimal -> number
   -1, // whitespace
   -1, // eof
   -1, // invalid

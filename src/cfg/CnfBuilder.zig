@@ -1,9 +1,9 @@
 /// CNF (Chomsky Normal Form) conversion builder.
 ///
 /// Transforms a Cfg into an equivalent grammar where every production is:
-///   - `A → B C`   (exactly two nonterminals)
-///   - `A → a`     (exactly one terminal)
-///   - `S0 → ε`    (only the start symbol, if ε ∈ L)
+///   - `A -> B C`   (exactly two nonterminals)
+///   - `A -> a`     (exactly one terminal)
+///   - `S0 -> ε`    (only the start symbol, if ε ∈ L)
 ///
 /// Uses the same comptime bounded-array pattern as `cfg/Parser.zig`.
 const std = @import("std");
@@ -82,7 +82,7 @@ fn addNt(b: *CnfBuilder, name: []const u8) u32 {
     return id;
 }
 
-/// Check whether a production `lhs → rhs` already exists.
+/// Check whether a production `lhs -> rhs` already exists.
 fn hasProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) bool {
     for (b.prods[0..b.prod_count]) |prod| {
         if (prod.lhs != lhs) continue;
@@ -99,7 +99,7 @@ fn hasProd(b: *CnfBuilder, lhs: u32, rhs: []const Symbol) bool {
     return false;
 }
 
-/// If the start symbol appears on any RHS, introduce a fresh S0 → S.
+/// If the start symbol appears on any RHS, introduce a fresh S0 -> S.
 fn startStep(b: *CnfBuilder) void {
     for (b.prods[0..b.prod_count]) |prod| {
         for (prod.rhs) |sym| {
@@ -132,7 +132,7 @@ fn startStep(b: *CnfBuilder) void {
 /// 2. For every production whose RHS contains nullable symbols, generate
 ///    all combinations with those symbols present/absent.
 /// 3. Drop all ε-productions.
-/// 4. If the start symbol is nullable, add back `S → ε`.
+/// 4. If the start symbol is nullable, add back `S -> ε`.
 fn delStep(b: *CnfBuilder) void {
     // 1. Compute nullable set.
     var nullable = [1]bool{false} ** max_nts;
@@ -184,7 +184,7 @@ fn delStep(b: *CnfBuilder) void {
     const old_count = b.prod_count;
     var old_prods: [max_prods]Production = undefined;
     for (b.prods[0..old_count], 0..) |prod, i| old_prods[i] = prod;
-    b.prod_count = 0; // sym_pool keeps growing — old slices stay valid.
+    b.prod_count = 0; // sym_pool keeps growing - old slices stay valid.
 
     // 3. Rebuild with nullable combinations.
     for (old_prods[0..old_count]) |prod| {
@@ -230,7 +230,7 @@ fn delStep(b: *CnfBuilder) void {
         }
     }
 
-    // 4. Re-add start → ε if the start symbol is nullable.
+    // 4. Re-add start -> ε if the start symbol is nullable.
     if (nullable[b.start]) {
         b.prods[b.prod_count] = .{
             .lhs = b.start,
@@ -240,7 +240,7 @@ fn delStep(b: *CnfBuilder) void {
     }
 }
 
-/// Remove unit productions `A → B` by copying B's non-unit productions to A.
+/// Remove unit productions `A -> B` by copying B's non-unit productions to A.
 ///
 /// A unit production is one whose RHS is a single nonterminal.
 /// For each unit pair (A, B) reachable through unit chains, every
@@ -263,7 +263,7 @@ fn unitStep(b: *CnfBuilder) void {
         }
     }
 
-    // Floyd-Warshall–style transitive closure.
+    // Floyd-Warshall-style transitive closure.
     for (0..b.nt_count) |k| {
         for (0..b.nt_count) |i| {
             if (!unit[i][k]) continue;
@@ -317,8 +317,8 @@ fn unitStep(b: *CnfBuilder) void {
     }
 }
 
-/// In productions with |rhs| ≥ 2, replace each terminal `a` with a fresh
-/// nonterminal `T_a → a` so that long productions contain only nonterminals.
+/// In productions with |rhs| >= 2, replace each terminal `a` with a fresh
+/// nonterminal `T_a -> a` so that long productions contain only nonterminals.
 fn termStep(b: *CnfBuilder) void {
     // Snapshot.
     const old_count = b.prod_count;
@@ -326,14 +326,14 @@ fn termStep(b: *CnfBuilder) void {
     for (b.prods[0..old_count], 0..) |prod, i| old_prods[i] = prod;
     b.prod_count = 0;
 
-    // Map: terminal → proxy nonterminal id.  Index by order of discovery.
+    // Map: terminal -> proxy nonterminal id.  Index by order of discovery.
     var proxy_terms: [max_nts]Cfg.Terminal = undefined;
     var proxy_nts: [max_nts]u32 = undefined;
     var proxy_count: usize = 0;
 
     for (old_prods[0..old_count]) |prod| {
         if (prod.rhs.len < 2) {
-            // Already CNF-legal (single terminal or ε) — keep as-is.
+            // Already CNF-legal (single terminal or ε) - keep as-is.
             b.addProd(prod.lhs, prod.rhs);
             continue;
         }
@@ -388,7 +388,7 @@ fn findOrAddProxy(
     for (proxy_terms.*[0..proxy_count.*], proxy_nts.*[0..proxy_count.*]) |pt, pn| {
         if (pt.eql(t)) return pn;
     }
-    // Create fresh nonterminal T_<name> → t.
+    // Create fresh nonterminal T_<name> -> t.
     const name = proxyName(t);
     const id = b.addNt(name);
     const ss = b.sym_total;
@@ -414,10 +414,10 @@ fn proxyName(t: Cfg.Terminal) []const u8 {
 
 /// Break productions with |rhs| > 2 into chains of binary productions.
 ///
-/// `A → B C D` becomes `A → B X0`, `X0 → C D`.
-/// `A → B C D E` becomes `A → B X0`, `X0 → C X1`, `X1 → D E`.
+/// `A -> B C D` becomes `A -> B X0`, `X0 -> C D`.
+/// `A -> B C D E` becomes `A -> B X0`, `X0 -> C X1`, `X1 -> D E`.
 ///
-/// Fresh nonterminals are named `B_0`, `B_1`, … .
+/// Fresh nonterminals are named `B_0`, `B_1`, ... .
 fn binStep(b: *CnfBuilder) void {
     // Snapshot.
     const old_count = b.prod_count;
@@ -429,13 +429,13 @@ fn binStep(b: *CnfBuilder) void {
 
     for (old_prods[0..old_count]) |prod| {
         if (prod.rhs.len <= 2) {
-            // Already binary (or unit/ε) — keep as-is.
+            // Already binary (or unit/ε) - keep as-is.
             b.addProd(prod.lhs, prod.rhs);
             continue;
         }
 
-        // Chain: A → s0 s1 s2 … sN
-        // becomes: A → s0 X, X → s1 X', …, X'' → s(N-1) sN
+        // Chain: A -> s0 s1 s2 ... sN
+        // becomes: A -> s0 X, X -> s1 X', ..., X'' -> s(N-1) sN
         var lhs = prod.lhs;
         var remaining = prod.rhs;
 
@@ -444,7 +444,7 @@ fn binStep(b: *CnfBuilder) void {
             bin_id += 1;
             const fresh = b.addNt(name);
 
-            // lhs → remaining[0] fresh
+            // lhs -> remaining[0] fresh
             const ss = b.sym_total;
             b.sym_pool[b.sym_total] = remaining[0];
             b.sym_total += 1;
@@ -460,7 +460,7 @@ fn binStep(b: *CnfBuilder) void {
             remaining = remaining[1..];
         }
 
-        // Final binary pair: lhs → remaining[0] remaining[1]
+        // Final binary pair: lhs -> remaining[0] remaining[1]
         b.addProd(lhs, remaining);
     }
 }
@@ -508,20 +508,20 @@ fn expectCnf(comptime source: []const u8, comptime expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, actual);
 }
 
-test "START: start not on rhs — no change" {
+test "START: start not on rhs - no change" {
     const cfg = comptime Cfg.parse(
         \\S -> A "x"
         \\A -> "a" | "b"
     );
     const cnf = comptime cfg.toCnf();
 
-    // TERM adds proxy T_x → "x" (1 NT, 1 prod).
+    // TERM adds proxy T_x -> "x" (1 NT, 1 prod).
     try std.testing.expectEqual(cfg.nonterminals.len + 1, cnf.nonterminals.len);
     try std.testing.expectEqual(cfg.productions.len + 1, cnf.productions.len);
     try std.testing.expectEqual(cfg.start, cnf.start);
 }
 
-test "START: start on rhs — fresh S0 added" {
+test "START: start on rhs - fresh S0 added" {
     const cfg = comptime Cfg.parse(
         \\S -> A "x"
         \\A -> S | "a"
@@ -538,15 +538,15 @@ test "START: format with new S0" {
         \\S -> A "x"
         \\A -> S | "a"
     ,
-        \\S0 → A T_x
-        \\S → A T_x
-        \\A → A T_x
-        \\A → "a"
-        \\T_x → "x"
+        \\S0 -> A T_x
+        \\S -> A T_x
+        \\A -> A T_x
+        \\A -> "a"
+        \\T_x -> "x"
     );
 }
 
-test "DEL: no nullable — no change" {
+test "DEL: no nullable - no change" {
     const cfg = comptime Cfg.parse(
         \\S -> "a" | "b"
     );
@@ -560,10 +560,10 @@ test "DEL: basic ε-elimination" {
         \\S -> A "b"
         \\A -> "a" |
     ,
-        \\S → A T_b
-        \\S → "b"
-        \\A → "a"
-        \\T_b → "b"
+        \\S -> A T_b
+        \\S -> "b"
+        \\A -> "a"
+        \\T_b -> "b"
     );
 }
 
@@ -572,9 +572,9 @@ test "DEL: nullable start gets ε back" {
         \\S -> A
         \\A -> "a" |
     ,
-        \\S → ε
-        \\S → "a"
-        \\A → "a"
+        \\S -> ε
+        \\S -> "a"
+        \\A -> "a"
     );
 }
 
@@ -583,10 +583,10 @@ test "DEL: duplicate combinations collapsed" {
         \\S -> A A
         \\A -> "a" |
     ,
-        \\S → A A
-        \\S → ε
-        \\S → "a"
-        \\A → "a"
+        \\S -> A A
+        \\S -> ε
+        \\S -> "a"
+        \\A -> "a"
     );
 }
 
@@ -596,10 +596,10 @@ test "DEL: transitive nullable" {
         \\A -> B
         \\B -> "x" |
     ,
-        \\S → ε
-        \\S → "x"
-        \\A → "x"
-        \\B → "x"
+        \\S -> ε
+        \\S -> "x"
+        \\A -> "x"
+        \\B -> "x"
     );
 }
 
@@ -608,34 +608,34 @@ test "UNIT: basic unit elimination" {
         \\S -> A
         \\A -> "x" "y"
     ,
-        \\S → T_x T_y
-        \\A → T_x T_y
-        \\T_x → "x"
-        \\T_y → "y"
+        \\S -> T_x T_y
+        \\A -> T_x T_y
+        \\T_x -> "x"
+        \\T_y -> "y"
     );
 }
 
-test "UNIT: chain A → B → C" {
+test "UNIT: chain A -> B -> C" {
     try expectCnf(
         \\S -> A
         \\A -> B
         \\B -> "x"
     ,
-        \\S → "x"
-        \\A → "x"
-        \\B → "x"
+        \\S -> "x"
+        \\A -> "x"
+        \\B -> "x"
     );
 }
 
-test "UNIT: no unit productions — no change" {
+test "UNIT: no unit productions - no change" {
     const cfg = comptime Cfg.parse(
         \\S -> "a" "b"
         \\S -> "c"
     );
     const cnf = comptime cfg.toCnf();
 
-    // UNIT: no change. TERM: S → "a" "b" rewritten + 2 proxies
-    // (T_a → "a", T_b → "b") + single-terminal S → "c" kept as-is = 4.
+    // UNIT: no change. TERM: S -> "a" "b" rewritten + 2 proxies
+    // (T_a -> "a", T_b -> "b") + single-terminal S -> "c" kept as-is = 4.
     try std.testing.expectEqual(4, cnf.productions.len);
 }
 
@@ -645,23 +645,23 @@ test "TERM: terminal in mixed rhs replaced" {
         \\A -> "a"
         \\B -> "b"
     ,
-        \\S → A B_0
-        \\A → "a"
-        \\B → "b"
-        \\T_x → "x"
-        \\B_0 → T_x B
+        \\S -> A B_0
+        \\A -> "a"
+        \\B -> "b"
+        \\T_x -> "x"
+        \\B_0 -> T_x B
     );
 }
 
-test "TERM: same terminal reused — single proxy" {
+test "TERM: same terminal reused - single proxy" {
     try expectCnf(
         \\S -> "x" A "x"
         \\A -> "a"
     ,
-        \\S → T_x B_0
-        \\A → "a"
-        \\T_x → "x"
-        \\B_0 → A T_x
+        \\S -> T_x B_0
+        \\A -> "a"
+        \\T_x -> "x"
+        \\B_0 -> A T_x
     );
 }
 
@@ -681,9 +681,9 @@ test "BIN: binary and shorter rhs unchanged" {
         \\A -> "a"
         \\B -> "b"
     ,
-        \\S → A B
-        \\A → "a"
-        \\B → "b"
+        \\S -> A B
+        \\A -> "a"
+        \\B -> "b"
     );
 }
 
@@ -694,11 +694,11 @@ test "BIN: length-3 rhs splits into binary chain" {
         \\B -> "b"
         \\C -> "c"
     ,
-        \\S → A B_0
-        \\A → "a"
-        \\B → "b"
-        \\C → "c"
-        \\B_0 → B C
+        \\S -> A B_0
+        \\A -> "a"
+        \\B -> "b"
+        \\C -> "c"
+        \\B_0 -> B C
     );
 }
 
@@ -710,12 +710,12 @@ test "BIN: length-4 rhs creates two fresh nonterminals" {
         \\C -> "c"
         \\D -> "d"
     ,
-        \\S → A B_0
-        \\A → "a"
-        \\B → "b"
-        \\C → "c"
-        \\D → "d"
-        \\B_0 → B B_1
-        \\B_1 → C D
+        \\S -> A B_0
+        \\A -> "a"
+        \\B -> "b"
+        \\C -> "c"
+        \\D -> "d"
+        \\B_0 -> B B_1
+        \\B_1 -> C D
     );
 }

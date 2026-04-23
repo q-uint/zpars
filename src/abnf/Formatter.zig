@@ -1,4 +1,4 @@
-/// ABNF formatter — pretty-prints an AST back into canonical ABNF text.
+/// ABNF formatter - pretty-prints an AST back into canonical ABNF text.
 ///
 /// Rule names are padded to align the `=` / `=/` operators across all
 /// rules in the grammar. Comments are preserved from the token stream.
@@ -68,7 +68,7 @@ pub fn formatGrammar(rules: []const Ast.Rule, tokens: []const Token, source: []c
                 }
             },
             else => {
-                // Unexpected token outside a rule — skip.
+                // Unexpected token outside a rule - skip.
                 tok_idx += 1;
             },
         }
@@ -162,7 +162,7 @@ fn formatRepetition(rep: Ast.Repetition, writer: anytype) anyerror!void {
         try writer.print("{d}*{d}", .{ rep.min, rep.max.? });
     }
 
-    // Element — needs grouping if compound.
+    // Element - needs grouping if compound.
     switch (rep.element.*) {
         .alternation, .concatenation => {
             try writer.writeByte('(');

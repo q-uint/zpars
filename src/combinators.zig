@@ -6,7 +6,7 @@
 ///     pub fn parse(input: []const u8) ?Result(Value);
 ///
 /// Combinators are `fn(...) type` functions that compose parsers into new ones.
-/// Everything is resolved at comptime — zero runtime overhead.
+/// Everything is resolved at comptime - zero runtime overhead.
 const std = @import("std");
 
 // Core result type
@@ -169,7 +169,7 @@ pub const Bounds = struct {
 /// Results are written into a per-instantiation threadlocal buffer of size
 /// `bounds.max orelse 4096`. The returned `.value` slice points into that
 /// buffer, so callers must consume it before the next call to
-/// `Many(P, bounds).parse` on the same thread — a second call clobbers the
+/// `Many(P, bounds).parse` on the same thread - a second call clobbers the
 /// first's results. Wrap with `Capture` if you need a slice of `input` instead.
 pub fn Many(comptime P: type, comptime bounds: Bounds) type {
     const limit = bounds.max orelse 4096;
@@ -480,7 +480,7 @@ test "Not succeeds on empty input when inner needs input" {
 }
 
 test "Not enables keyword vs identifier disambiguation" {
-    // `Word("let")` — match "let" only if not followed by an identifier char.
+    // `Word("let")` - match "let" only if not followed by an identifier char.
     const Alpha = Char(std.ascii.isAlphabetic);
     const Word = Seq(.{ Literal("let"), Not(Alpha) });
     try std.testing.expect(Word.parse("let x") != null);

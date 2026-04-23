@@ -1,4 +1,4 @@
-/// S-expression scanner — tokenizes RFC 9804 S-expressions.
+/// S-expression scanner - tokenizes RFC 9804 S-expressions.
 ///
 /// Supports the advanced transport representation which is a superset
 /// of canonical and basic transport. Handles verbatim (length-prefixed),
@@ -51,13 +51,13 @@ fn scanAfterZero(self: *Scanner, start: usize) Token {
         _ = self.advance(); // consume ':'
         return self.scanVerbatimData(start, 0);
     }
-    // Bare '0' — emit as decimal.
+    // Bare '0' - emit as decimal.
     return self.makeToken(.decimal, start, 1);
 }
 
 /// After seeing '1'-'9': scan remaining digits, then decide based on
-/// what follows: `:` → verbatim, `"` → length-prefixed quoted,
-/// `#` → length-prefixed hex, `|` → length-prefixed base64.
+/// what follows: `:` -> verbatim, `"` -> length-prefixed quoted,
+/// `#` -> length-prefixed hex, `|` -> length-prefixed base64.
 fn scanAfterDigit(self: *Scanner, start: usize) Token {
     while (!self.isAtEnd() and isDigit(self.peek())) _ = self.advance();
 
@@ -90,7 +90,7 @@ fn scanAfterDigit(self: *Scanner, start: usize) Token {
 fn scanVerbatimData(self: *Scanner, start: usize, len: usize) Token {
     const avail = self.source.len - self.current;
     if (avail < len) {
-        // Not enough data — consume what's left, mark invalid.
+        // Not enough data - consume what's left, mark invalid.
         self.current = self.source.len;
         return self.makeToken(.invalid, start, self.current - start);
     }
@@ -410,9 +410,7 @@ test "mixed expression" {
     });
 }
 
-// ── RFC 9804 edge case tests ───────────────────────────────────────
-
-// §4.2 Token — pseudo-alphabetic start characters
+// §4.2 Token - pseudo-alphabetic start characters
 test "token starting with colon" {
     try expectTokens(":=..", &.{ .sexp_token, .eof });
 }
@@ -429,13 +427,13 @@ test "token class-of-1997 (digit after non-digit start)" {
     try expectTokens("class-of-1997", &.{ .sexp_token, .eof });
 }
 
-// §4.2 Token — digits cannot start a token (they start verbatim/decimal)
+// §4.2 Token - digits cannot start a token (they start verbatim/decimal)
 test "digit start is not a token" {
-    // '1abc' — '1' starts a decimal scan, not a token
+    // '1abc' - '1' starts a decimal scan, not a token
     try expectTokens("1abc", &.{ .decimal, .sexp_token, .eof });
 }
 
-// §4.1 Verbatim — binary data pass-through
+// §4.1 Verbatim - binary data pass-through
 test "verbatim with special characters" {
     // 4:::": is verbatim for ::\"
     var scanner = Scanner.init("4:::\":");
@@ -456,17 +454,17 @@ test "verbatim truncated input" {
     try expectTokens("5:abc", &.{ .invalid, .eof });
 }
 
-// §4.3 Quoted string — empty
+// §4.3 Quoted string - empty
 test "quoted string empty" {
     try expectTokens("\"\"", &.{ .quoted_string, .eof });
 }
 
-// §4.3 Quoted string — unterminated
+// §4.3 Quoted string - unterminated
 test "quoted string unterminated" {
     try expectTokens("\"oops", &.{ .invalid, .eof });
 }
 
-// §4.3 Quoted string — line continuation
+// §4.3 Quoted string - line continuation
 test "quoted string with line continuation" {
     try expectTokens("\"hello\\\nworld\"", &.{ .quoted_string, .eof });
 }
@@ -475,68 +473,68 @@ test "quoted string with CRLF continuation" {
     try expectTokens("\"hello\\\r\nworld\"", &.{ .quoted_string, .eof });
 }
 
-// §4.4 Hexadecimal — newlines as whitespace inside hex
+// §4.4 Hexadecimal - newlines as whitespace inside hex
 test "hexadecimal with newlines" {
     try expectTokens("# 61\n62\n63 #", &.{ .hexadecimal, .eof });
 }
 
-// §4.4 Hexadecimal — unterminated
+// §4.4 Hexadecimal - unterminated
 test "hexadecimal unterminated" {
     try expectTokens("#6162", &.{ .invalid, .eof });
 }
 
-// §4.4 Hexadecimal — invalid character inside
+// §4.4 Hexadecimal - invalid character inside
 test "hexadecimal invalid char" {
     try expectTokens("#61GZ#", &.{ .invalid, .eof });
 }
 
-// §4.5 Base-64 — with whitespace
+// §4.5 Base-64 - with whitespace
 test "base64 with internal whitespace" {
     try expectTokens("| Y W J j |", &.{ .base64, .eof });
 }
 
-// §4.5 Base-64 — empty
+// §4.5 Base-64 - empty
 test "base64 empty" {
     try expectTokens("||", &.{ .base64, .eof });
 }
 
-// §4.5 Base-64 — unterminated
+// §4.5 Base-64 - unterminated
 test "base64 unterminated" {
     try expectTokens("|YWJj", &.{ .invalid, .eof });
 }
 
-// §4.5 Base-64 — padding dropped on input (MAY accept)
+// §4.5 Base-64 - padding dropped on input (MAY accept)
 test "base64 without padding" {
     try expectTokens("|YWJjZA|", &.{ .base64, .eof });
 }
 
-// §6 Basic transport — brace-wrapped with internal whitespace
+// §6 Basic transport - brace-wrapped with internal whitespace
 test "brace base64 with whitespace" {
     try expectTokens("{ KDE6YTE6YjE6Yyk= }", &.{ .lbrace, .eof });
 }
 
-// §6 Brace — unterminated
+// §6 Brace - unterminated
 test "brace base64 unterminated" {
     try expectTokens("{KDE6YTE6", &.{ .invalid, .eof });
 }
 
-// §3 Display hints — whitespace around hint
+// §3 Display hints - whitespace around hint
 test "display hint with whitespace" {
     try expectTokens("[ 3:gif ]\"data\"", &.{ .lbracket, .verbatim, .rbracket, .quoted_string, .eof });
 }
 
-// §3 Display hints — quoted hint
+// §3 Display hints - quoted hint
 test "display hint with quoted string" {
     try expectTokens("[\"image/gif\"]\"data\"", &.{ .lbracket, .quoted_string, .rbracket, .quoted_string, .eof });
 }
 
-// Whitespace — all RFC 9804 whitespace characters
+// Whitespace - all RFC 9804 whitespace characters
 test "all whitespace types skipped" {
     // SP, HTAB, VTAB, FF, CR, LF
     try expectTokens(" \t\x0B\x0C\r\nabc", &.{ .sexp_token, .eof });
 }
 
-// Canonical — no whitespace between elements
+// Canonical - no whitespace between elements
 test "canonical list no spaces" {
     try expectTokens("(6:issuer3:bob)", &.{
         .lparen,

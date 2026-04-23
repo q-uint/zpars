@@ -14,33 +14,33 @@ pub const Rule = struct {
 
 /// A single node in the grammar syntax tree.
 pub const Node = union(enum) {
-    /// `a / b / c` — one of the alternatives.
+    /// `a / b / c` - one of the alternatives.
     alternation: []const Node,
-    /// `a b c` — all elements in sequence.
+    /// `a b c` - all elements in sequence.
     concatenation: []const Node,
-    /// `[min]*[max] element` — bounded repetition.
+    /// `[min]*[max] element` - bounded repetition.
     repetition: Repetition,
     /// Quoted string literal (RFC 5234 + RFC 7405).
     char_val: CharVal,
     /// `%x41`, `%x41-5A`, or `%x41.42.43`.
     num_val: NumVal,
-    /// `<prose description>` — free-form text.
+    /// `<prose description>` - free-form text.
     prose_val: []const u8,
     /// Reference to another rule by name.
     rulename: []const u8,
-    /// `&e` — positive lookahead (match without consuming).
+    /// `&e` - positive lookahead (match without consuming).
     and_predicate: *const Node,
-    /// `!e` — negative lookahead (succeed if e fails, consume nothing).
+    /// `!e` - negative lookahead (succeed if e fails, consume nothing).
     not_predicate: *const Node,
-    /// `[a-zA-Z0-9]` — character class with ranges and singles.
+    /// `[a-zA-Z0-9]` - character class with ranges and singles.
     char_class: []const ClassRange,
-    /// `[^a-zA-Z0-9]` — negated character class (matches any char NOT in ranges).
+    /// `[^a-zA-Z0-9]` - negated character class (matches any char NOT in ranges).
     neg_char_class: []const ClassRange,
-    /// `^` — anchor: match only at the start of input.
+    /// `^` - anchor: match only at the start of input.
     anchor_start,
-    /// `$` — anchor: match only at the end of input.
+    /// `$` - anchor: match only at the end of input.
     anchor_end,
-    /// `.` — match any single character.
+    /// `.` - match any single character.
     any,
     /// Capture group: records start/end positions of the inner match.
     capture: *const Node,

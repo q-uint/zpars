@@ -1,4 +1,4 @@
-/// PEG formatter — pretty-prints an AST back into PEG notation.
+/// PEG formatter - pretty-prints an AST back into PEG notation.
 ///
 /// Rule names are padded to align the `<-` operators across all rules.
 /// Comments are preserved from the token stream.

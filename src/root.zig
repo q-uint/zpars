@@ -74,6 +74,7 @@ pub const vm = struct {
     pub const Compiler = compiler_mod.Compiler;
     pub const CompilerWith = compiler_mod.CompilerWith;
     pub const CompilerConfig = compiler_mod.Config;
+    pub const CaptureTree = @import("vm/CaptureTree.zig");
     pub const Disassembler = @import("vm/Disassembler.zig");
     pub const Instruction = @import("vm/Instruction.zig");
     pub const Jit = @import("vm/Jit.zig");

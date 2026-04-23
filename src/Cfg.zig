@@ -36,7 +36,7 @@ pub const Terminal = union(enum) {
     }
 };
 
-/// A grammar symbol — either a terminal or a reference to a nonterminal.
+/// A grammar symbol - either a terminal or a reference to a nonterminal.
 pub const Symbol = union(enum) {
     terminal: Terminal,
     /// Index into the `nonterminals` table.
@@ -52,7 +52,7 @@ pub const Symbol = union(enum) {
     }
 };
 
-/// A production rule: `lhs → rhs`.
+/// A production rule: `lhs -> rhs`.
 ///
 /// An empty `rhs` represents an ε-production.
 pub const Production = struct {
@@ -86,10 +86,10 @@ pub fn productionsFor(self: Cfg, nonterminal: u32) []const Production {
     return self.productions[lo..hi];
 }
 
-/// Format a single production as `A → X Y Z`.
+/// Format a single production as `A -> X Y Z`.
 fn formatProduction(self: Cfg, prod: Production, writer: anytype) !void {
     try writer.writeAll(self.nonterminalName(prod.lhs));
-    try writer.writeAll(" →");
+    try writer.writeAll(" ->");
 
     if (prod.rhs.len == 0) {
         try writer.writeAll(" ε");
@@ -129,9 +129,9 @@ const Parser = parser_mod.Parser;
 ///   - `->` separates the LHS nonterminal from the RHS symbols
 ///   - `|` separates alternative right-hand sides
 ///   - Quoted strings are case-sensitive terminals: `"text"`
-///   - `%s"text"` — case-sensitive string terminal
-///   - `%i"text"` — case-insensitive string terminal
-///   - `%x41` — single byte terminal, `%x41-5A` — byte range
+///   - `%s"text"` - case-sensitive string terminal
+///   - `%i"text"` - case-insensitive string terminal
+///   - `%x41` - single byte terminal, `%x41-5A` - byte range
 ///   - Bare identifiers are nonterminal references
 ///   - Empty RHS is an ε-production
 ///   - The first rule's LHS becomes the start symbol
@@ -158,16 +158,16 @@ const CnfBuilder = @import("cfg/CnfBuilder.zig");
 /// Convert this grammar to Chomsky Normal Form at compile time.
 ///
 /// CNF restricts every production to one of:
-///   - `A → B C`   (exactly two nonterminals)
-///   - `A → a`     (exactly one terminal)
-///   - `S0 → ε`    (only the start symbol, if ε ∈ L)
+///   - `A -> B C`   (exactly two nonterminals)
+///   - `A -> a`     (exactly one terminal)
+///   - `S0 -> ε`    (only the start symbol, if ε ∈ L)
 ///
 /// The conversion applies the standard textbook steps in order:
-///   1. **START** — guarantee the start symbol never appears on any RHS
-///   2. **DEL**   — eliminate ε-productions
-///   3. **UNIT**  — eliminate unit productions
-///   4. **TERM**  — isolate terminals in long RHS
-///   5. **BIN**   — break long RHS into binary chains
+///   1. **START** - guarantee the start symbol never appears on any RHS
+///   2. **DEL**   - eliminate ε-productions
+///   3. **UNIT**  - eliminate unit productions
+///   4. **TERM**  - isolate terminals in long RHS
+///   5. **BIN**   - break long RHS into binary chains
 pub fn toCnf(comptime self: Cfg) Cfg {
     comptime {
         @setEvalBranchQuota(1_000_000);
@@ -180,16 +180,16 @@ test "basic construction and name lookup" {
     const cfg = Cfg{
         .nonterminals = &.{ "S", "A" },
         .productions = &.{
-            // S → A "x"
+            // S -> A "x"
             .{ .lhs = 0, .rhs = &.{
                 .{ .nonterminal = 1 },
                 .{ .terminal = .{ .byte = 'x' } },
             } },
-            // A → "hello"
+            // A -> "hello"
             .{ .lhs = 1, .rhs = &.{
                 .{ .terminal = .{ .string = "hello" } },
             } },
-            // A → ε
+            // A -> ε
             .{ .lhs = 1, .rhs = &.{} },
         },
         .start = 0,
@@ -265,11 +265,11 @@ test "format produces readable output" {
     var buf: [256]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&buf);
     try cfg.formatProduction(cfg.productions[0], &fbs);
-    try std.testing.expectEqualStrings("S → A %x78", fbs.buffered());
+    try std.testing.expectEqualStrings("S -> A %x78", fbs.buffered());
 
     fbs.end = 0;
     try cfg.formatProduction(cfg.productions[2], &fbs);
-    try std.testing.expectEqualStrings("A → ε", fbs.buffered());
+    try std.testing.expectEqualStrings("A -> ε", fbs.buffered());
 }
 
 test "parse: basic nonterminal and string terminal" {
@@ -380,8 +380,8 @@ test "parse: format round-trip" {
 
     const actual = comptime std.fmt.comptimePrint("{f}", .{cfg});
     try std.testing.expectEqualStrings(
-        \\S → A %x78
-        \\A → "hello"
-        \\A → ε
+        \\S -> A %x78
+        \\A -> "hello"
+        \\A -> ε
     , actual);
 }

@@ -2,7 +2,7 @@
   <img src="icon.png" width="128" height="128" alt="zpars logo">
   <h1 align="center">zpars</h1>
   <p align="center">
-    A grammar parser toolkit written in Zig — ABNF, BNF, PEG, CFG, ERE, and S-expressions<br>
+    A grammar parser toolkit written in Zig - ABNF, BNF, PEG, CFG, ERE, and S-expressions<br>
     with comptime parser combinators, a bytecode VM, native JIT compilers, and AOT compilation for AArch64 and x86_64.
   </p>
   <p align="center">
@@ -14,21 +14,21 @@
 
 ## Features
 
-- **Multi-format parsing** — ABNF, BNF, PEG, CFG, ERE, and S-expression grammars, each with tokenizer, parser, and error diagnostics.
-- **Validation** — Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
-- **Runtime matching** — Match input strings against any rule in a dynamically loaded grammar.
-- **Formatting** — Pretty-print grammars back to canonical form with aligned operators.
-- **Comptime combinators** — Zero-overhead parser combinator library resolved entirely at comptime.
-- **ABNF compiler** — Compile ABNF grammar strings into combinator types at comptime — define your grammar in standard ABNF and get a parser for free.
-- **Grammar VM** — Bytecode virtual machine inspired by LPeg. Compiles any grammar to instructions and executes with backtracking and capture groups.
-- **Peephole optimizer** — Optimizes compiled bytecode with charset-to-char reduction, consecutive char fusion into string instructions, common prefix factoring, and optional char fusion.
-- **JIT compilers** — Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
-- **AOT compilation** — Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
-- **Benchmarks** — 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
+- **Multi-format parsing** - ABNF, BNF, PEG, CFG, ERE, and S-expression grammars, each with tokenizer, parser, and error diagnostics.
+- **Validation** - Detects duplicate rules, undefined references, unused rules, and unproductive cycles.
+- **Runtime matching** - Match input strings against any rule in a dynamically loaded grammar.
+- **Formatting** - Pretty-print grammars back to canonical form with aligned operators.
+- **Comptime combinators** - Zero-overhead parser combinator library resolved entirely at comptime.
+- **ABNF compiler** - Compile ABNF grammar strings into combinator types at comptime - define your grammar in standard ABNF and get a parser for free.
+- **Grammar VM** - Bytecode virtual machine inspired by LPeg. Compiles any grammar to instructions and executes with backtracking and capture groups.
+- **Peephole optimizer** - Optimizes compiled bytecode with charset-to-char reduction, consecutive char fusion into string instructions, common prefix factoring, and optional char fusion.
+- **JIT compilers** - Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
+- **AOT compilation** - Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
+- **Benchmarks** - 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
 ## Comptime ABNF Compiler
 
-Define a grammar in ABNF and compile it to a parser type at comptime — zero runtime overhead:
+Define a grammar in ABNF and compile it to a parser type at comptime - zero runtime overhead:
 
 ```zig
 const zpars = @import("zpars");
@@ -164,10 +164,10 @@ The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 16 opcode
 
 The optimizer runs after compilation, rewriting bytecode in-place before execution:
 
-- **Charset-to-char** — Replaces `set` instructions with a single-element charset by a cheaper `char` instruction.
-- **Char fusion** — Fuses runs of consecutive `char` instructions into a single `string` instruction.
-- **Common prefix factoring** — Factors shared prefixes out of alternation branches (e.g. `https|http` shares `http`).
-- **Optional char fusion** — Collapses `choice`/`char`/`commit` sequences for `a?` patterns into a single `optional_char` instruction.
+- **Charset-to-char** - Replaces `set` instructions with a single-element charset by a cheaper `char` instruction.
+- **Char fusion** - Fuses runs of consecutive `char` instructions into a single `string` instruction.
+- **Common prefix factoring** - Factors shared prefixes out of alternation branches (e.g. `https|http` shares `http`).
+- **Optional char fusion** - Collapses `choice`/`char`/`commit` sequences for `a?` patterns into a single `optional_char` instruction.
 
 ### JIT Compilers
 
@@ -300,11 +300,11 @@ zig build vsx                  # build the Open VSX extension (WASM + TypeScript
 
 ## References
 
-- [RFC 5234 — Augmented BNF for Syntax Specifications: ABNF](https://www.rfc-editor.org/rfc/rfc5234)
-- [RFC 7405 — Case-Sensitive String Support in ABNF](https://www.rfc-editor.org/rfc/rfc7405)
-- [Report on the Algorithmic Language ALGOL 60 (1960)](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) — original BNF definition (Section 1.1)
-- [Parsing Expression Grammars: A Recognition-Based Syntactic Foundation (2004)](https://bford.info/pub/lang/peg.pdf) — Bryan Ford's PEG paper
-- [IEEE Std 1003.1 — Extended Regular Expressions (ERE)](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html) — POSIX ERE specification (Section 9.4)
-- [RFC 9804 — S-Expressions](https://www.rfc-editor.org/rfc/rfc9804)
-- [A Text Pattern-Matching Tool based on Parsing Expression Grammars (2009)](http://www.inf.puc-rio.br/~roberto/docs/peg.pdf) — Ierusalimschy's LPeg parsing machine
-- [Packrat Parsers Can Support Left Recursion (2008)](https://web.cs.ucla.edu/~todd/research/pepm08.pdf) — Warth et al.'s seed-growing algorithm for left recursion in PEGs
+- [RFC 5234 - Augmented BNF for Syntax Specifications: ABNF](https://www.rfc-editor.org/rfc/rfc5234)
+- [RFC 7405 - Case-Sensitive String Support in ABNF](https://www.rfc-editor.org/rfc/rfc7405)
+- [Report on the Algorithmic Language ALGOL 60 (1960)](https://softwarepreservation.computerhistory.org/ALGOL/report/Algol60_report_CACM_1960_June.pdf) - original BNF definition (Section 1.1)
+- [Parsing Expression Grammars: A Recognition-Based Syntactic Foundation (2004)](https://bford.info/pub/lang/peg.pdf) - Bryan Ford's PEG paper
+- [IEEE Std 1003.1 - Extended Regular Expressions (ERE)](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap09.html) - POSIX ERE specification (Section 9.4)
+- [RFC 9804 - S-Expressions](https://www.rfc-editor.org/rfc/rfc9804)
+- [A Text Pattern-Matching Tool based on Parsing Expression Grammars (2009)](http://www.inf.puc-rio.br/~roberto/docs/peg.pdf) - Ierusalimschy's LPeg parsing machine
+- [Packrat Parsers Can Support Left Recursion (2008)](https://web.cs.ucla.edu/~todd/research/pepm08.pdf) - Warth et al.'s seed-growing algorithm for left recursion in PEGs
