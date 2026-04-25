@@ -43,7 +43,58 @@ pub const Tree = struct {
         self.allocator.free(self.roots);
         self.roots = &.{};
     }
+
+    /// Tree-sitter style S-expression. Each node looks like
+    /// `(NodeType [start,end] children...)`. Closing parens stack at
+    /// the end of the last line so the output diffs cleanly. Names
+    /// are looked up by `group_id` in the provided slice; a hyphen is
+    /// printed when `group_id` is out of range.
+    pub fn writeSExp(self: *const Tree, writer: anytype, names: []const []const u8) !void {
+        for (self.roots, 0..) |root, i| {
+            if (i > 0) try writer.writeByte('\n');
+            try writeSExpNode(root, writer, names, 0);
+        }
+    }
+
+    /// Compact single-line JSON: `{"type":"X","span":[s,e],"children":[...]}`.
+    /// Children key is omitted when the node is a leaf. Rule names are
+    /// trusted to be identifiers (no JSON escaping).
+    pub fn writeJson(self: *const Tree, writer: anytype, names: []const []const u8) !void {
+        try writer.writeByte('[');
+        for (self.roots, 0..) |root, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeJsonNode(root, writer, names);
+        }
+        try writer.writeByte(']');
+    }
 };
+
+fn nodeName(names: []const []const u8, group_id: u16) []const u8 {
+    return if (group_id < names.len) names[group_id] else "-";
+}
+
+fn writeSExpNode(node: Node, writer: anytype, names: []const []const u8, depth: usize) !void {
+    try writer.splatByteAll(' ', depth);
+    try writer.print("({s} [{d},{d}]", .{ nodeName(names, node.group_id), node.span.start, node.span.end });
+    for (node.children) |child| {
+        try writer.writeByte('\n');
+        try writeSExpNode(child, writer, names, depth + 2);
+    }
+    try writer.writeByte(')');
+}
+
+fn writeJsonNode(node: Node, writer: anytype, names: []const []const u8) !void {
+    try writer.print("{{\"type\":\"{s}\",\"span\":[{d},{d}]", .{ nodeName(names, node.group_id), node.span.start, node.span.end });
+    if (node.children.len > 0) {
+        try writer.writeAll(",\"children\":[");
+        for (node.children, 0..) |child, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeJsonNode(child, writer, names);
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeByte('}');
+}
 
 fn freeNodes(allocator: std.mem.Allocator, nodes: []Node) void {
     for (nodes) |*n| {
@@ -210,4 +261,58 @@ test "buildFromEvents: unbalanced close returns error" {
         .{ .close = .{ .group_id = 0, .pos = 1 } },
     };
     try testing.expectError(error.UnbalancedEvents, buildFromEvents(testing.allocator, &events));
+}
+
+test "writeSExp: tree-sitter style with stacked closing parens" {
+    const events = [_]Event{
+        .{ .open = .{ .group_id = 0, .pos = 0 } },
+        .{ .open = .{ .group_id = 1, .pos = 0 } },
+        .{ .close = .{ .group_id = 1, .pos = 1 } },
+        .{ .open = .{ .group_id = 1, .pos = 2 } },
+        .{ .close = .{ .group_id = 1, .pos = 3 } },
+        .{ .close = .{ .group_id = 0, .pos = 3 } },
+    };
+    var tree = try buildFromEvents(testing.allocator, &events);
+    defer tree.deinit();
+
+    var buf: [256]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try tree.writeSExp(&stream, &.{ "Expr", "Term" });
+    try testing.expectEqualStrings(
+        \\(Expr [0,3]
+        \\  (Term [0,1])
+        \\  (Term [2,3]))
+    , stream.buffered());
+}
+
+test "writeJson: compact single-line representation" {
+    const events = [_]Event{
+        .{ .open = .{ .group_id = 0, .pos = 0 } },
+        .{ .open = .{ .group_id = 1, .pos = 0 } },
+        .{ .close = .{ .group_id = 1, .pos = 1 } },
+        .{ .close = .{ .group_id = 0, .pos = 1 } },
+    };
+    var tree = try buildFromEvents(testing.allocator, &events);
+    defer tree.deinit();
+
+    var buf: [256]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try tree.writeJson(&stream, &.{ "Outer", "Inner" });
+    try testing.expectEqualStrings(
+        \\[{"type":"Outer","span":[0,1],"children":[{"type":"Inner","span":[0,1]}]}]
+    , stream.buffered());
+}
+
+test "writeSExp: out-of-range group_id renders as hyphen" {
+    const events = [_]Event{
+        .{ .open = .{ .group_id = 7, .pos = 0 } },
+        .{ .close = .{ .group_id = 7, .pos = 1 } },
+    };
+    var tree = try buildFromEvents(testing.allocator, &events);
+    defer tree.deinit();
+
+    var buf: [64]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try tree.writeSExp(&stream, &.{});
+    try testing.expectEqualStrings("(- [0,1])", stream.buffered());
 }

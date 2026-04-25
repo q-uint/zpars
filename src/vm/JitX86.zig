@@ -540,6 +540,11 @@ fn emitBacktrackHandler(
     emitCmp32RI8(buf, t1, 2);
     const save_rel32 = emitJccRel32(buf, CC.eq);
 
+    const event_rel32 = if (config.capture_events) blk: {
+        emitCmp32RI8(buf, t1, 3);
+        break :blk emitJccRel32(buf, CC.eq);
+    } else 0;
+
     // tag == 1 (ret): skip, continue loop
     emitTestRR(buf, bsp, bsp);
     addFixup(fixups, fcount, emitJccRel32(buf, CC.z), .fail);
@@ -573,6 +578,20 @@ fn emitBacktrackHandler(
         patchRel32(buf, jmp_off, loop_off);
     }
 
+    // event handler (capture_events only)
+    const event_handler_off = if (config.capture_events) blk: {
+        const off = buf.off();
+        emitMovRM(buf, rsi_r, t0, 24); // event_len
+        emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+        emitMovRM(buf, t3, rsp_r, stk_hte);
+        emitCallR(buf, t3);
+        emitTestRR(buf, bsp, bsp);
+        addFixup(fixups, fcount, emitJccRel32(buf, CC.z), .fail);
+        const jmp_off = emitJmpRel32(buf);
+        patchRel32(buf, jmp_off, loop_off);
+        break :blk off;
+    } else 0;
+
     // choice handler
     const choice_handler_off = buf.off();
     emitMovRM(buf, pos, t0, 8);
@@ -585,6 +604,7 @@ fn emitBacktrackHandler(
 
     patchRel32(buf, choice_rel32, choice_handler_off);
     patchRel32(buf, save_rel32, save_handler_off);
+    if (config.capture_events) patchRel32(buf, event_rel32, event_handler_off);
 }
 
 fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup, fcount: *usize) void {
@@ -674,12 +694,69 @@ fn emitInst(
             unreachable;
         },
         .ret => {
-            emitDec(buf, bsp);
-            emitMovRR(buf, t0, bsp);
-            emitShlRI(buf, t0, 5);
-            emitLeaRR(buf, t0, skp, t0);
-            emitMovRM(buf, t0, t0, 8);
-            emitJmpR(buf, t0);
+            if (config.capture_events) {
+                // The body may have left save/event frames on top of
+                // the call's ret frame. Walk down to find the ret
+                // frame, then shift the intervening frames down by
+                // one so they remain live for outer backtrack.
+                emitMovRR(buf, t1, bsp);
+                emitDec(buf, t1); // t1 = sp - 1 (top frame index)
+
+                const find_loop_off = buf.off();
+                emitMovRR(buf, t0, t1);
+                emitShlRI(buf, t0, 5);
+                emitLeaRR(buf, t0, skp, t0); // t0 = &stack[t1]
+                emitMovRM(buf, t2, t0, 0); // t2 = tag
+                emitCmp32RI8(buf, t2, 1);
+                const found_rel32 = emitJccRel32(buf, CC.eq);
+                emitDec(buf, t1);
+                {
+                    const back = emitJmpRel32(buf);
+                    patchRel32(buf, back, find_loop_off);
+                }
+
+                patchRel32(buf, found_rel32, buf.off());
+                // t0 -> ret frame, t1 = ret_idx. Stash ret addr in t3
+                // so it survives the shift loop.
+                emitMovRM(buf, t3, t0, 8);
+
+                const shift_loop_off = buf.off();
+                emitMovRR(buf, t2, t1);
+                emitInc(buf, t2);
+                emitCmpRR(buf, t2, bsp);
+                const shift_done_rel32 = emitJccRel32(buf, CC.ae);
+
+                emitMovRR(buf, t0, t1);
+                emitShlRI(buf, t0, 5);
+                emitLeaRR(buf, t0, skp, t0); // dest = &stack[t1]
+
+                // Copy 32 bytes (4 qwords) from [t0+32] to [t0].
+                emitMovRM(buf, t4, t0, 32);
+                emitMovMR(buf, t0, 0, t4);
+                emitMovRM(buf, t4, t0, 40);
+                emitMovMR(buf, t0, 8, t4);
+                emitMovRM(buf, t4, t0, 48);
+                emitMovMR(buf, t0, 16, t4);
+                emitMovRM(buf, t4, t0, 56);
+                emitMovMR(buf, t0, 24, t4);
+
+                emitInc(buf, t1);
+                {
+                    const back = emitJmpRel32(buf);
+                    patchRel32(buf, back, shift_loop_off);
+                }
+
+                patchRel32(buf, shift_done_rel32, buf.off());
+                emitDec(buf, bsp);
+                emitJmpR(buf, t3);
+            } else {
+                emitDec(buf, bsp);
+                emitMovRR(buf, t0, bsp);
+                emitShlRI(buf, t0, 5);
+                emitLeaRR(buf, t0, skp, t0);
+                emitMovRM(buf, t0, t0, 8);
+                emitJmpR(buf, t0);
+            }
         },
         .save => {
             const slot: u12 = @intCast(inst.data.slot);
@@ -743,5 +820,31 @@ fn emitInst(
         },
         .set => emitCharsetCheck(buf, inst.data.charset, false, fixups, fcount),
         .neg_set => emitCharsetCheck(buf, inst.data.charset, true, fixups, fcount),
+        .event_open, .event_close => {
+            if (config.capture_events) {
+                const group_id: u16 = inst.data.slot;
+                const slot: u16 = if (inst.op == .event_open)
+                    group_id << 1
+                else
+                    (group_id << 1) | 1;
+                // Call helper_append_save(state, slot, pos)
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+                emitMovRI32(buf, rsi_r, @intCast(slot));
+                emitMovRR(buf, t2, pos);
+                emitMovRM(buf, t3, rsp_r, stk_has);
+                emitCallR(buf, t3);
+                // OOM check
+                emitCmpRI8(buf, t0, -1);
+                addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                // Build stack entry: tag=3 (event), event_len = pre_len.
+                emitMovRR(buf, t1, bsp);
+                emitShlRI(buf, t1, 5);
+                emitLeaRR(buf, t1, skp, t1);
+                emitMovMI(buf, t1, 0, 3);
+                emitMovMR(buf, t1, 24, t0);
+                emitInc(buf, bsp);
+            }
+            // capture_events off: no-op (tree mode requires events on).
+        },
     }
 }

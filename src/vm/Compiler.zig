@@ -41,6 +41,13 @@ pub fn CompilerWith(comptime config: Config) type {
             [_]?*const Ast.Node{null} ** (config.max_captures / 2),
         memo_rule_count: u16 = 0,
 
+        /// Per-rule name slices into `string_data`. Populated for every
+        /// rule in `compileOpts`; `getRuleName` decodes them. Storing
+        /// names here (rather than via the AST `rules` slice) keeps the
+        /// Compiler self-contained - the AST can be freed after compile.
+        rule_names: [256]I.Inst.StringRef = [_]I.Inst.StringRef{.{ .offset = 0, .len = 0 }} ** 256,
+        rule_count: u16 = 0,
+
         optimize_enabled: bool = true,
 
         rules: []const Ast.Rule = &.{},
@@ -57,17 +64,38 @@ pub fn CompilerWith(comptime config: Config) type {
         pub const Options = struct {
             optimize: bool = true,
             memoize: bool = false,
+            /// When true, capture-bearing rules are eligible for
+            /// packrat memoization. Requires the VM/JIT to run with
+            /// `capture_events = true`: the memo entry caches the
+            /// rule's open/close events and replays them on a hit so
+            /// the capture slots are restored. With events off there
+            /// is no cached state to replay from, so captures would
+            /// silently be wrong on a hit-after-backtrack - hence the
+            /// default exclusion.
+            memoize_captures: bool = false,
+            /// When true, every multi-rule grammar rule emits an
+            /// `event_open` at body entry and `event_close` just
+            /// before `ret`, keyed by rule_id. The resulting event
+            /// log mirrors the rule call hierarchy as a parse tree
+            /// (each node typed by rule name). Requires the VM/JIT
+            /// to run with `capture_events = true`; the events are
+            /// no-ops otherwise. Single-rule grammars are unchanged.
+            rules_as_captures: bool = false,
         };
 
         pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Self {
             var c = Self{};
             c.rules = rules;
             c.optimize_enabled = opts.optimize;
+            c.rule_count = @intCast(rules.len);
+            for (rules, 0..) |rule, i| c.rule_names[i] = c.internRuleName(rule.name);
 
             if (rules.len == 0) {
                 c.emit(.{ .op = .match });
             } else if (rules.len == 1) {
+                if (opts.rules_as_captures) c.emit(.{ .op = .event_open, .data = .{ .slot = 0 } });
                 c.compileNode(&rules[0].node);
+                if (opts.rules_as_captures) c.emit(.{ .op = .event_close, .data = .{ .slot = 0 } });
                 c.emit(.{ .op = .match });
                 c.patchCalls(&.{0}, rules);
             } else {
@@ -78,7 +106,11 @@ pub fn CompilerWith(comptime config: Config) type {
                 var rule_ends: [256]u32 = undefined;
                 for (rules, 0..) |rule, i| {
                     rule_addrs[i] = c.code_len;
+                    if (opts.rules_as_captures)
+                        c.emit(.{ .op = .event_open, .data = .{ .slot = @intCast(i) } });
                     c.compileNode(&rule.node);
+                    if (opts.rules_as_captures)
+                        c.emit(.{ .op = .event_close, .data = .{ .slot = @intCast(i) } });
                     c.emit(.{ .op = .ret });
                     rule_ends[i] = c.code_len;
                 }
@@ -87,7 +119,11 @@ pub fn CompilerWith(comptime config: Config) type {
                 c.patchCalls(&rule_addrs, rules);
 
                 if (opts.memoize) {
-                    c.rewriteMemoCalls(rule_addrs[0..rules.len], rule_ends[0..rules.len]);
+                    c.rewriteMemoCalls(
+                        rule_addrs[0..rules.len],
+                        rule_ends[0..rules.len],
+                        opts.memoize_captures,
+                    );
                 }
             }
 
@@ -97,38 +133,43 @@ pub fn CompilerWith(comptime config: Config) type {
             return c;
         }
 
-        fn rewriteMemoCalls(self: *Self, rule_addrs: []const u32, rule_ends: []const u32) void {
+        /// Copy the rule name into `string_data` so it outlives the AST.
+        /// Truncates names longer than 255 bytes (the StringRef.len limit).
+        fn internRuleName(self: *Self, name: []const u8) I.Inst.StringRef {
+            const len: u8 = @intCast(@min(name.len, 255));
+            const offset: u16 = self.string_data_len;
+            if (@as(usize, offset) + len > self.string_data.len) return .{ .offset = 0, .len = 0 };
+            @memcpy(self.string_data[offset..][0..len], name[0..len]);
+            self.string_data_len += len;
+            return .{ .offset = offset, .len = len };
+        }
+
+        /// Look up a rule's name by id. Valid for ids < `rule_count`.
+        pub fn getRuleName(self: *const Self, rule_id: u16) []const u8 {
+            const ref = self.rule_names[rule_id];
+            return self.string_data[ref.offset..][0..ref.len];
+        }
+
+        fn rewriteMemoCalls(
+            self: *Self,
+            rule_addrs: []const u32,
+            rule_ends: []const u32,
+            memoize_captures: bool,
+        ) void {
             var memo_id: [256]?u16 = [_]?u16{null} ** 256;
             for (rule_addrs, rule_ends, 0..) |start, end, i| {
-                // TODO(incremental): this is the interface between
-                // captures and packrat memoization. Today, any rule
-                // containing a `save` is excluded from memoization so
-                // the memo entry never has to carry capture state. When
-                // incremental parsing lands, the memo entry must
-                // additionally store the `events[start..end]` range
-                // produced by this rule invocation so it can be
-                // replayed on a cache hit. Remove the `has_save`
-                // exclusion only together with that replay logic.
-                //
-                // The VM's `initPackrat` constructor is currently gated
-                // off when `capture_events` is true for the same
-                // reason: without the replay logic above, a memo hit
-                // would return the cached end position without
-                // appending the corresponding open/close events,
-                // leaving the event log out of sync with the match.
-                // Re-enable that constructor when this exclusion is
-                // lifted.
-                var has_save = false;
-                for (self.code[start..end]) |inst| {
-                    if (inst.op == .save) {
-                        has_save = true;
-                        break;
+                if (!memoize_captures) {
+                    var has_save = false;
+                    for (self.code[start..end]) |inst| {
+                        if (inst.op == .save) {
+                            has_save = true;
+                            break;
+                        }
                     }
+                    if (has_save) continue;
                 }
-                if (!has_save) {
-                    memo_id[i] = self.memo_rule_count;
-                    self.memo_rule_count += 1;
-                }
+                memo_id[i] = self.memo_rule_count;
+                self.memo_rule_count += 1;
             }
 
             for (self.code[0..self.code_len]) |*inst| {

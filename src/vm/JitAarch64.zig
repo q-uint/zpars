@@ -414,6 +414,13 @@ fn emitBacktrackHandler(
     const save_off = buf.off();
     buf.emit(encBCond(CC.eq, 0));
 
+    const event_off = if (config.capture_events) blk: {
+        buf.emit(encCmpImm(t2, 3));
+        const off = buf.off();
+        buf.emit(encBCond(CC.eq, 0));
+        break :blk off;
+    } else 0;
+
     // tag == 1 (ret): skip, continue loop
     addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, bsp);
     buf.emit(encNop());
@@ -438,6 +445,19 @@ fn emitBacktrackHandler(
     buf.emit(encNop());
     buf.emit(encB(@intCast(@as(i32, @intCast(loop_off)) - @as(i32, @intCast(buf.off())))));
 
+    // event handler (capture_events only): truncate events, no slot restore.
+    const event_handler = if (config.capture_events) blk: {
+        const off = buf.off();
+        buf.emit(encLdr(1, t1, 24));
+        buf.emit(encLdr(0, sp_reg, sp_esp));
+        buf.emit(encLdr(t0, sp_reg, sp_hte));
+        buf.emit(encBlr(t0));
+        addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, bsp);
+        buf.emit(encNop());
+        buf.emit(encB(@intCast(@as(i32, @intCast(loop_off)) - @as(i32, @intCast(buf.off())))));
+        break :blk off;
+    } else 0;
+
     // choice handler
     const choice_handler = buf.off();
     buf.emit(encLdr(pos, t1, 8));
@@ -454,6 +474,10 @@ fn emitBacktrackHandler(
         const rel: i32 = @as(i32, @intCast(save_handler)) - @as(i32, @intCast(save_off));
         buf.patchAt(save_off, encBCond(CC.eq, @intCast(rel)));
     }
+    if (config.capture_events) {
+        const rel: i32 = @as(i32, @intCast(event_handler)) - @as(i32, @intCast(event_off));
+        buf.patchAt(event_off, encBCond(CC.eq, @intCast(rel)));
+    }
 }
 
 fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup, fcount: *usize) void {
@@ -464,7 +488,7 @@ fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup,
     buf.emit(encMov(0, csp));
     buf.emit(encMovz(1, @intCast(charset), 0));
     buf.emit(encMov(2, t0));
-    buf.emit(encLdr(t0, sp_reg, 8)); // helper_charset_match from stack
+    buf.emit(encLdr(t0, sp_reg, sp_hcm));
     buf.emit(encBlr(t0));
     addFixup(fixups, fcount, buf.off(), .backtrack, if (negate) .cbnz else .cbz, 0, 0);
     buf.emit(encNop());
@@ -547,11 +571,72 @@ fn emitInst(
             unreachable;
         },
         .ret => {
-            buf.emit(encSub(bsp, bsp, 1));
-            buf.emit(encLsl(t1, bsp, 5));
-            buf.emit(encAddReg(t1, skp, t1));
-            buf.emit(encLdr(t2, t1, 8));
-            buf.emit(encBr(t2));
+            if (config.capture_events) {
+                // See JitX86 for the algorithm: find the call's ret
+                // frame, stash its return address, shift any save /
+                // event frames above it down by one so backtrack can
+                // still undo them.
+                buf.emit(encSub(t1, bsp, 1)); // t1 = sp - 1
+
+                const find_loop = buf.off();
+                buf.emit(encLsl(t0, t1, 5));
+                buf.emit(encAddReg(t0, skp, t0));
+                buf.emit(encLdr(t2, t0, 0));
+                buf.emit(encCmpImm(t2, 1));
+                const found_off = buf.off();
+                buf.emit(encBCond(CC.eq, 0));
+                buf.emit(encSub(t1, t1, 1));
+                {
+                    const rel: i32 = @as(i32, @intCast(find_loop)) - @as(i32, @intCast(buf.off()));
+                    buf.emit(encB(@intCast(rel)));
+                }
+
+                const found = buf.off();
+                buf.emit(encLdr(t3, t0, 8)); // t3 = ret addr
+
+                const shift_loop = buf.off();
+                buf.emit(encAdd(t2, t1, 1));
+                buf.emit(encCmpReg(t2, bsp));
+                const shift_done_off = buf.off();
+                buf.emit(encBCond(CC.hs, 0));
+
+                buf.emit(encLsl(t0, t1, 5));
+                buf.emit(encAddReg(t0, skp, t0));
+
+                buf.emit(encLdr(t4, t0, 32));
+                buf.emit(encStr(t4, t0, 0));
+                buf.emit(encLdr(t4, t0, 40));
+                buf.emit(encStr(t4, t0, 8));
+                buf.emit(encLdr(t4, t0, 48));
+                buf.emit(encStr(t4, t0, 16));
+                buf.emit(encLdr(t4, t0, 56));
+                buf.emit(encStr(t4, t0, 24));
+
+                buf.emit(encAdd(t1, t1, 1));
+                {
+                    const rel: i32 = @as(i32, @intCast(shift_loop)) - @as(i32, @intCast(buf.off()));
+                    buf.emit(encB(@intCast(rel)));
+                }
+
+                const shift_done = buf.off();
+                {
+                    const rel: i32 = @as(i32, @intCast(found)) - @as(i32, @intCast(found_off));
+                    buf.patchAt(found_off, encBCond(CC.eq, @intCast(rel)));
+                }
+                {
+                    const rel: i32 = @as(i32, @intCast(shift_done)) - @as(i32, @intCast(shift_done_off));
+                    buf.patchAt(shift_done_off, encBCond(CC.hs, @intCast(rel)));
+                }
+
+                buf.emit(encSub(bsp, bsp, 1));
+                buf.emit(encBr(t3));
+            } else {
+                buf.emit(encSub(bsp, bsp, 1));
+                buf.emit(encLsl(t1, bsp, 5));
+                buf.emit(encAddReg(t1, skp, t1));
+                buf.emit(encLdr(t2, t1, 8));
+                buf.emit(encBr(t2));
+            }
         },
         .save => {
             const slot: u12 = @intCast(inst.data.slot);
@@ -609,7 +694,7 @@ fn emitInst(
             buf.emit(encMov(3, sdp));
             buf.emit(encMovz(4, ref.offset, 0));
             buf.emit(encMovz(5, @intCast(ref.len), 0));
-            buf.emit(encLdr(t0, sp_reg, 0)); // helper_string_match from stack
+            buf.emit(encLdr(t0, sp_reg, sp_hsm));
             buf.emit(encBlr(t0));
             addFixup(fixups, fcount, buf.off(), .backtrack, .cbz, 0, 0);
             buf.emit(encNop());
@@ -617,5 +702,34 @@ fn emitInst(
         },
         .set => emitCharsetCheck(buf, inst.data.charset, false, fixups, fcount),
         .neg_set => emitCharsetCheck(buf, inst.data.charset, true, fixups, fcount),
+        .event_open, .event_close => {
+            if (config.capture_events) {
+                const group_id: u16 = inst.data.slot;
+                const slot: u16 = if (inst.op == .event_open)
+                    group_id << 1
+                else
+                    (group_id << 1) | 1;
+                // Call helper_append_save(state, slot, pos)
+                buf.emit(encLdr(0, sp_reg, sp_esp));
+                buf.emit(encMovz(1, slot, 0));
+                buf.emit(encMov(2, pos));
+                buf.emit(encLdr(t0, sp_reg, sp_has));
+                buf.emit(encBlr(t0));
+                // OOM check: x0 + 1 == 0 iff x0 was -1.
+                buf.emit(encAdd(t0, 0, 1));
+                addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, t0);
+                buf.emit(encNop());
+                // Preserve pre_len in t4 (the call clobbered x0..x18).
+                buf.emit(encMov(t4, 0));
+                // Build stack entry: tag=3, event_len in slot 24.
+                buf.emit(encLsl(t1, bsp, 5));
+                buf.emit(encAddReg(t1, skp, t1));
+                buf.emit(encMovz(t2, 3, 0));
+                buf.emit(encStr(t2, t1, 0));
+                buf.emit(encStr(t4, t1, 24));
+                buf.emit(encAdd(bsp, bsp, 1));
+            }
+            // capture_events off: no-op.
+        },
     }
 }

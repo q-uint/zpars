@@ -26,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
         try runMatch(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "run")) {
         try runAot(io, allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "tree")) {
+        try runTree(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "vm")) {
         try runVm(io, allocator, args[2..]);
     } else {
@@ -44,6 +46,7 @@ fn printUsage() void {
         \\  fmt     <file>                     Format a grammar
         \\  match   -r <rule> <file> <input>   Match input against a rule
         \\  run     <blob> <input>             Run a compiled .zpar blob
+        \\  tree    [-j] [-p|--jit] <file> <input>  Parse input and print parse tree (-j JSON, -p packrat, --jit native)
         \\  vm      [-t] [-p] <file> [<input>]  Disassemble (and optionally run) via VM (-t trace, -p packrat)
         \\
         \\Format is auto-detected from file extension (.abnf, .peg, .ere).
@@ -239,6 +242,119 @@ fn runMatch(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
     const stdout = &stdout_writer.interface;
 
     try stdout.print("{s}\n", .{result.value});
+    try stdout.flush();
+}
+
+fn runTree(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var filename: ?[]const u8 = null;
+    var input: ?[]const u8 = null;
+    var json_output = false;
+    var packrat_enabled = false;
+    var jit_enabled = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
+        } else if (std.mem.eql(u8, arg, "-p")) {
+            packrat_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--jit")) {
+            jit_enabled = true;
+        } else if (filename == null) {
+            filename = arg;
+        } else if (input == null) {
+            input = arg;
+        }
+    }
+
+    if (filename == null or input == null) {
+        std.debug.print("usage: zpars tree [-j] [-p|--jit] <file> <input>\n", .{});
+        std.process.exit(1);
+    }
+    if (jit_enabled and packrat_enabled) {
+        std.debug.print("error: --jit and -p are mutually exclusive (the JIT does not implement packrat memoization)\n", .{});
+        std.process.exit(1);
+    }
+
+    const source = try readSource(io, allocator, filename.?);
+    defer allocator.free(source);
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const rules = switch (detectFormat(filename.?)) {
+        .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
+        .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename.?, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
+        .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
+    };
+
+    var compiler = zpars.vm.Compiler.compileOpts(rules, .{
+        .memoize = packrat_enabled,
+        .memoize_captures = packrat_enabled,
+        .rules_as_captures = true,
+    });
+
+    // Build a name slice indexed by rule_id for the tree printer.
+    var names_buf: [256][]const u8 = undefined;
+    const names = names_buf[0..compiler.rule_count];
+    for (0..compiler.rule_count) |i| names[i] = compiler.getRuleName(@intCast(i));
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    var tree = if (jit_enabled) blk: {
+        const EventJit = zpars.vm.Jit.JitWith(.{ .capture_events = true });
+        var jit = try EventJit.initEvents(
+            allocator,
+            compiler.getCode(),
+            compiler.getCharsets(),
+            compiler.getStringData(),
+            input.?,
+        );
+        defer jit.deinit();
+        if (jit.execute() == null) {
+            try stdout.print("no match\n", .{});
+            try stdout.flush();
+            std.process.exit(1);
+        }
+        break :blk try jit.buildCaptureTree(allocator);
+    } else blk: {
+        const EventVm = zpars.vm.VmWith(.{ .capture_events = true });
+        var vm = if (packrat_enabled)
+            try EventVm.initPackrat(
+                allocator,
+                compiler.getCode(),
+                compiler.getCharsets(),
+                compiler.getStringData(),
+                compiler.getMemoRuleCount(),
+                input.?,
+            )
+        else
+            EventVm.initEvents(
+                allocator,
+                compiler.getCode(),
+                compiler.getCharsets(),
+                compiler.getStringData(),
+                input.?,
+            );
+        defer vm.deinit();
+        if ((try vm.execute()) == null) {
+            try stdout.print("no match\n", .{});
+            try stdout.flush();
+            std.process.exit(1);
+        }
+        break :blk try vm.buildCaptureTree(allocator);
+    };
+    defer tree.deinit();
+
+    if (json_output) {
+        try tree.writeJson(stdout, names);
+    } else {
+        try tree.writeSExp(stdout, names);
+    }
+    try stdout.writeByte('\n');
     try stdout.flush();
 }
 

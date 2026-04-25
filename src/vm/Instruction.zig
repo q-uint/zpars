@@ -41,6 +41,14 @@ pub const Opcode = enum(u8) {
     /// to the rule entry exactly like a regular `call`. The final
     /// `ret` writes the result back to the table.
     memo_call,
+    /// Append an "open capture" event keyed by group_id (carried in
+    /// the slot data field). Like `save` but does not touch the flat
+    /// captures array - used by `rules_as_captures` to record the
+    /// rule structure as a parse tree without consuming flat slots.
+    /// No-op when the runtime has `capture_events = false`.
+    event_open,
+    /// Append a matching "close capture" event. Mirror of event_open.
+    event_close,
     /// Accept the match and halt.
     match,
 };

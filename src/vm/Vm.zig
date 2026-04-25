@@ -50,6 +50,13 @@ pub fn VmWith(comptime config: Config) type {
                 event_len: if (config.capture_events) u32 else void =
                     if (config.capture_events) 0 else {},
             },
+            /// Events-only save frame: pushed by `event_open`/`event_close`
+            /// when capture_events is on. Carries no slot to restore;
+            /// backtrack just truncates the events log.
+            event: struct {
+                event_len: if (config.capture_events) u32 else void =
+                    if (config.capture_events) 0 else {},
+            },
             /// Memo frame: pushed by `memo_call` on a table miss. Holds the
             /// information needed for (a) left-recursion detection via
             /// stack walking, (b) seed-growing re-entries, and (c) head
@@ -68,6 +75,15 @@ pub fn VmWith(comptime config: Config) type {
                 best_end: u32,
                 /// Head this frame is attached to (maxInt u32 = no head yet).
                 head_idx: u32,
+                /// Snapshot of `events.list.items.len` at the moment this
+                /// frame was pushed. On success-write the body's events
+                /// are `events[events_len_at_entry..]`, and we copy that
+                /// slice into `memo_events` for replay on cache hits.
+                /// Inherited unchanged across grow re-pushes so an LR
+                /// rule's cached range covers all iterations, matching
+                /// the events left in the live log by the original run.
+                events_len_at_entry: if (config.capture_events) u32 else void =
+                    if (config.capture_events) 0 else {},
             },
         };
 
@@ -97,6 +113,15 @@ pub fn VmWith(comptime config: Config) type {
             ///   .lr      -> stack index of the live memo frame.
             ///   other    -> unused.
             next_pos_or_frame: u32,
+            /// Slice of `self.memo_events` holding the open/close events
+            /// the rule's body produced on its memoized invocation.
+            /// Replayed on a `.success` cache hit so the events log and
+            /// capture slots match what re-running the body would do.
+            /// Only populated when `config.capture_events` is true.
+            events_start: if (config.capture_events) u32 else void =
+                if (config.capture_events) 0 else {},
+            events_count: if (config.capture_events) u32 else void =
+                if (config.capture_events) 0 else {},
         };
 
         const Head = struct {
@@ -161,6 +186,16 @@ pub fn VmWith(comptime config: Config) type {
         /// append to the same structure through its C-ABI helpers.
         events: if (config.capture_events) ?events_mod.State else void =
             if (config.capture_events) null else {},
+        /// Append-only buffer of events captured by memoized rules. A
+        /// memo entry's `events_start..events_start+events_count` slices
+        /// into this buffer. Append-only because earlier entries must
+        /// remain valid even as later iterations cache more events.
+        /// Allocated by the packrat constructor when capture_events is
+        /// on; freed in `deinit`.
+        memo_events: if (config.capture_events)
+            std.ArrayListUnmanaged(CaptureTree.Event)
+        else
+            void = if (config.capture_events) .empty else {},
 
         pub const Writer = std.Io.Writer;
 
@@ -184,6 +219,86 @@ pub fn VmWith(comptime config: Config) type {
             }
         }
 
+        /// Current length of the live events log (0 when capture_events
+        /// is off). Used as both the snapshot recorded at memo-frame
+        /// push time and the lower bound of the cached events range
+        /// when a body completes successfully.
+        inline fn currentEventsLen(self: *const Self) u32 {
+            if (config.capture_events) {
+                if (self.events) |*s| return @intCast(s.list.items.len);
+            }
+            return 0;
+        }
+
+        /// Copy `events[entry_len..now_len]` - the events the rule's
+        /// body just appended - into `memo_events`, and return the
+        /// (start, count) the memo entry should record. No-op (zeros)
+        /// when capture_events is off or the rule produced no events.
+        fn cacheRuleEvents(self: *Self, entry_len: u32) !struct { start: u32, count: u32 } {
+            if (!config.capture_events) return .{ .start = 0, .count = 0 };
+            const a = self.memo_allocator orelse return .{ .start = 0, .count = 0 };
+            const live = if (self.events) |*s| s.list.items else return .{ .start = 0, .count = 0 };
+            if (live.len <= entry_len) return .{ .start = 0, .count = 0 };
+            const slice = live[entry_len..];
+            const start: u32 = @intCast(self.memo_events.items.len);
+            try self.memo_events.appendSlice(a, slice);
+            return .{ .start = start, .count = @intCast(slice.len) };
+        }
+
+        /// Write `memo_table[idx] = .success` with the cached events
+        /// range `m`'s body produced. When capture_events is off this
+        /// degenerates to the original single-field write.
+        fn writeMemoSuccess(self: *Self, idx: usize, end_pos: u32, m: anytype) !void {
+            if (config.capture_events) {
+                const cached = try self.cacheRuleEvents(m.events_len_at_entry);
+                self.memo_table[idx] = .{
+                    .state = .success,
+                    .next_pos_or_frame = end_pos,
+                    .events_start = cached.start,
+                    .events_count = cached.count,
+                };
+            } else {
+                self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = end_pos };
+            }
+        }
+
+        /// Replay a cached events range on a `.success` cache hit:
+        /// push a save frame for each event so backtrack truncates
+        /// correctly, append the event to the live log, and write the
+        /// matching capture slot. Returns true on success, false if
+        /// the backtrack stack would overflow.
+        fn replayCachedEvents(
+            self: *Self,
+            stack: *[max_stack]Entry,
+            sp: *usize,
+            entry: MemoEntry,
+        ) !bool {
+            if (!config.capture_events) return true;
+            if (entry.events_count == 0) return true;
+            const state = if (self.events) |*s| s else return true;
+            const cached = self.memo_events.items[entry.events_start..][0..entry.events_count];
+            for (cached) |ev| {
+                if (sp.* >= max_stack) return false;
+                const slot: u16 = switch (ev) {
+                    .open => |m| m.group_id << 1,
+                    .close => |m| (m.group_id << 1) | 1,
+                };
+                const ev_pos: u32 = switch (ev) {
+                    .open => |m| m.pos,
+                    .close => |m| m.pos,
+                };
+                const event_len = try events_mod.appendSave(state, slot, ev_pos);
+                stack[sp.*] = .{ .save = .{
+                    .slot = slot,
+                    .old = self.captures[slot],
+                    .event_len = event_len,
+                } };
+                sp.* += 1;
+                self.captures[slot] = ev_pos;
+            }
+            return true;
+        }
+
         inline fn recordExec(self: *Self, pc: u32, op: I.Opcode) void {
             self.opcode_exec_counts[@intFromEnum(op)] += 1;
             if (config.enable_stats) {
@@ -199,7 +314,7 @@ pub fn VmWith(comptime config: Config) type {
         }
 
         /// Default constructor. Unavailable when `config.capture_events`
-        /// is true — use `initEvents` instead, which supplies the
+        /// is true - use `initEvents` instead, which supplies the
         /// allocator that backs the event log.
         pub const init = if (config.capture_events) {} else struct {
             fn f(code: []const I.Inst, charsets: []const I.Charset, string_data: []const u8, input: []const u8) Self {
@@ -234,11 +349,10 @@ pub fn VmWith(comptime config: Config) type {
         /// rules and `input.len + 1` positions. Call `deinit` to free it. If
         /// `memo_rule_count` is 0 the call is equivalent to `init`.
         ///
-        /// Unavailable when `config.capture_events` is true: the memo
-        /// entry does not yet carry capture state, so memoizing a
-        /// capture-bearing rule would desync the event log from the
-        /// match. See the TODO in Compiler.rewriteMemoCalls.
-        pub const initPackrat = if (config.capture_events) {} else struct {
+        /// When `config.capture_events` is true, the same allocator backs
+        /// both the live events log and the memo events buffer used to
+        /// replay captures on a cache hit.
+        pub const initPackrat = struct {
             fn f(
                 allocator: std.mem.Allocator,
                 code: []const I.Inst,
@@ -254,6 +368,9 @@ pub fn VmWith(comptime config: Config) type {
                     .input = input,
                     .memo_rule_count = memo_rule_count,
                 };
+                if (config.capture_events) {
+                    vm.events = events_mod.State.init(allocator);
+                }
                 if (memo_rule_count > 0) {
                     const stride = input.len + 1;
                     const table = try allocator.alloc(MemoEntry, @as(usize, memo_rule_count) * stride);
@@ -279,6 +396,9 @@ pub fn VmWith(comptime config: Config) type {
                 self.heads_pool.deinit(a);
                 self.memo_table = &.{};
                 self.heads = &.{};
+                if (config.capture_events) {
+                    self.memo_events.deinit(a);
+                }
                 self.memo_allocator = null;
             }
             if (config.capture_events) {
@@ -432,6 +552,9 @@ pub fn VmWith(comptime config: Config) type {
                                         .rule_entry_pc = mc.offset,
                                         .best_end = grow_sentinel,
                                         .head_idx = active_head,
+                                        .events_len_at_entry = if (config.capture_events)
+                                            self.currentEventsLen()
+                                        else {},
                                     } };
                                     sp += 1;
                                     pc = mc.offset;
@@ -441,6 +564,9 @@ pub fn VmWith(comptime config: Config) type {
 
                             switch (self.memo_table[idx].state) {
                                 .success => {
+                                    if (config.capture_events) {
+                                        if (!try self.replayCachedEvents(&stack, &sp, self.memo_table[idx])) return null;
+                                    }
                                     pos = self.memo_table[idx].next_pos_or_frame;
                                     pc += 1;
                                 },
@@ -481,6 +607,9 @@ pub fn VmWith(comptime config: Config) type {
                                         .rule_entry_pc = mc.offset,
                                         .best_end = grow_sentinel,
                                         .head_idx = no_head,
+                                        .events_len_at_entry = if (config.capture_events)
+                                            self.currentEventsLen()
+                                        else {},
                                     } };
                                     sp += 1;
                                     pc = mc.offset;
@@ -489,8 +618,22 @@ pub fn VmWith(comptime config: Config) type {
                         }
                     },
                     .ret => {
+                        // Find the matching call/memo frame, skipping
+                        // any save / event frames the body pushed for
+                        // live captures. Those frames stay on the
+                        // stack so the outer caller's backtrack can
+                        // still undo them; we just close the gap.
+                        var ret_idx = sp;
+                        while (ret_idx > 0) : (ret_idx -= 1) {
+                            const tag = std.meta.activeTag(stack[ret_idx - 1]);
+                            if (tag == .ret or tag == .memo) break;
+                        }
+                        ret_idx -= 1;
+                        const popped = stack[ret_idx];
+                        var k: usize = ret_idx;
+                        while (k + 1 < sp) : (k += 1) stack[k] = stack[k + 1];
                         sp -= 1;
-                        switch (stack[sp]) {
+                        switch (popped) {
                             .ret => |addr| pc = addr,
                             .memo => |m| {
                                 const stride = self.input.len + 1;
@@ -509,7 +652,7 @@ pub fn VmWith(comptime config: Config) type {
                                         m.start_pos;
                                     const report_end = if (cur_end > prev_end) cur_end else prev_end;
                                     if (cur_end > prev_end) {
-                                        self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = cur_end };
+                                        try self.writeMemoSuccess(idx, cur_end, m);
                                     }
                                     pos = report_end;
                                     pc = m.return_pc;
@@ -521,7 +664,7 @@ pub fn VmWith(comptime config: Config) type {
                                         // enter GROW-LR; otherwise return the
                                         // answer to the participant caller.
                                         if (self.heads_pool.items[m.head_idx].rule_id == m.rule_id) {
-                                            self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = cur_end };
+                                            try self.writeMemoSuccess(idx, cur_end, m);
                                             self.heads[m.start_pos] = m.head_idx;
                                             try self.resetEvalSet(m.head_idx);
                                             if (sp >= max_stack) return null;
@@ -534,11 +677,11 @@ pub fn VmWith(comptime config: Config) type {
                                         } else {
                                             // Participant in someone else's
                                             // cycle: hand answer back up.
-                                            self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = cur_end };
+                                            try self.writeMemoSuccess(idx, cur_end, m);
                                             pc = m.return_pc;
                                         }
                                     } else {
-                                        self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = cur_end };
+                                        try self.writeMemoSuccess(idx, cur_end, m);
                                         pc = m.return_pc;
                                     }
                                 } else {
@@ -555,7 +698,7 @@ pub fn VmWith(comptime config: Config) type {
                                         m.best_end;
                                     const new_best = if (cur_end > memo_end) cur_end else memo_end;
                                     if (new_best > m.best_end) {
-                                        self.memo_table[idx] = .{ .state = .success, .next_pos_or_frame = new_best };
+                                        try self.writeMemoSuccess(idx, new_best, m);
                                         try self.resetEvalSet(m.head_idx);
                                         if (sp >= max_stack) return null;
                                         var frame = m;
@@ -579,8 +722,7 @@ pub fn VmWith(comptime config: Config) type {
                         if (sp >= max_stack) return null;
                         const slot = inst.data.slot;
                         if (config.capture_events) {
-                            const state = if (self.events) |*s| s else
-                                @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
                             const event_len = try events_mod.appendSave(state, slot, @intCast(pos));
                             stack[sp] = .{ .save = .{
                                 .slot = slot,
@@ -592,6 +734,21 @@ pub fn VmWith(comptime config: Config) type {
                         }
                         sp += 1;
                         self.captures[slot] = pos;
+                        pc += 1;
+                    },
+                    .event_open, .event_close => {
+                        if (config.capture_events) {
+                            if (sp >= max_stack) return null;
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const group_id = inst.data.slot;
+                            const slot: u16 = if (inst.op == .event_open)
+                                group_id << 1
+                            else
+                                (group_id << 1) | 1;
+                            const event_len = try events_mod.appendSave(state, slot, @intCast(pos));
+                            stack[sp] = .{ .event = .{ .event_len = event_len } };
+                            sp += 1;
+                        }
                         pc += 1;
                     },
                     .match => {
@@ -620,6 +777,11 @@ pub fn VmWith(comptime config: Config) type {
                         self.captures[s.slot] = s.old;
                         if (config.capture_events) {
                             if (self.events) |*state| events_mod.truncate(state, s.event_len);
+                        }
+                    },
+                    .event => |e| {
+                        if (config.capture_events) {
+                            if (self.events) |*state| events_mod.truncate(state, e.event_len);
                         }
                     },
                     .memo => |m| {
@@ -800,6 +962,8 @@ pub fn VmWith(comptime config: Config) type {
                 .memo_call => w.print("memo_call R{d} -> {d}", .{ inst.data.memo.rule_id, inst.data.memo.offset }) catch {},
                 .ret => w.writeAll("ret") catch {},
                 .save => w.print("save {d}", .{inst.data.slot}) catch {},
+                .event_open => w.print("event_open g{d}", .{inst.data.slot}) catch {},
+                .event_close => w.print("event_close g{d}", .{inst.data.slot}) catch {},
                 .match => w.writeAll("match") catch {},
             }
             w.writeByte('\n') catch {};
@@ -1226,36 +1390,86 @@ test "warth: indirect LR with three rules in cycle" {
     try testing.expectEqual(@as(?usize, 4), try runPackrat(src, "yxxx"));
 }
 
-test "packrat: captures keep rule out of memoization" {
-    // The ERE capture emits `save`, so the whole wrapper rule is
-    // ineligible. But it still compiles and runs correctly.
-    var c = compilePegOpts("Main <- \"a\" \"b\"", .{ .memoize = true });
-    // Single-rule PEG (no multi-rule call sites) yields zero memoizable rules.
-    try testing.expectEqual(@as(u16, 0), c.getMemoRuleCount());
-    var vm = try Vm.initPackrat(
+test "rules_as_captures: PEG grammar produces a tree mirroring the call hierarchy" {
+    // The smallest end-to-end check that the JIT capture_events +
+    // packrat replay infrastructure actually produces a parse tree
+    // through a real grammar. Each rule emits open/close events keyed
+    // by rule_id, and the tree builder already turns those into
+    // hierarchical nodes - no grammar syntax change required.
+    const src =
+        \\Expr <- Term ("+" Term)*
+        \\Term <- [0-9]+
+    ;
+    var c = compilePegOpts(src, .{ .rules_as_captures = true });
+    const Cfg = VmWith(.{ .capture_events = true });
+    var vm = Cfg.initEvents(
         testing.allocator,
         c.getCode(),
         c.getCharsets(),
         c.getStringData(),
-        c.getMemoRuleCount(),
-        "ab",
+        "1+2+3",
     );
     defer vm.deinit();
-    try testing.expectEqual(@as(?usize, 2), try vm.execute());
+    try testing.expectEqual(@as(?usize, 5), try vm.execute());
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 1), tree.roots.len);
+    const expr = tree.roots[0];
+    try testing.expectEqualStrings("Expr", c.getRuleName(expr.group_id));
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 0, .end = 5 }, expr.span);
+    try testing.expectEqual(@as(usize, 3), expr.children.len);
+    for (expr.children) |term| {
+        try testing.expectEqualStrings("Term", c.getRuleName(term.group_id));
+    }
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 0, .end = 1 }, expr.children[0].span);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 2, .end = 3 }, expr.children[1].span);
+    try testing.expectEqual(CaptureTreeMod.Span{ .start = 4, .end = 5 }, expr.children[2].span);
 }
 
-test "TODO(incremental): memoized capture-bearing rule replays events on hit" {
-    // Pinned placeholder for the capture+memo integration needed by
-    // incremental parsing. Today `rewriteMemoCalls` excludes any rule
-    // containing `save`, so a capture-bearing rule is re-executed on
-    // every call and its events are regenerated naturally.
+test "packrat + captures: memoized rule replays events on cache hit" {
+    // No grammar format in the codebase produces multi-rule programs
+    // with captures (PEG has no capture syntax, ERE is single-rule),
+    // so we hand-craft bytecode for the equivalent of:
+    //   Main <- A 'x' / A 'y'
+    //   A    <- '(' '$0' 'a' '$1' ')'    (where $N are open/close saves)
     //
-    // When that exclusion is lifted, the memo entry must additionally
-    // store the `events[start..end]` slice produced by the rule's
-    // first invocation and replay (re-append) it on a cache hit, with
-    // matching truncation on backtrack. Delete this test as part of
-    // that change - a passing test will assert the replay behaviour.
-    return error.SkipZigTest;
+    // Input "(a)y" forces a backtrack-then-retry on A: the first call
+    // misses, runs the body, and gets backtracked; the second call
+    // must hit the cache and replay the events plus capture writes.
+    const code = [_]I.Inst{
+        .{ .op = .choice, .data = .{ .offset = 5 } }, // 0: try alt1
+        .{ .op = .memo_call, .data = .{ .memo = .{ .rule_id = 0, .offset = 8 } } }, // 1: A
+        .{ .op = .char, .data = .{ .byte = 'x' } }, // 2
+        .{ .op = .commit, .data = .{ .offset = 7 } }, // 3: jump to match
+        .{ .op = .fail }, // 4: unreachable padding
+        .{ .op = .memo_call, .data = .{ .memo = .{ .rule_id = 0, .offset = 8 } } }, // 5: alt2: A
+        .{ .op = .char, .data = .{ .byte = 'y' } }, // 6
+        .{ .op = .match }, // 7
+        .{ .op = .char, .data = .{ .byte = '(' } }, // 8: A body
+        .{ .op = .save, .data = .{ .slot = 0 } }, // 9: open group 0
+        .{ .op = .char, .data = .{ .byte = 'a' } }, // 10
+        .{ .op = .save, .data = .{ .slot = 1 } }, // 11: close group 0
+        .{ .op = .char, .data = .{ .byte = ')' } }, // 12
+        .{ .op = .ret }, // 13
+    };
+
+    const Cfg = VmWith(.{ .capture_events = true });
+    var vm = try Cfg.initPackrat(testing.allocator, &code, &.{}, "", 1, "(a)y");
+    defer vm.deinit();
+    try testing.expectEqual(@as(?usize, 4), try vm.execute());
+
+    // Capture slots reflect the hit-replayed writes from alt2.
+    try testing.expectEqualStrings("a", vm.getCaptureSlice(0).?);
+
+    // Live events log holds exactly the surviving alt's events: the
+    // miss-path events were truncated on backtrack, then re-appended
+    // by the cache-hit replay before alt2's 'y' matched.
+    const evs = vm.getCaptureEvents();
+    try testing.expectEqual(@as(usize, 2), evs.len);
+    try testing.expectEqual(CaptureTreeMod.Event{ .open = .{ .group_id = 0, .pos = 1 } }, evs[0]);
+    try testing.expectEqual(CaptureTreeMod.Event{ .close = .{ .group_id = 0, .pos = 2 } }, evs[1]);
 }
 
 const EventVm = VmWith(.{ .capture_events = true });

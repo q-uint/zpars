@@ -26,12 +26,14 @@ pub const null_cap = std.math.maxInt(u64);
 pub const page_size = std.heap.page_size_min;
 
 pub const StackEntry = extern struct {
-    tag: u64, // 0=choice, 1=ret, 2=save
+    tag: u64, // 0=choice, 1=ret, 2=save, 3=event
     val1: u64,
     val2: u64,
-    /// Snapshot of `events.len` captured at a successful `save`, used by
-    /// the backtrack handler to truncate the log in lockstep with the
-    /// capture-slot undo. Unused (zero) when capture_events is off.
+    /// Snapshot of `events.len` captured at a successful `save` or
+    /// `event_open`/`event_close`, used by the backtrack handler to
+    /// truncate the log in lockstep with the capture-slot undo (for
+    /// save) or alone (for event). Unused (zero) when capture_events
+    /// is off.
     event_len: u64 = 0,
 };
 
@@ -57,15 +59,13 @@ pub const JitCtx = extern struct {
     helper_truncate_events: u64 = 0,
 };
 
-/// Compile-time configuration for the JIT. Mirrors `Vm.Config` so callers
-/// can opt into features that require extra codegen (currently just
-/// `capture_events`, which is not yet implemented — see the TODOs in
-/// `JitX86.emitInst`/`JitAarch64.emitInst` for the save handler).
+/// Compile-time configuration for the JIT. Mirrors `Vm.Config` so the
+/// same feature flags drive both backends.
 pub const Config = struct {
     /// Record open/close events for each capture save so a tree can be
-    /// built in a post-pass. Mirrors `Vm.Config.capture_events`. Not yet
-    /// wired through to the backend codegen; setting it has no effect
-    /// until the backends learn to emit event-append calls.
+    /// built in a post-pass. When true, use `initEvents` (the plain
+    /// `init` is gated off because no allocator is available to back
+    /// the event log).
     capture_events: bool = false,
 };
 
@@ -101,7 +101,7 @@ pub fn JitWith(comptime config: Config) type {
             if (config.capture_events) undefined else {},
 
         /// Default constructor. Unavailable when `config.capture_events`
-        /// is true — use `initEvents`, which supplies the allocator that
+        /// is true - use `initEvents`, which supplies the allocator that
         /// backs the event log.
         pub const init = if (config.capture_events) {} else struct {
             fn f(
@@ -511,4 +511,37 @@ test "jit capture_events: cleared between runs" {
     try testing.expectEqual(@as(usize, 2), jit.getCaptureEvents().len);
     _ = jit.execute();
     try testing.expectEqual(@as(usize, 2), jit.getCaptureEvents().len);
+}
+
+test "jit rules_as_captures: PEG grammar produces a tree" {
+    const src =
+        \\Expr <- Term ("+" Term)*
+        \\Term <- [0-9]+
+    ;
+    var scanner = PegScanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = PegParser.init(tokens, src);
+    const rules = try parser.parse();
+    var c = Compiler.compileOpts(rules, .{ .rules_as_captures = true });
+
+    var jit = try EventJit.initEvents(
+        testing.allocator,
+        c.getCode(),
+        c.getCharsets(),
+        c.getStringData(),
+        "1+2+3",
+    );
+    defer jit.deinit();
+    try testing.expectEqual(@as(?usize, 5), jit.execute());
+
+    var tree = try jit.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 1), tree.roots.len);
+    const expr = tree.roots[0];
+    try testing.expectEqualStrings("Expr", c.getRuleName(expr.group_id));
+    try testing.expectEqual(@as(usize, 3), expr.children.len);
+    for (expr.children) |term| {
+        try testing.expectEqualStrings("Term", c.getRuleName(term.group_id));
+    }
 }
