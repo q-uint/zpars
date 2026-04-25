@@ -24,6 +24,7 @@
 - **Peephole optimizer** - Optimizes compiled bytecode with charset-to-char reduction, consecutive char fusion into string instructions, common prefix factoring, and optional char fusion.
 - **JIT compilers** - Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
 - **AOT compilation** - Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
+- **Parse trees** - Run any multi-rule grammar with auto-rule-captures to produce a hierarchical tree (S-expression or JSON), with each rule call becoming a node typed by rule name. Works on both the VM and the JIT, with optional packrat memoization.
 - **Benchmarks** - 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
 ## Comptime ABNF Compiler
@@ -158,7 +159,7 @@ $ zpars vm -t pattern.ere "abcbd"
    ...
 ```
 
-The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 16 opcodes: `char`, `string`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, `optional_char`, `memo_call`, and `match`.
+The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 18 opcodes: `char`, `string`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, `optional_char`, `memo_call`, `event_open`, `event_close`, and `match`.
 
 ### Peephole Optimizer
 
@@ -223,25 +224,67 @@ var blob2 = try zpars.vm.Aot.deserializeBlob(allocator, data);
 const result = zpars.vm.AotRuntime.run(blob2, "1+2*3");
 ```
 
+### Parse Trees
+
+Run any multi-rule grammar with `rules_as_captures` to produce a hierarchical parse tree where every rule call is a node typed by its rule name. The compiler emits `event_open` / `event_close` instructions around each rule body; the VM/JIT records them on a side channel so they survive backtracking, and a post-pass folds the events into a tree:
+
+```
+$ zpars tree examples/calc.peg "1+2*3"
+(Expr [0,5]
+  (Term [0,1]
+    (Factor [0,1]))
+  (Term [2,5]
+    (Factor [2,3])
+    (Factor [4,5])))
+```
+
+`-j` switches to compact JSON, `--jit` runs through the native JIT, `-p` enables packrat memoization (which transparently caches and replays the per-rule events on cache hits). The output format mirrors tree-sitter's S-expressions for easy inspection and diffing.
+
+Programmatic API:
+
+```zig
+const zpars = @import("zpars");
+
+var compiler = zpars.vm.Compiler.compileOpts(rules, .{ .rules_as_captures = true });
+
+const Vm = zpars.vm.VmWith(.{ .capture_events = true });
+var vm = Vm.initEvents(allocator, compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
+defer vm.deinit();
+_ = try vm.execute();
+
+var tree = try vm.buildCaptureTree(allocator);
+defer tree.deinit();
+
+// Look up node names by group_id.
+var names: [256][]const u8 = undefined;
+for (0..compiler.rule_count) |i| names[i] = compiler.getRuleName(@intCast(i));
+try tree.writeSExp(stdout, names[0..compiler.rule_count]);
+```
+
+The same `JitWith(.{ .capture_events = true })` API works with the JIT for native-speed tree construction.
+
 Try the example grammars:
 
 ```
-zpars vm examples/calc.peg "1+2*3"              # arithmetic expressions
-zpars vm examples/email.ere "user@example.com"  # email with captures
-zpars vm examples/json.peg '[1, "hello", true]' # JSON parser
-zpars vm examples/uri.peg "http://example.com"  # URI structure
-zpars vm examples/bit.bnf "01010011"            # binary byte
+zpars vm examples/calc.peg "1+2*3"               # arithmetic expressions
+zpars vm examples/email.ere "user@example.com"   # email with captures
+zpars vm examples/json.peg '[1, "hello", true]'  # JSON parser
+zpars vm examples/uri.peg "http://example.com"   # URI structure
+zpars vm examples/bit.bnf "01010011"             # binary byte
+zpars tree examples/calc.peg "1+2*3"             # parse tree
+zpars tree --jit -j examples/calc.peg "1+2*3"    # JIT, JSON output
 ```
 
 ## CLI
 
 ```
-zpars check   <file>                     # validate a grammar
-zpars compile <file> -o <output>         # compile grammar to native .zpar blob
-zpars fmt     <file>                     # format a grammar
-zpars match   -r <rule> <file> <input>   # match input against a rule
-zpars run     <blob> <input>             # run a compiled .zpar blob
-zpars vm      [-t] <file> [<input>]      # disassemble and run via VM
+zpars check   <file>                          # validate a grammar
+zpars compile <file> -o <output>              # compile grammar to native .zpar blob
+zpars fmt     <file>                          # format a grammar
+zpars match   -r <rule> <file> <input>        # match input against a rule
+zpars run     <blob> <input>                  # run a compiled .zpar blob
+zpars tree    [-j] [-p|--jit] <file> <input>  # print parse tree (S-exp default, -j JSON)
+zpars vm      [-t] [-p] <file> [<input>]      # disassemble and run via VM
 ```
 
 ### check
@@ -279,6 +322,26 @@ Match an input string against a rule:
 $ zpars match -r version grammar.abnf "HTTP/1.1 OK"
 HTTP/1.1
 ```
+
+### tree
+
+Parse input and print the parse tree, with each rule call becoming a node typed by its rule name:
+
+```
+$ zpars tree examples/calc.peg "1+2*3"
+(Expr [0,5]
+  (Term [0,1]
+    (Factor [0,1]))
+  (Term [2,5]
+    (Factor [2,3])
+    (Factor [4,5])))
+```
+
+Flags:
+
+- `-j` / `--json` - emit compact JSON instead of S-expressions.
+- `-p` - enable packrat memoization on the VM path.
+- `--jit` - run through the native JIT (mutually exclusive with `-p`; the JIT does not implement packrat).
 
 ## Editor Support
 
