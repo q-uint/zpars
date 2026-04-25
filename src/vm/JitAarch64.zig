@@ -246,33 +246,38 @@ pub const GenerateResult = struct {
     jump_table: [4096]u64,
 };
 
-pub fn estimateSize(code_len: usize) usize {
-    return (code_len + 1) * 80 + 2048;
+pub fn estimateSize(comptime config: Jit.Config, code_len: usize) usize {
+    const per_inst: usize = if (config.capture_events) 128 else 80;
+    return (code_len + 1) * per_inst + 2048;
 }
 
-pub fn generate(code: []const I.Inst, output: [*]u8) GenerateResult {
+pub fn generate(
+    comptime config: Jit.Config,
+    code: []const I.Inst,
+    output: [*]u8,
+) GenerateResult {
     var buf = Buf{ .ptr = output, .len = 0 };
     var fixups: [8192]Fixup = undefined;
     var fcount: usize = 0;
     var bc_map: [4096]u32 = undefined;
 
-    emitPrologue(&buf);
+    emitPrologue(config, &buf);
 
     for (code, 0..) |inst, i| {
         bc_map[i] = buf.off();
-        emitInst(&buf, inst, &fixups, &fcount);
+        emitInst(config, &buf, inst, &fixups, &fcount);
     }
     if (code.len < 4096)
         bc_map[code.len] = buf.off();
 
     const bt_off = buf.off();
-    emitBacktrackHandler(&buf, &fixups, &fcount);
+    emitBacktrackHandler(config, &buf, &fixups, &fcount);
 
     const fail_off = buf.off();
     buf.emit(encMovn(0, 0)); // MOV x0, #-1 (all ones)
 
     const succ_off = buf.off();
-    emitEpilogue(&buf);
+    emitEpilogue(config, &buf);
 
     for (fixups[0..fcount]) |f| {
         const tgt_off: u32 = switch (f.target) {
@@ -301,8 +306,9 @@ pub fn generate(code: []const I.Inst, output: [*]u8) GenerateResult {
     return result;
 }
 
-pub fn compile(self: *Jit) !void {
-    const est = estimateSize(self.code.len);
+pub fn compile(self: anytype) !void {
+    const config = @TypeOf(self.*).jit_config;
+    const est = estimateSize(config, self.code.len);
     const size = std.mem.alignForward(usize, est, page_size);
 
     self.native_code = try std.posix.mmap(
@@ -314,7 +320,7 @@ pub fn compile(self: *Jit) !void {
         0,
     );
 
-    const result = generate(self.code, self.native_code.ptr);
+    const result = generate(config, self.code, self.native_code.ptr);
     self.native_len = result.native_len;
     self.jump_table = result.jump_table;
 
@@ -324,15 +330,27 @@ pub fn compile(self: *Jit) !void {
     );
 }
 
-fn emitPrologue(buf: *Buf) void {
+/// Stack slots for helper pointers (offsets within the locals frame).
+/// The last three are only reserved when `config.capture_events` is on.
+const sp_hsm: u15 = 0; // helper_string_match
+const sp_hcm: u15 = 8; // helper_charset_match
+const sp_esp: u15 = 16; // events_state_ptr
+const sp_has: u15 = 24; // helper_append_save
+const sp_hte: u15 = 32; // helper_truncate_events
+
+fn localsSize(comptime config: Jit.Config) u12 {
+    // Must be a multiple of 16 for AArch64 SP alignment.
+    return if (config.capture_events) 48 else 16;
+}
+
+fn emitPrologue(comptime config: Jit.Config, buf: *Buf) void {
     buf.emit(encStpPre(29, 30, sp_reg, -16));
     buf.emit(encStpPre(pos, bsp, sp_reg, -16));
     buf.emit(encStpPre(inp, inl, sp_reg, -16));
     buf.emit(encStpPre(csp, sdp, sp_reg, -16));
     buf.emit(encStpPre(cap, skp, sp_reg, -16));
     buf.emit(encStpPre(jtp, cbp, sp_reg, -16));
-    // Allocate 16 bytes for helper function pointers.
-    buf.emit(encSub(sp_reg, sp_reg, 16));
+    buf.emit(encSub(sp_reg, sp_reg, localsSize(config)));
 
     // x0 = pointer to JitCtx. Load fields into callee-saved regs.
     buf.emit(encLdr(inp, 0, 0)); // x21 = ctx->input_ptr
@@ -345,16 +363,24 @@ fn emitPrologue(buf: *Buf) void {
     buf.emit(encLdr(cbp, 0, 56)); // x28 = ctx->code_base_ptr
     // Store helper function pointers on the stack.
     buf.emit(encLdr(t0, 0, 64)); // helper_string_match
-    buf.emit(encStr(t0, sp_reg, 0)); // [sp+0]
+    buf.emit(encStr(t0, sp_reg, sp_hsm));
     buf.emit(encLdr(t0, 0, 72)); // helper_charset_match
-    buf.emit(encStr(t0, sp_reg, 8)); // [sp+8]
+    buf.emit(encStr(t0, sp_reg, sp_hcm));
+    if (config.capture_events) {
+        buf.emit(encLdr(t0, 0, 80)); // events_state_ptr
+        buf.emit(encStr(t0, sp_reg, sp_esp));
+        buf.emit(encLdr(t0, 0, 88)); // helper_append_save
+        buf.emit(encStr(t0, sp_reg, sp_has));
+        buf.emit(encLdr(t0, 0, 96)); // helper_truncate_events
+        buf.emit(encStr(t0, sp_reg, sp_hte));
+    }
 
     buf.emit(encMovz(pos, 0, 0));
     buf.emit(encMovz(bsp, 0, 0));
 }
 
-fn emitEpilogue(buf: *Buf) void {
-    buf.emit(encAdd(sp_reg, sp_reg, 16)); // deallocate helper slots
+fn emitEpilogue(comptime config: Jit.Config, buf: *Buf) void {
+    buf.emit(encAdd(sp_reg, sp_reg, localsSize(config)));
     buf.emit(encLdpPost(jtp, cbp, sp_reg, 16));
     buf.emit(encLdpPost(cap, skp, sp_reg, 16));
     buf.emit(encLdpPost(csp, sdp, sp_reg, 16));
@@ -364,7 +390,12 @@ fn emitEpilogue(buf: *Buf) void {
     buf.emit(encRet());
 }
 
-fn emitBacktrackHandler(buf: *Buf, fixups: *[8192]Fixup, fcount: *usize) void {
+fn emitBacktrackHandler(
+    comptime config: Jit.Config,
+    buf: *Buf,
+    fixups: *[8192]Fixup,
+    fcount: *usize,
+) void {
     addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, bsp);
     buf.emit(encNop());
 
@@ -390,6 +421,16 @@ fn emitBacktrackHandler(buf: *Buf, fixups: *[8192]Fixup, fcount: *usize) void {
 
     // save handler
     const save_handler = buf.off();
+    if (config.capture_events) {
+        // Truncate events to the snapshot taken at save time, then
+        // rebuild t1 since BLR clobbers x9-x18.
+        buf.emit(encLdr(1, t1, 24)); // x1 = event_len
+        buf.emit(encLdr(0, sp_reg, sp_esp)); // x0 = state_ptr
+        buf.emit(encLdr(t0, sp_reg, sp_hte));
+        buf.emit(encBlr(t0));
+        buf.emit(encLsl(t1, bsp, 5));
+        buf.emit(encAddReg(t1, skp, t1));
+    }
     buf.emit(encLdr(t3, t1, 8));
     buf.emit(encLdr(t4, t1, 16));
     buf.emit(encStrReg(t4, cap, t3));
@@ -431,6 +472,7 @@ fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup,
 }
 
 fn emitInst(
+    comptime config: Jit.Config,
     buf: *Buf,
     inst: I.Inst,
     fixups: *[8192]Fixup,
@@ -512,24 +554,47 @@ fn emitInst(
             buf.emit(encBr(t2));
         },
         .save => {
-            // TODO(capture_events): the VM records open/close events
-            // here when `VmConfig.capture_events` is true. The JIT path
-            // only writes the capture slot and does NOT append events,
-            // so running a capture_events-enabled program via JIT yields
-            // an empty event log and a broken capture tree. Either teach
-            // the JIT to call into the VM's events list, or gate JIT
-            // execution off when capture_events is enabled.
             const slot: u12 = @intCast(inst.data.slot);
-            buf.emit(encMovz(t0, slot, 0));
-            buf.emit(encLdrReg(t1, cap, t0));
-            buf.emit(encLsl(t2, bsp, 5));
-            buf.emit(encAddReg(t2, skp, t2));
-            buf.emit(encMovz(t3, 2, 0));
-            buf.emit(encStr(t3, t2, 0));
-            buf.emit(encStr(t0, t2, 8));
-            buf.emit(encStr(t1, t2, 16));
-            buf.emit(encAdd(bsp, bsp, 1));
-            buf.emit(encStrReg(pos, cap, t0));
+            if (config.capture_events) {
+                // Call helper_append_save(state, slot, pos). The helper
+                // returns the pre-append length in x0 (or maxInt on OOM);
+                // we stash that in the stack entry's event_len so the
+                // backtrack path truncates in lockstep.
+                buf.emit(encLdr(0, sp_reg, sp_esp)); // x0 = state_ptr
+                buf.emit(encMovz(1, slot, 0)); // x1 = slot
+                buf.emit(encMov(2, pos)); // x2 = pos
+                buf.emit(encLdr(t0, sp_reg, sp_has));
+                buf.emit(encBlr(t0));
+                // OOM check: x0 + 1 == 0 iff x0 was maxInt(u64).
+                buf.emit(encAdd(t0, 0, 1));
+                addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, t0);
+                buf.emit(encNop());
+                // Preserve pre_len in t4 before the rest of save clobbers x0.
+                buf.emit(encMov(t4, 0));
+                // Build stack entry.
+                buf.emit(encMovz(t0, slot, 0));
+                buf.emit(encLdrReg(t1, cap, t0));
+                buf.emit(encLsl(t2, bsp, 5));
+                buf.emit(encAddReg(t2, skp, t2));
+                buf.emit(encMovz(t3, 2, 0));
+                buf.emit(encStr(t3, t2, 0));
+                buf.emit(encStr(t0, t2, 8));
+                buf.emit(encStr(t1, t2, 16));
+                buf.emit(encStr(t4, t2, 24));
+                buf.emit(encAdd(bsp, bsp, 1));
+                buf.emit(encStrReg(pos, cap, t0));
+            } else {
+                buf.emit(encMovz(t0, slot, 0));
+                buf.emit(encLdrReg(t1, cap, t0));
+                buf.emit(encLsl(t2, bsp, 5));
+                buf.emit(encAddReg(t2, skp, t2));
+                buf.emit(encMovz(t3, 2, 0));
+                buf.emit(encStr(t3, t2, 0));
+                buf.emit(encStr(t0, t2, 8));
+                buf.emit(encStr(t1, t2, 16));
+                buf.emit(encAdd(bsp, bsp, 1));
+                buf.emit(encStrReg(pos, cap, t0));
+            }
         },
         .match => {
             buf.emit(encMov(0, pos));

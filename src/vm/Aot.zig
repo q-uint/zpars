@@ -60,10 +60,12 @@ pub fn compileToBlob(
     string_data: []const u8,
     capture_count: u16,
 ) !Blob {
-    const est = backend.estimateSize(code.len);
+    // AOT currently always compiles with the default JIT config; capture
+    // events are not yet serialized into the blob format.
+    const est = backend.estimateSize(.{}, code.len);
     const buf = try allocator.alloc(u8, est);
 
-    const result = backend.generate(code, buf.ptr);
+    const result = backend.generate(.{}, code, buf.ptr);
 
     // Shrink to actual size.
     const native_code = allocator.realloc(buf, result.native_len) catch buf[0..result.native_len];

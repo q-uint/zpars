@@ -5,6 +5,7 @@
 const std = @import("std");
 const I = @import("Instruction.zig");
 const CaptureTree = @import("CaptureTree.zig");
+const events_mod = @import("events.zig");
 
 pub const Config = struct {
     max_stack: u32 = 1024,
@@ -156,11 +157,9 @@ pub fn VmWith(comptime config: Config) type {
 
         /// Open/close capture events appended during execution and truncated
         /// on backtrack. Only present when `config.capture_events` is true.
-        events: if (config.capture_events)
-            std.ArrayListUnmanaged(CaptureTree.Event)
-        else
-            void = if (config.capture_events) .empty else {},
-        events_allocator: if (config.capture_events) ?std.mem.Allocator else void =
+        /// Backed by the shared `events_mod.State` so the JIT path can
+        /// append to the same structure through its C-ABI helpers.
+        events: if (config.capture_events) ?events_mod.State else void =
             if (config.capture_events) null else {},
 
         pub const Writer = std.Io.Writer;
@@ -225,7 +224,7 @@ pub fn VmWith(comptime config: Config) type {
                         .charsets = charsets,
                         .string_data = string_data,
                         .input = input,
-                        .events_allocator = allocator,
+                        .events = events_mod.State.init(allocator),
                     };
                 }
             }.f
@@ -283,9 +282,7 @@ pub fn VmWith(comptime config: Config) type {
                 self.memo_allocator = null;
             }
             if (config.capture_events) {
-                if (self.events_allocator) |a| {
-                    self.events.deinit(a);
-                }
+                if (self.events) |*s| s.deinit();
             }
         }
 
@@ -302,7 +299,7 @@ pub fn VmWith(comptime config: Config) type {
             self.steps = 0;
             self.resetStats();
             if (config.capture_events) {
-                self.events.clearRetainingCapacity();
+                if (self.events) |*s| s.clear();
             }
             while (pc < self.code.len) {
                 const inst = self.code[pc];
@@ -582,24 +579,14 @@ pub fn VmWith(comptime config: Config) type {
                         if (sp >= max_stack) return null;
                         const slot = inst.data.slot;
                         if (config.capture_events) {
-                            const a = self.events_allocator orelse
-                                @panic("capture_events enabled but no events allocator; use Self.initEvents");
-                            const event_len: u32 = @intCast(self.events.items.len);
+                            const state = if (self.events) |*s| s else
+                                @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const event_len = try events_mod.appendSave(state, slot, @intCast(pos));
                             stack[sp] = .{ .save = .{
                                 .slot = slot,
                                 .old = self.captures[slot],
                                 .event_len = event_len,
                             } };
-                            const group_id: u16 = slot >> 1;
-                            const marker: CaptureTree.Event.Marker = .{
-                                .group_id = group_id,
-                                .pos = @intCast(pos),
-                            };
-                            const ev: CaptureTree.Event = if (slot & 1 == 0)
-                                .{ .open = marker }
-                            else
-                                .{ .close = marker };
-                            try self.events.append(a, ev);
                         } else {
                             stack[sp] = .{ .save = .{ .slot = slot, .old = self.captures[slot] } };
                         }
@@ -632,7 +619,7 @@ pub fn VmWith(comptime config: Config) type {
                     .save => |s| {
                         self.captures[s.slot] = s.old;
                         if (config.capture_events) {
-                            self.events.shrinkRetainingCapacity(s.event_len);
+                            if (self.events) |*state| events_mod.truncate(state, s.event_len);
                         }
                     },
                     .memo => |m| {
@@ -692,7 +679,8 @@ pub fn VmWith(comptime config: Config) type {
         pub const buildCaptureTree = if (config.capture_events)
             struct {
                 fn f(self: *const Self, tree_allocator: std.mem.Allocator) CaptureTree.BuildError!CaptureTree.Tree {
-                    return CaptureTree.buildFromEvents(tree_allocator, self.events.items);
+                    const evs = if (self.events) |*s| s.items() else &.{};
+                    return CaptureTree.buildFromEvents(tree_allocator, evs);
                 }
             }.f
         else {};
@@ -703,7 +691,7 @@ pub fn VmWith(comptime config: Config) type {
         pub const getCaptureEvents = if (config.capture_events)
             struct {
                 fn f(self: *const Self) []const CaptureTree.Event {
-                    return self.events.items;
+                    return if (self.events) |*s| s.items() else &.{};
                 }
             }.f
         else {};
@@ -1267,16 +1255,6 @@ test "TODO(incremental): memoized capture-bearing rule replays events on hit" {
     // first invocation and replay (re-append) it on a cache hit, with
     // matching truncation on backtrack. Delete this test as part of
     // that change - a passing test will assert the replay behaviour.
-    return error.SkipZigTest;
-}
-
-test "TODO(capture_events): JIT path records events into the VM's log" {
-    // The JIT backends compile `save` as a pure slot write; they do
-    // not touch the VM's events ArrayList. Running a capture_events-
-    // enabled program via JIT therefore silently produces an empty
-    // event log and a broken capture tree. Delete this test when the
-    // JIT either learns to append events or is explicitly gated off
-    // whenever capture_events is enabled.
     return error.SkipZigTest;
 }
 

@@ -44,14 +44,22 @@ const r8_r: Reg = 8;
 const r9_r: Reg = 9;
 const rsp_r: Reg = 4;
 
-// Stack frame layout
+// Stack frame layout. The final three slots are only reserved/populated
+// when `Jit.Config.capture_events` is true; `stkSize` returns the
+// correct frame size for the given config.
 const stk_csp: i32 = 0;
 const stk_sdp: i32 = 8;
 const stk_jtp: i32 = 16;
 const stk_cbp: i32 = 24;
 const stk_hsm: i32 = 32; // helper_string_match
 const stk_hcm: i32 = 40; // helper_charset_match
-const stk_size: i32 = 48;
+const stk_esp: i32 = 48; // events_state_ptr (capture_events only)
+const stk_has: i32 = 56; // helper_append_save (capture_events only)
+const stk_hte: i32 = 64; // helper_truncate_events (capture_events only)
+
+fn stkSize(comptime config: Jit.Config) i32 {
+    return if (config.capture_events) 72 else 48;
+}
 
 // Condition codes for Jcc
 const CC = struct {
@@ -262,6 +270,15 @@ fn emitCmp32RI8(buf: *Buf, r: Reg, imm: u8) void {
     buf.emit1(imm);
 }
 
+/// 64-bit `cmp r, imm8` with sign-extension. Encodes -128..127 and is
+/// useful for comparing against the OOM sentinel (maxInt(u64) = -1).
+fn emitCmpRI8(buf: *Buf, r: Reg, imm: i8) void {
+    buf.emit1(0x48 | @as(u8, regHi(r)));
+    buf.emit1(0x83);
+    buf.emit1(modrmByte(3, 7, regLo(r)));
+    buf.emit1(@bitCast(imm));
+}
+
 fn emitShlRI(buf: *Buf, dst: Reg, amount: u8) void {
     buf.emit1(0x48 | @as(u8, regHi(dst)));
     buf.emit1(0xC1);
@@ -369,33 +386,38 @@ pub const GenerateResult = struct {
     jump_table: [4096]u64,
 };
 
-pub fn estimateSize(code_len: usize) usize {
-    return (code_len + 1) * 128 + 4096;
+pub fn estimateSize(comptime config: Jit.Config, code_len: usize) usize {
+    const per_inst: usize = if (config.capture_events) 192 else 128;
+    return (code_len + 1) * per_inst + 4096;
 }
 
-pub fn generate(code: []const I.Inst, output: [*]u8) GenerateResult {
+pub fn generate(
+    comptime config: Jit.Config,
+    code: []const I.Inst,
+    output: [*]u8,
+) GenerateResult {
     var buf = Buf{ .ptr = output, .len = 0 };
     var fixups: [8192]Fixup = undefined;
     var fcount: usize = 0;
     var bc_map: [4096]u32 = undefined;
 
-    emitPrologue(&buf);
+    emitPrologue(config, &buf);
 
     for (code, 0..) |inst, i| {
         bc_map[i] = buf.off();
-        emitInst(&buf, inst, &fixups, &fcount);
+        emitInst(config, &buf, inst, &fixups, &fcount);
     }
     if (code.len < 4096)
         bc_map[code.len] = buf.off();
 
     const bt_off = buf.off();
-    emitBacktrackHandler(&buf, &fixups, &fcount);
+    emitBacktrackHandler(config, &buf, &fixups, &fcount);
 
     const fail_off = buf.off();
     emitMovRI64(&buf, t0, Jit.null_cap);
 
     const succ_off = buf.off();
-    emitEpilogue(&buf);
+    emitEpilogue(config, &buf);
 
     for (fixups[0..fcount]) |f| {
         const tgt_off: u32 = switch (f.target) {
@@ -417,8 +439,9 @@ pub fn generate(code: []const I.Inst, output: [*]u8) GenerateResult {
     return result;
 }
 
-pub fn compile(self: *Jit) !void {
-    const est = estimateSize(self.code.len);
+pub fn compile(self: anytype) !void {
+    const config = @TypeOf(self.*).jit_config;
+    const est = estimateSize(config, self.code.len);
     const size = std.mem.alignForward(usize, est, page_size);
 
     self.native_code = try std.posix.mmap(
@@ -430,7 +453,7 @@ pub fn compile(self: *Jit) !void {
         0,
     );
 
-    const result = generate(self.code, self.native_code.ptr);
+    const result = generate(config, self.code, self.native_code.ptr);
     self.native_len = result.native_len;
     self.jump_table = result.jump_table;
 
@@ -440,7 +463,7 @@ pub fn compile(self: *Jit) !void {
     );
 }
 
-fn emitPrologue(buf: *Buf) void {
+fn emitPrologue(comptime config: Jit.Config, buf: *Buf) void {
     emitPush(buf, pos); // rbx
     emitPush(buf, bsp); // rbp
     emitPush(buf, cap); // r12
@@ -448,7 +471,7 @@ fn emitPrologue(buf: *Buf) void {
     emitPush(buf, inp); // r14
     emitPush(buf, skp); // r15
 
-    emitSubRI(buf, rsp_r, stk_size);
+    emitSubRI(buf, rsp_r, stkSize(config));
 
     // rdi = pointer to JitCtx. Load fields into regs and stack slots.
     emitMovRM(buf, inp, rdi_r, 0); // r14 = ctx->input_ptr
@@ -468,12 +491,21 @@ fn emitPrologue(buf: *Buf) void {
     emitMovRM(buf, t0, rdi_r, 72);
     emitMovMR(buf, rsp_r, stk_hcm, t0); // [rsp+40] = helper_charset_match
 
+    if (config.capture_events) {
+        emitMovRM(buf, t0, rdi_r, 80);
+        emitMovMR(buf, rsp_r, stk_esp, t0); // events_state_ptr
+        emitMovRM(buf, t0, rdi_r, 88);
+        emitMovMR(buf, rsp_r, stk_has, t0); // helper_append_save
+        emitMovRM(buf, t0, rdi_r, 96);
+        emitMovMR(buf, rsp_r, stk_hte, t0); // helper_truncate_events
+    }
+
     emitXorRR32(buf, pos);
     emitXorRR32(buf, bsp);
 }
 
-fn emitEpilogue(buf: *Buf) void {
-    emitAddRI(buf, rsp_r, stk_size);
+fn emitEpilogue(comptime config: Jit.Config, buf: *Buf) void {
+    emitAddRI(buf, rsp_r, stkSize(config));
     emitPop(buf, skp); // r15
     emitPop(buf, inp); // r14
     emitPop(buf, inl); // r13
@@ -483,7 +515,12 @@ fn emitEpilogue(buf: *Buf) void {
     emitRetInst(buf);
 }
 
-fn emitBacktrackHandler(buf: *Buf, fixups: *[8192]Fixup, fcount: *usize) void {
+fn emitBacktrackHandler(
+    comptime config: Jit.Config,
+    buf: *Buf,
+    fixups: *[8192]Fixup,
+    fcount: *usize,
+) void {
     emitTestRR(buf, bsp, bsp);
     addFixup(fixups, fcount, emitJccRel32(buf, CC.z), .fail);
 
@@ -513,6 +550,19 @@ fn emitBacktrackHandler(buf: *Buf, fixups: *[8192]Fixup, fcount: *usize) void {
 
     // save handler
     const save_handler_off = buf.off();
+    if (config.capture_events) {
+        // Truncate events to the snapshot taken at save time.
+        // t0 still points to the stack entry; offset 24 = event_len.
+        // The call clobbers caller-saved regs, so we re-derive t0 after.
+        emitMovRM(buf, rsi_r, t0, 24); // rsi = event_len (2nd arg)
+        emitMovRM(buf, rdi_r, rsp_r, stk_esp); // rdi = state_ptr (1st arg)
+        emitMovRM(buf, t3, rsp_r, stk_hte); // t3 = helper_truncate_events
+        emitCallR(buf, t3);
+        // Recompute t0 = &stack_entry[bsp]
+        emitMovRR(buf, t0, bsp);
+        emitShlRI(buf, t0, 5);
+        emitLeaRR(buf, t0, skp, t0);
+    }
     emitMovRM(buf, t2, t0, 8);
     emitMovRM(buf, t1, t0, 16);
     emitMovMRSib8(buf, cap, t2, t1);
@@ -552,6 +602,7 @@ fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup,
 }
 
 fn emitInst(
+    comptime config: Jit.Config,
     buf: *Buf,
     inst: I.Inst,
     fixups: *[8192]Fixup,
@@ -631,22 +682,46 @@ fn emitInst(
             emitJmpR(buf, t0);
         },
         .save => {
-            // TODO(capture_events): see JitAarch64.zig - JIT path does
-            // not append to the VM's open/close event log, so a
-            // capture_events-enabled program executed via JIT produces
-            // a broken capture tree. Teach the JIT to populate events,
-            // or refuse to JIT when capture_events is on.
             const slot: u12 = @intCast(inst.data.slot);
-            emitMovRI32(buf, t0, @intCast(slot));
-            emitMovRMSib8(buf, t1, cap, t0);
-            emitMovRR(buf, t2, bsp);
-            emitShlRI(buf, t2, 5);
-            emitLeaRR(buf, t2, skp, t2);
-            emitMovMI(buf, t2, 0, 2);
-            emitMovMR(buf, t2, 8, t0);
-            emitMovMR(buf, t2, 16, t1);
-            emitInc(buf, bsp);
-            emitMovMRSib8(buf, cap, t0, pos);
+            if (config.capture_events) {
+                // Append the event first; the helper returns the
+                // pre-append length, which we stash in the stack entry
+                // so the backtrack path can truncate in lockstep with
+                // the capture-slot undo. OOM surfaces as the sentinel
+                // maxInt(u64) and routes us to the fail handler.
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp); // rdi = state_ptr
+                emitMovRI32(buf, rsi_r, @intCast(slot)); // rsi = slot
+                emitMovRR(buf, t2, pos); // rdx = pos (t2 is rdx)
+                emitMovRM(buf, t3, rsp_r, stk_has); // t3 = helper_append_save
+                emitCallR(buf, t3);
+                // rax (t0) = pre_len or maxInt(u64) on OOM.
+                emitCmpRI8(buf, t0, -1);
+                addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                // Build stack entry. t1 = slot, t2 = old cap[slot],
+                // t3 = &stack_entry, t0 still holds pre_len.
+                emitMovRI32(buf, t1, @intCast(slot));
+                emitMovRMSib8(buf, t2, cap, t1);
+                emitMovRR(buf, t3, bsp);
+                emitShlRI(buf, t3, 5);
+                emitLeaRR(buf, t3, skp, t3);
+                emitMovMI(buf, t3, 0, 2);
+                emitMovMR(buf, t3, 8, t1);
+                emitMovMR(buf, t3, 16, t2);
+                emitMovMR(buf, t3, 24, t0);
+                emitInc(buf, bsp);
+                emitMovMRSib8(buf, cap, t1, pos);
+            } else {
+                emitMovRI32(buf, t0, @intCast(slot));
+                emitMovRMSib8(buf, t1, cap, t0);
+                emitMovRR(buf, t2, bsp);
+                emitShlRI(buf, t2, 5);
+                emitLeaRR(buf, t2, skp, t2);
+                emitMovMI(buf, t2, 0, 2);
+                emitMovMR(buf, t2, 8, t0);
+                emitMovMR(buf, t2, 16, t1);
+                emitInc(buf, bsp);
+                emitMovMRSib8(buf, cap, t0, pos);
+            }
         },
         .match => {
             emitMovRR(buf, t0, pos);
