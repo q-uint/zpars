@@ -411,3 +411,84 @@ export fn match(
         .cfg, .sexp => null,
     };
 }
+
+/// Tree result format (little-endian):
+///   bytes 0..3   - JSON length (u32). 0 means "no match" (empty body).
+///   bytes 4..    - JSON bytes (capture-tree serialization). Each node is
+///                  `{"type":..,"span":[s,e]}` for normal rules, plus
+///                  `"partial":true` for partial subtrees, or a fixed
+///                  `"type":"ERROR"` / `"type":"MISSING"` plus a `"label"`
+///                  field for synthesized recovery nodes.
+///
+/// Returns null on grammar parse error or compile failure. PEG only;
+/// recovery directives (`#@ ...`) are recognized.
+export fn tree(
+    grammar_ptr: [*]const u8,
+    grammar_len: usize,
+    input_ptr: [*]const u8,
+    input_len: usize,
+) ?[*]const u8 {
+    if (grammar_len == 0) return null;
+    const grammar = grammar_ptr[0..grammar_len];
+    const input = input_ptr[0..input_len];
+
+    // Recovery-enabled PEG parser - the only front-end that produces
+    // `#@` directive AST nodes. Other formats fall through to the
+    // ordinary capture-tree path with no recovery semantics; for now,
+    // tree() is PEG-only.
+    const RecoveryPegParser = root.peg.ParserWith(.{ .recovery = true });
+
+    var scanner = root.peg.Scanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryPegParser.init(tokens, grammar);
+    const rules = parser.parse() catch return null;
+    if (rules.len == 0) return null;
+
+    var compiler = root.vm.Compiler.compileOpts(rules, .{ .rules_as_captures = true }) catch return null;
+
+    const EventVm = root.vm.VmWith(.{ .capture_events = true });
+    var vm = EventVm.initEvents(
+        allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        input,
+    );
+    defer vm.deinit();
+
+    // Build the result buffer with a 4-byte length header. On a failed
+    // match we still return a buffer (length = 0) so the JS side can
+    // distinguish "no match" from "grammar didn't compile" (null).
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    aw.writer.writeAll(&[_]u8{ 0, 0, 0, 0 }) catch return null;
+
+    const exec_result = vm.execute() catch return null;
+    if (exec_result == null) {
+        // No match: write 0-length header and return.
+        const slice = aw.toOwnedSlice() catch return null;
+        return slice.ptr;
+    }
+
+    var captured = vm.buildCaptureTree(allocator) catch return null;
+    defer captured.deinit();
+
+    // Build name slices indexed by rule_id and label_id for the renderer.
+    const max_names = 256;
+    var rule_names_buf: [max_names][]const u8 = undefined;
+    const rule_names = rule_names_buf[0..compiler.rule_count];
+    for (0..compiler.rule_count) |i| rule_names[i] = compiler.getRuleName(@intCast(i));
+
+    var label_names_buf: [max_names][]const u8 = undefined;
+    const label_names = label_names_buf[0..compiler.label_count];
+    for (0..compiler.label_count) |i| label_names[i] = compiler.getLabelName(@intCast(i));
+
+    captured.writeJson(&aw.writer, .{ .rules = rule_names, .labels = label_names }) catch return null;
+
+    const written = aw.writer.buffered();
+    const json_len: u32 = @intCast(written.len - 4);
+    @memcpy(written[0..4], std.mem.asBytes(&json_len));
+
+    const slice = aw.toOwnedSlice() catch return null;
+    return slice.ptr;
+}

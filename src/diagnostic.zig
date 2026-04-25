@@ -52,13 +52,18 @@ pub fn Diagnostic(comptime ExpectedType: type, comptime FoundTagType: type) type
             else
                 "eof";
 
-            try writer.print("{s}:{d}:{d}: error: expected {s}, found '{s}'\n", .{
-                filename,
-                self.line,
-                col,
-                @tagName(self.expected),
-                found_lexeme,
-            });
+            try writer.print("{s}:{d}:{d}: error: ", .{ filename, self.line, col });
+            const handled = if (comptime @hasDecl(Expected, "writeMessage"))
+                try self.expected.writeMessage(writer, found_lexeme)
+            else
+                false;
+            if (!handled) {
+                try writer.print("expected {s}, found '{s}'", .{
+                    @tagName(self.expected),
+                    found_lexeme,
+                });
+            }
+            try writer.writeByte('\n');
             try writer.print("   {s}\n", .{line});
             for (0..col - 1 + 3) |_| try writer.writeByte(' ');
             try writer.print("^\n", .{});

@@ -134,6 +134,12 @@ pub fn formatNode(node: Ast.Node, in_predicate: bool, writer: anytype) anyerror!
         .any => try writer.writeByte('.'),
         // Nodes not produced by the PEG parser.
         .num_val, .prose_val, .neg_char_class, .anchor_start, .anchor_end, .capture => unreachable,
+        // Recovery nodes are emitted by the `#@` directive parser. The
+        // formatter handles them at the rule level (see formatRules /
+        // a follow-up pass), not inline in formatNode. Encountering one
+        // here means the AST was constructed manually without using the
+        // matching rule-level renderer; treat it as a programming error.
+        .throw_label, .lcatch, .missing_label => unreachable,
     }
 }
 

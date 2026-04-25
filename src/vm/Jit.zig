@@ -260,24 +260,24 @@ const EreParser = @import("../ere/Parser.zig").Parser;
 const PegScanner = @import("../peg/Scanner.zig").Scanner;
 const PegParser = @import("../peg/Parser.zig").Parser;
 
-fn compileEre(source: []const u8) Compiler {
+fn compileEre(source: []const u8) !Compiler {
     var scanner = EreScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
-fn compilePeg(source: []const u8) Compiler {
+fn compilePeg(source: []const u8) !Compiler {
     var scanner = PegScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = PegParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
 fn expectMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
-    var compiler = compileEre(source);
+    var compiler = try compileEre(source);
     var jit = try Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
     defer jit.deinit();
     const result = jit.execute();
@@ -285,7 +285,7 @@ fn expectMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
 }
 
 fn expectPegMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
-    var compiler = compilePeg(source);
+    var compiler = try compilePeg(source);
     var jit = try Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
     defer jit.deinit();
     const result = jit.execute();
@@ -380,7 +380,7 @@ test "jit: peg recursive rules" {
 }
 
 test "jit: capture single group" {
-    var compiler = compileEre("a(bc)d");
+    var compiler = try compileEre("a(bc)d");
     var jit = try Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "abcd");
     defer jit.deinit();
     try testing.expectEqual(@as(?usize, 4), jit.execute());
@@ -388,7 +388,7 @@ test "jit: capture single group" {
 }
 
 test "jit: capture multiple groups" {
-    var compiler = compileEre("(a+)(b+)");
+    var compiler = try compileEre("(a+)(b+)");
     var jit = try Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaabb");
     defer jit.deinit();
     try testing.expectEqual(@as(?usize, 5), jit.execute());
@@ -399,7 +399,7 @@ test "jit: capture multiple groups" {
 const EventJit = JitWith(.{ .capture_events = true });
 
 test "jit capture_events: flat single group emits open/close pair" {
-    var compiler = compileEre("a(bc)d");
+    var compiler = try compileEre("a(bc)d");
     var jit = try EventJit.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -419,7 +419,7 @@ test "jit capture_events: flat single group emits open/close pair" {
 }
 
 test "jit capture_events: nested groups build a tree" {
-    var compiler = compileEre("((a)(b))");
+    var compiler = try compileEre("((a)(b))");
     var jit = try EventJit.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -445,7 +445,7 @@ test "jit capture_events: nested groups build a tree" {
 }
 
 test "jit capture_events: repetition yields sibling nodes" {
-    var compiler = compileEre("(a)(a)(a)");
+    var compiler = try compileEre("(a)(a)(a)");
     var jit = try EventJit.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -464,7 +464,7 @@ test "jit capture_events: backtracking truncates abandoned events" {
     // The first alternative (a)(b)x matches (a)(b) then fails on x;
     // the second alternative (c)(d)y succeeds. Only the surviving
     // captures from the second alternative should appear.
-    var compiler = compileEre("(a)(b)x|(c)(d)y");
+    var compiler = try compileEre("(a)(b)x|(c)(d)y");
     var jit = try EventJit.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -484,7 +484,7 @@ test "jit capture_events: backtracking truncates abandoned events" {
 }
 
 test "jit capture_events: failed match produces empty log" {
-    var compiler = compileEre("(a)b");
+    var compiler = try compileEre("(a)b");
     var jit = try EventJit.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -498,7 +498,7 @@ test "jit capture_events: failed match produces empty log" {
 }
 
 test "jit capture_events: cleared between runs" {
-    var compiler = compileEre("(a)");
+    var compiler = try compileEre("(a)");
     var jit = try EventJit.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -522,7 +522,7 @@ test "jit rules_as_captures: PEG grammar produces a tree" {
     const tokens = scanner.scanTokens();
     var parser = PegParser.init(tokens, src);
     const rules = try parser.parse();
-    var c = Compiler.compileOpts(rules, .{ .rules_as_captures = true });
+    var c = try Compiler.compileOpts(rules, .{ .rules_as_captures = true });
 
     var jit = try EventJit.initEvents(
         testing.allocator,
@@ -544,4 +544,24 @@ test "jit rules_as_captures: PEG grammar produces a tree" {
     for (expr.children) |term| {
         try testing.expectEqualStrings("Term", c.getRuleName(term.group_id));
     }
+}
+
+test "jit: rejects recovery grammars with explicit error" {
+    const Ast = @import("../Ast.zig");
+    const throw_node: Ast.Node = .{ .throw_label = "L" };
+    const missing_node: Ast.Node = .{ .missing_label = "L" };
+    const lcatch_node: Ast.Node = .{ .lcatch = .{
+        .label = "L",
+        .body = &throw_node,
+        .handler = &missing_node,
+    } };
+    const rules = [_]Ast.Rule{
+        .{ .name = "stmt", .node = lcatch_node, .incremental = false },
+    };
+
+    var compiler = try Compiler.compileOpts(&rules, .{ .rules_as_captures = true });
+    try testing.expectError(
+        error.JitDoesNotSupportRecovery,
+        Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), ""),
+    );
 }

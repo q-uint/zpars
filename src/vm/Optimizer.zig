@@ -337,31 +337,31 @@ const testing = @import("std").testing;
 const EreScanner = @import("../ere/Scanner.zig").Scanner;
 const EreParser = @import("../ere/Parser.zig").Parser;
 
-fn compileEre(source: []const u8) Compiler {
+fn compileEre(source: []const u8) !Compiler {
     var scanner = EreScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
-fn compileEreUnopt(source: []const u8) Compiler {
+fn compileEreUnopt(source: []const u8) !Compiler {
     var scanner = EreScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compileOpts(rules, .{ .optimize = false });
 }
 
 test "charset deduplication" {
     // Two identical charsets [a-z] should share one slot.
-    const compiler = compileEre("[a-z][a-z]");
+    const compiler = try compileEre("[a-z][a-z]");
     try testing.expectEqual(@as(u16, 1), compiler.charset_len);
 }
 
 test "single-char charset replaced with char" {
     // [a] should be optimized to a char instruction.
-    const compiler = compileEre("[a]");
+    const compiler = try compileEre("[a]");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.char, code[0].op);
     try testing.expectEqual(@as(u8, 'a'), code[0].data.byte);
@@ -369,21 +369,21 @@ test "single-char charset replaced with char" {
 
 test "multi-char charset not replaced" {
     // [ab] has two bits set; must remain a set instruction.
-    const compiler = compileEre("[ab]");
+    const compiler = try compileEre("[ab]");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.set, code[0].op);
 }
 
 test "negated single-char charset not replaced" {
     // [^a] should stay as neg_set (no single-instruction equivalent).
-    const compiler = compileEre("[^a]");
+    const compiler = try compileEre("[^a]");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.neg_set, code[0].op);
 }
 
 test "consecutive chars fused into string" {
     // "abc" should produce a single string instruction instead of 3 chars.
-    const compiler = compileEre("abc");
+    const compiler = try compileEre("abc");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.string, code[0].op);
     try testing.expectEqual(@as(u8, 3), code[0].data.string.len);
@@ -395,14 +395,14 @@ test "consecutive chars fused into string" {
 
 test "single char not fused" {
     // A single char should remain as char, not become a 1-byte string.
-    const compiler = compileEre("a");
+    const compiler = try compileEre("a");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.char, code[0].op);
 }
 
 test "string fusion preserves offsets" {
     // "ab|cd" -- alternation offsets must be correct after fusion.
-    const compiler = compileEre("ab|cd");
+    const compiler = try compileEre("ab|cd");
     const code = compiler.getCode();
     // choice -> string "ab" -> commit -> string "cd" -> match
     try testing.expectEqual(I.Opcode.choice, code[0].op);
@@ -418,7 +418,7 @@ test "string fusion preserves offsets" {
 
 test "optional char fused" {
     // "a?" should produce optional_char instead of choice/char/commit.
-    const compiler = compileEre("a?");
+    const compiler = try compileEre("a?");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.optional_char, code[0].op);
     try testing.expectEqual(@as(u8, 'a'), code[0].data.byte);
@@ -428,7 +428,7 @@ test "optional char fused" {
 
 test "optional char not fused for star" {
     // "a*" uses choice/char/commit but commit jumps back, not forward.
-    const compiler = compileEre("a*");
+    const compiler = try compileEre("a*");
     const code = compiler.getCode();
     // Should remain choice/char/commit, not fused.
     try testing.expectEqual(I.Opcode.choice, code[0].op);
@@ -436,7 +436,7 @@ test "optional char not fused for star" {
 
 test "optional char preserves surrounding offsets" {
     // "a?b" should become: optional_char 'a', char 'b', match
-    const compiler = compileEre("a?b");
+    const compiler = try compileEre("a?b");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.optional_char, code[0].op);
     try testing.expectEqual(@as(u8, 'a'), code[0].data.byte);
@@ -447,7 +447,7 @@ test "optional char preserves surrounding offsets" {
 
 test "common prefix factored (one suffix empty)" {
     // "https|http" -> string "http", optional_char 's', match
-    const compiler = compileEre("https|http");
+    const compiler = try compileEre("https|http");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.string, code[0].op);
     const str = compiler.getStringData();
@@ -460,7 +460,7 @@ test "common prefix factored (one suffix empty)" {
 
 test "common prefix factored (both suffixes non-empty)" {
     // "httpAB|httpCD" -> string "http", choice, string "AB", commit, string "CD", match
-    const compiler = compileEre("httpAB|httpCD");
+    const compiler = try compileEre("httpAB|httpCD");
     const code = compiler.getCode();
     const str = compiler.getStringData();
     try testing.expectEqual(I.Opcode.string, code[0].op);
@@ -477,21 +477,21 @@ test "common prefix factored (both suffixes non-empty)" {
 
 test "common prefix not factored without shared prefix" {
     // "abc|xyz" has no common prefix; alternation stays intact.
-    const compiler = compileEre("abc|xyz");
+    const compiler = try compileEre("abc|xyz");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.choice, code[0].op);
 }
 
 test "common prefix not factored when branch 0 is prefix" {
     // "http|https": branch 0 always wins in PEG, no benefit.
-    const compiler = compileEre("http|https");
+    const compiler = try compileEre("http|https");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.choice, code[0].op);
 }
 
 test "common prefix single char branches" {
     // "ab|a" -> char 'a', optional_char 'b', match
-    const compiler = compileEre("ab|a");
+    const compiler = try compileEre("ab|a");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.char, code[0].op);
     try testing.expectEqual(@as(u8, 'a'), code[0].data.byte);
@@ -502,7 +502,7 @@ test "common prefix single char branches" {
 
 test "optimizer disabled" {
     // With optimization off, chars remain unfused and charsets are not simplified.
-    const compiler = compileEreUnopt("abc");
+    const compiler = try compileEreUnopt("abc");
     const code = compiler.getCode();
     try testing.expectEqual(I.Opcode.char, code[0].op);
     try testing.expectEqual(I.Opcode.char, code[1].op);

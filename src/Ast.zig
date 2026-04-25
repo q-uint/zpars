@@ -44,6 +44,31 @@ pub const Node = union(enum) {
     any,
     /// Capture group: records start/end positions of the inner match.
     capture: *const Node,
+    /// Throw a labeled failure. Always fails non-recoverably for `fail`-style
+    /// backtracking; the runtime unwinds past `choice` frames until a matching
+    /// `lcatch` is found. Produced by the PEG front-end from `#@ throw
+    /// <label>` directives, or constructed directly by programmatic AST
+    /// users. The compiler resolves `label` to a label id at lowering time.
+    throw_label: []const u8,
+    /// Wrap `body` in a labeled-failure catch keyed to `label`. On a matching
+    /// throw inside `body`, control transfers to `handler` with the input
+    /// position left at the throw site. `handler` runs as a normal expression;
+    /// if `handler` itself fails normally, the outer scope sees the throw
+    /// propagate further. The compiler emits an error_open / error_close pair
+    /// around `handler` so the recovered region surfaces as an ERROR node.
+    lcatch: Lcatch,
+    /// Emit a zero-width MISSING(label) marker into the event log. Always
+    /// succeeds; consumes no input. Typically appears as the body of a
+    /// recovery handler (or via the `recover_missing` builtin handler form
+    /// in PEG).
+    missing_label: []const u8,
+};
+
+/// Payload for `Node.lcatch`.
+pub const Lcatch = struct {
+    label: []const u8,
+    body: *const Node,
+    handler: *const Node,
 };
 
 /// A character class range entry (e.g. `a-z` or a single `_`).

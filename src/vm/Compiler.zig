@@ -15,6 +15,19 @@ pub const Config = struct {
 
 pub const Compiler = CompilerWith(.{});
 
+/// Compile-time errors caused by grammar input exceeding a fixed
+/// resource bound. These are recoverable: the caller can surface a
+/// diagnostic and reject the grammar. Programmer-bug invariants in
+/// the compiler still trip `unreachable` / `assert`, not these.
+pub const Error = error{
+    TooManyRules,
+    TooManyLabels,
+    TooManyCaptures,
+    CodeBufferExhausted,
+    PatchBufferExhausted,
+    CharsetBufferExhausted,
+};
+
 pub fn CompilerWith(comptime config: Config) type {
     return struct {
         const Self = @This();
@@ -48,6 +61,14 @@ pub fn CompilerWith(comptime config: Config) type {
         rule_names: [256]I.Inst.StringRef = [_]I.Inst.StringRef{.{ .offset = 0, .len = 0 }} ** 256,
         rule_count: u16 = 0,
 
+        /// Label-id table for recovery. Populated lazily by
+        /// `labelIdFor` on the first reference to a label from a
+        /// `throw_label`, `lcatch`, or `missing_label` AST node. Indexed
+        /// by label id; `getLabelName` decodes them. Empty for grammars
+        /// without recovery.
+        label_names: [256]I.Inst.StringRef = [_]I.Inst.StringRef{.{ .offset = 0, .len = 0 }} ** 256,
+        label_count: u16 = 0,
+
         optimize_enabled: bool = true,
 
         rules: []const Ast.Rule = &.{},
@@ -57,7 +78,7 @@ pub fn CompilerWith(comptime config: Config) type {
             name: []const u8,
         };
 
-        pub fn compile(rules: []const Ast.Rule) Self {
+        pub fn compile(rules: []const Ast.Rule) Error!Self {
             return compileOpts(rules, .{});
         }
 
@@ -83,35 +104,37 @@ pub fn CompilerWith(comptime config: Config) type {
             rules_as_captures: bool = false,
         };
 
-        pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Self {
+        pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Error!Self {
             var c = Self{};
+            if (rules.len > c.rule_names.len) return Error.TooManyRules;
+
             c.rules = rules;
             c.optimize_enabled = opts.optimize;
             c.rule_count = @intCast(rules.len);
             for (rules, 0..) |rule, i| c.rule_names[i] = c.internRuleName(rule.name);
 
             if (rules.len == 0) {
-                c.emit(.{ .op = .match });
+                try c.emit(.{ .op = .match });
             } else if (rules.len == 1) {
-                if (opts.rules_as_captures) c.emit(.{ .op = .event_open, .data = .{ .slot = 0 } });
-                c.compileNode(&rules[0].node);
-                if (opts.rules_as_captures) c.emit(.{ .op = .event_close, .data = .{ .slot = 0 } });
-                c.emit(.{ .op = .match });
+                if (opts.rules_as_captures) try c.emit(.{ .op = .event_open, .data = .{ .slot = 0 } });
+                try c.compileNode(&rules[0].node);
+                if (opts.rules_as_captures) try c.emit(.{ .op = .event_close, .data = .{ .slot = 0 } });
+                try c.emit(.{ .op = .match });
                 c.patchCalls(&.{0}, rules);
             } else {
-                const entry_call = c.emitPlaceholder();
-                c.emit(.{ .op = .match });
+                const entry_call = try c.emitPlaceholder();
+                try c.emit(.{ .op = .match });
 
                 var rule_addrs: [256]u32 = undefined;
                 var rule_ends: [256]u32 = undefined;
                 for (rules, 0..) |rule, i| {
                     rule_addrs[i] = c.code_len;
                     if (opts.rules_as_captures)
-                        c.emit(.{ .op = .event_open, .data = .{ .slot = @intCast(i) } });
-                    c.compileNode(&rule.node);
+                        try c.emit(.{ .op = .event_open, .data = .{ .slot = @intCast(i) } });
+                    try c.compileNode(&rule.node);
                     if (opts.rules_as_captures)
-                        c.emit(.{ .op = .event_close, .data = .{ .slot = @intCast(i) } });
-                    c.emit(.{ .op = .ret });
+                        try c.emit(.{ .op = .event_close, .data = .{ .slot = @intCast(i) } });
+                    try c.emit(.{ .op = .ret });
                     rule_ends[i] = c.code_len;
                 }
 
@@ -148,6 +171,29 @@ pub fn CompilerWith(comptime config: Config) type {
         pub fn getRuleName(self: *const Self, rule_id: u16) []const u8 {
             const ref = self.rule_names[rule_id];
             return self.string_data[ref.offset..][0..ref.len];
+        }
+
+        /// Look up a label's name by id. Valid for ids < `label_count`.
+        /// Used by the tree CLI to render ERROR / MISSING node labels.
+        pub fn getLabelName(self: *const Self, label_id: u16) []const u8 {
+            const ref = self.label_names[label_id];
+            return self.string_data[ref.offset..][0..ref.len];
+        }
+
+        /// Resolve a label name to an id, allocating a fresh id on first
+        /// use. Names are interned into `string_data` so they outlive
+        /// the AST.
+        fn labelIdFor(self: *Self, name: []const u8) Error!u16 {
+            for (0..self.label_count) |i| {
+                const ref = self.label_names[i];
+                const stored = self.string_data[ref.offset..][0..ref.len];
+                if (std.mem.eql(u8, stored, name)) return @intCast(i);
+            }
+            if (self.label_count >= self.label_names.len) return Error.TooManyLabels;
+            self.label_names[self.label_count] = self.internRuleName(name);
+            const id: u16 = self.label_count;
+            self.label_count += 1;
+            return id;
         }
 
         fn rewriteMemoCalls(
@@ -203,60 +249,101 @@ pub fn CompilerWith(comptime config: Config) type {
             }
         }
 
-        fn compileNode(self: *Self, node: *const Ast.Node) void {
+        fn compileNode(self: *Self, node: *const Ast.Node) Error!void {
             switch (node.*) {
                 .char_val => |cv| {
                     for (cv.value) |b| {
-                        self.emit(.{ .op = .char, .data = .{ .byte = b } });
+                        try self.emit(.{ .op = .char, .data = .{ .byte = b } });
                     }
                 },
-                .any => self.emit(.{ .op = .any }),
+                .any => try self.emit(.{ .op = .any }),
                 .concatenation => |nodes| {
-                    for (nodes) |*n| self.compileNode(n);
+                    for (nodes) |*n| try self.compileNode(n);
                 },
-                .alternation => |alts| self.compileAlternation(alts),
-                .repetition => |rep| self.compileRepetition(rep),
+                .alternation => |alts| try self.compileAlternation(alts),
+                .repetition => |rep| try self.compileRepetition(rep),
                 .char_class => |ranges| {
-                    const idx = self.addCharset(ranges);
-                    self.emit(.{ .op = .set, .data = .{ .charset = idx } });
+                    const idx = try self.addCharset(ranges);
+                    try self.emit(.{ .op = .set, .data = .{ .charset = idx } });
                 },
                 .neg_char_class => |ranges| {
-                    const idx = self.addCharset(ranges);
-                    self.emit(.{ .op = .neg_set, .data = .{ .charset = idx } });
+                    const idx = try self.addCharset(ranges);
+                    try self.emit(.{ .op = .neg_set, .data = .{ .charset = idx } });
                 },
-                .num_val => |nv| self.compileNumVal(nv),
+                .num_val => |nv| try self.compileNumVal(nv),
                 .rulename => |name| {
-                    if (self.patch_len >= config.max_patches)
-                        @panic("compiler patch buffer exhausted");
+                    if (self.patch_len >= config.max_patches) return Error.PatchBufferExhausted;
                     self.patches[self.patch_len] = .{
                         .addr = self.code_len,
                         .name = name,
                     };
                     self.patch_len += 1;
-                    self.emit(.{ .op = .fail });
+                    try self.emit(.{ .op = .fail });
                 },
                 .and_predicate => |inner| {
-                    const outer = self.emitPlaceholder();
-                    const inner_choice = self.emitPlaceholder();
-                    self.compileNode(inner);
-                    const commit_addr = self.emitPlaceholder();
-                    self.emit(.{ .op = .fail_twice });
+                    const outer = try self.emitPlaceholder();
+                    const inner_choice = try self.emitPlaceholder();
+                    try self.compileNode(inner);
+                    const commit_addr = try self.emitPlaceholder();
+                    try self.emit(.{ .op = .fail_twice });
                     self.code[inner_choice] = .{ .op = .choice, .data = .{ .offset = self.code_len - 1 } };
                     self.code[commit_addr] = .{ .op = .commit, .data = .{ .offset = self.code_len - 1 } };
                     self.code[outer] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
-                    self.emit(.{ .op = .fail_twice });
+                    try self.emit(.{ .op = .fail_twice });
                 },
                 .not_predicate => |inner| {
-                    const choice_addr = self.emitPlaceholder();
-                    self.compileNode(inner);
-                    self.emit(.{ .op = .fail_twice });
+                    const choice_addr = try self.emitPlaceholder();
+                    try self.compileNode(inner);
+                    try self.emit(.{ .op = .fail_twice });
                     self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
                 },
                 .capture => |inner| {
-                    const slot = self.captureSlotFor(node);
-                    self.emit(.{ .op = .save, .data = .{ .slot = slot } });
-                    self.compileNode(inner);
-                    self.emit(.{ .op = .save, .data = .{ .slot = slot + 1 } });
+                    const slot = try self.captureSlotFor(node);
+                    try self.emit(.{ .op = .save, .data = .{ .slot = slot } });
+                    try self.compileNode(inner);
+                    try self.emit(.{ .op = .save, .data = .{ .slot = slot + 1 } });
+                },
+                .throw_label => |name| {
+                    const label_id = try self.labelIdFor(name);
+                    try self.emit(.{ .op = .throw, .data = .{ .slot = label_id } });
+                },
+                .missing_label => |name| {
+                    const label_id = try self.labelIdFor(name);
+                    try self.emit(.{ .op = .event_missing, .data = .{ .slot = label_id } });
+                },
+                .lcatch => |c| {
+                    // Lowers to:
+                    //   lcatch L -> handler_pc
+                    //   <body>
+                    //   commit -> end
+                    // handler_pc:
+                    //   event_error_open L            ; (only if not recover_missing)
+                    //   <handler>
+                    //   event_error_close L           ; (only if not recover_missing)
+                    // end:
+                    //
+                    // When `handler.* == .missing_label`, the handler is the
+                    // PEG `recover_missing` builtin: emit only the missing
+                    // marker, no ERROR-node wrapping.
+                    const label_id = try self.labelIdFor(c.label);
+                    const lcatch_addr = try self.emitPlaceholder();
+                    try self.compileNode(c.body);
+                    const commit_addr = try self.emitPlaceholder();
+                    const handler_pc = self.code_len;
+                    const wrap_in_error_node = c.handler.* != .missing_label;
+                    if (wrap_in_error_node) {
+                        try self.emit(.{ .op = .event_error_open, .data = .{ .slot = label_id } });
+                    }
+                    try self.compileNode(c.handler);
+                    if (wrap_in_error_node) {
+                        try self.emit(.{ .op = .event_error_close, .data = .{ .slot = label_id } });
+                    }
+                    const end = self.code_len;
+                    self.code[lcatch_addr] = .{
+                        .op = .lcatch,
+                        .data = .{ .catch_handler = .{ .label = label_id, .handler_pc = handler_pc } },
+                    };
+                    self.code[commit_addr] = .{ .op = .commit, .data = .{ .offset = end } };
                 },
                 .anchor_start, .anchor_end, .prose_val => {},
             }
@@ -266,22 +353,21 @@ pub fn CompilerWith(comptime config: Config) type {
         /// assigning a fresh group id on first visit. Subsequent visits
         /// of the same node (e.g. via a parent repetition compiled
         /// multiple times) reuse the same slot so `(a)+` is one group.
-        fn captureSlotFor(self: *Self, node_ptr: *const Ast.Node) u16 {
+        fn captureSlotFor(self: *Self, node_ptr: *const Ast.Node) Error!u16 {
             for (self.capture_node_ptrs[0..self.capture_count], 0..) |stored, i| {
                 if (stored == node_ptr) return @as(u16, @intCast(i)) * 2;
             }
-            if (self.capture_count >= config.max_captures / 2)
-                @panic("too many capture groups");
+            if (self.capture_count >= config.max_captures / 2) return Error.TooManyCaptures;
             const slot = self.capture_count * 2;
             self.capture_node_ptrs[self.capture_count] = node_ptr;
             self.capture_count += 1;
             return slot;
         }
 
-        fn compileAlternation(self: *Self, alts: []const Ast.Node) void {
+        fn compileAlternation(self: *Self, alts: []const Ast.Node) Error!void {
             if (alts.len == 0) return;
             if (alts.len == 1) {
-                self.compileNode(&alts[0]);
+                try self.compileNode(&alts[0]);
                 return;
             }
 
@@ -289,14 +375,14 @@ pub fn CompilerWith(comptime config: Config) type {
             var commit_count: usize = 0;
 
             for (alts[0 .. alts.len - 1]) |*alt| {
-                const choice_addr = self.emitPlaceholder();
-                self.compileNode(alt);
-                commits[commit_count] = self.emitPlaceholder();
+                const choice_addr = try self.emitPlaceholder();
+                try self.compileNode(alt);
+                commits[commit_count] = try self.emitPlaceholder();
                 commit_count += 1;
                 self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
             }
 
-            self.compileNode(&alts[alts.len - 1]);
+            try self.compileNode(&alts[alts.len - 1]);
 
             const end = self.code_len;
             for (commits[0..commit_count]) |addr| {
@@ -304,46 +390,46 @@ pub fn CompilerWith(comptime config: Config) type {
             }
         }
 
-        fn compileRepetition(self: *Self, rep: Ast.Repetition) void {
+        fn compileRepetition(self: *Self, rep: Ast.Repetition) Error!void {
             for (0..rep.min) |_| {
-                self.compileNode(rep.element);
+                try self.compileNode(rep.element);
             }
 
             if (rep.max) |max| {
                 const optional = max - rep.min;
                 for (0..optional) |_| {
-                    const choice_addr = self.emitPlaceholder();
-                    self.compileNode(rep.element);
-                    const commit_addr = self.emitPlaceholder();
+                    const choice_addr = try self.emitPlaceholder();
+                    try self.compileNode(rep.element);
+                    const commit_addr = try self.emitPlaceholder();
                     self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
                     self.code[commit_addr] = .{ .op = .commit, .data = .{ .offset = self.code_len } };
                 }
             } else {
                 const loop_start = self.code_len;
-                const choice_addr = self.emitPlaceholder();
-                self.compileNode(rep.element);
-                self.emit(.{ .op = .commit, .data = .{ .offset = loop_start } });
+                const choice_addr = try self.emitPlaceholder();
+                try self.compileNode(rep.element);
+                try self.emit(.{ .op = .commit, .data = .{ .offset = loop_start } });
                 self.code[choice_addr] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
             }
         }
 
-        fn compileNumVal(self: *Self, nv: Ast.NumVal) void {
+        fn compileNumVal(self: *Self, nv: Ast.NumVal) Error!void {
             switch (nv) {
-                .single => |b| self.emit(.{ .op = .char, .data = .{ .byte = b } }),
+                .single => |b| try self.emit(.{ .op = .char, .data = .{ .byte = b } }),
                 .range => |r| {
                     const ranges = [_][2]u8{.{ r.lo, r.hi }};
-                    const idx = self.addCharsetFromRaw(&ranges);
-                    self.emit(.{ .op = .set, .data = .{ .charset = idx } });
+                    const idx = try self.addCharsetFromRaw(&ranges);
+                    try self.emit(.{ .op = .set, .data = .{ .charset = idx } });
                 },
                 .concat => |bytes| {
                     for (bytes) |b| {
-                        self.emit(.{ .op = .char, .data = .{ .byte = b } });
+                        try self.emit(.{ .op = .char, .data = .{ .byte = b } });
                     }
                 },
             }
         }
 
-        fn addCharset(self: *Self, ranges: []const Ast.ClassRange) u16 {
+        fn addCharset(self: *Self, ranges: []const Ast.ClassRange) Error!u16 {
             var cs = I.Charset{ 0, 0, 0, 0 };
             for (ranges) |r| {
                 var b: u16 = r.lo;
@@ -357,11 +443,11 @@ pub fn CompilerWith(comptime config: Config) type {
             return self.findOrAddCharset(cs);
         }
 
-        fn addCharsetFromRaw(self: *Self, ranges: []const [2]u8) u16 {
+        fn addCharsetFromRaw(self: *Self, ranges: []const [2]u8) Error!u16 {
             return self.findOrAddCharset(I.charsetFromRanges(ranges));
         }
 
-        fn findOrAddCharset(self: *Self, cs: I.Charset) u16 {
+        fn findOrAddCharset(self: *Self, cs: I.Charset) Error!u16 {
             for (self.charsets[0..self.charset_len], 0..) |existing, i| {
                 if (existing[0] == cs[0] and existing[1] == cs[1] and
                     existing[2] == cs[2] and existing[3] == cs[3])
@@ -369,24 +455,22 @@ pub fn CompilerWith(comptime config: Config) type {
                     return @intCast(i);
                 }
             }
-            if (self.charset_len >= config.max_charsets)
-                @panic("compiler charset buffer exhausted");
+            if (self.charset_len >= config.max_charsets) return Error.CharsetBufferExhausted;
             const idx = self.charset_len;
             self.charsets[idx] = cs;
             self.charset_len += 1;
             return idx;
         }
 
-        fn emit(self: *Self, inst: I.Inst) void {
-            if (self.code_len >= config.max_code)
-                @panic("compiler code buffer exhausted");
+        fn emit(self: *Self, inst: I.Inst) Error!void {
+            if (self.code_len >= config.max_code) return Error.CodeBufferExhausted;
             self.code[self.code_len] = inst;
             self.code_len += 1;
         }
 
-        fn emitPlaceholder(self: *Self) u32 {
+        fn emitPlaceholder(self: *Self) Error!u32 {
             const addr = self.code_len;
-            self.emit(.{ .op = .jump, .data = .{ .offset = 0 } });
+            try self.emit(.{ .op = .jump, .data = .{ .offset = 0 } });
             return addr;
         }
 

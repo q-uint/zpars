@@ -440,6 +440,8 @@ pub fn generate(
 }
 
 pub fn compile(self: anytype) !void {
+    if (I.containsRecoveryOps(self.code)) return error.JitDoesNotSupportRecovery;
+
     const config = @TypeOf(self.*).jit_config;
     const est = estimateSize(config, self.code.len);
     const size = std.mem.alignForward(usize, est, page_size);
@@ -846,5 +848,9 @@ fn emitInst(
             }
             // capture_events off: no-op (tree mode requires events on).
         },
+        // Recovery opcodes are VM-only for now. `compile` rejects any
+        // grammar carrying these with `error.JitDoesNotSupportRecovery`,
+        // so reaching here would mean the gate was bypassed.
+        .event_error_open, .event_error_close, .event_missing, .throw, .lcatch => unreachable,
     }
 }

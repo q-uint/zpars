@@ -51,6 +51,36 @@ pub fn appendSave(state: *State, slot: u16, pos: u32) std.mem.Allocator.Error!u3
     return pre_len;
 }
 
+/// Append a recovery-era event of one of the labeled variants. Same
+/// shape as `appendSave`: returns the pre-append length so the caller
+/// can stash it in an undo frame. `error_open` / `error_close` /
+/// `missing` are emitted explicitly by recovery handlers in compiled
+/// grammars; `partial_close` is synthesized by the throw unwinder when
+/// it walks past unclosed `open`s on its way to the matching `lcatch`.
+pub fn appendErrorOpen(state: *State, label: u16, pos: u32) std.mem.Allocator.Error!u32 {
+    const pre_len: u32 = @intCast(state.list.items.len);
+    try state.list.append(state.allocator, .{ .error_open = .{ .group_id = label, .pos = pos } });
+    return pre_len;
+}
+
+pub fn appendErrorClose(state: *State, label: u16, pos: u32) std.mem.Allocator.Error!u32 {
+    const pre_len: u32 = @intCast(state.list.items.len);
+    try state.list.append(state.allocator, .{ .error_close = .{ .group_id = label, .pos = pos } });
+    return pre_len;
+}
+
+pub fn appendMissing(state: *State, label: u16, pos: u32) std.mem.Allocator.Error!u32 {
+    const pre_len: u32 = @intCast(state.list.items.len);
+    try state.list.append(state.allocator, .{ .missing = .{ .group_id = label, .pos = pos } });
+    return pre_len;
+}
+
+pub fn appendPartialClose(state: *State, group_id: u16, pos: u32) std.mem.Allocator.Error!u32 {
+    const pre_len: u32 = @intCast(state.list.items.len);
+    try state.list.append(state.allocator, .{ .partial_close = .{ .group_id = group_id, .pos = pos } });
+    return pre_len;
+}
+
 /// Truncate the event log to `new_len`, dropping any events appended
 /// after the matching `save`. Called from the backtrack unwind.
 pub fn truncate(state: *State, new_len: u32) void {
@@ -70,6 +100,37 @@ pub fn helperAppendSave(
     pos: u64,
 ) callconv(.c) u64 {
     const pre_len = appendSave(state_ptr, @intCast(slot), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
+/// C-ABI wrappers for the recovery-era append helpers. Same OOM contract
+/// as `helperAppendSave`. `partial_close` has no JIT helper because it
+/// is only synthesized inside the interpreter's throw unwinder, and
+/// `throw` / `lcatch` are JIT-`unreachable` until a follow-up.
+pub fn helperAppendErrorOpen(
+    state_ptr: *State,
+    label: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendErrorOpen(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
+pub fn helperAppendErrorClose(
+    state_ptr: *State,
+    label: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendErrorClose(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
+pub fn helperAppendMissing(
+    state_ptr: *State,
+    label: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendMissing(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
     return pre_len;
 }
 
@@ -110,4 +171,28 @@ test "truncate: restores the length returned from an earlier append" {
     truncate(&state, pre);
 
     try testing.expectEqual(@as(usize, 1), state.items().len);
+}
+
+test "recovery helpers: each variant appends correctly and returns pre-len" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+
+    const pre_eo = try appendErrorOpen(&state, 7, 3);
+    const pre_ec = try appendErrorClose(&state, 7, 9);
+    const pre_pc = try appendPartialClose(&state, 1, 9);
+    const pre_m = try appendMissing(&state, 4, 9);
+
+    try testing.expectEqual(@as(u32, 0), pre_eo);
+    try testing.expectEqual(@as(u32, 1), pre_ec);
+    try testing.expectEqual(@as(u32, 2), pre_pc);
+    try testing.expectEqual(@as(u32, 3), pre_m);
+
+    const evs = state.items();
+    try testing.expectEqual(@as(usize, 4), evs.len);
+    try testing.expectEqual(@as(u16, 7), evs[0].error_open.group_id);
+    try testing.expectEqual(@as(u32, 3), evs[0].error_open.pos);
+    try testing.expectEqual(@as(u16, 7), evs[1].error_close.group_id);
+    try testing.expectEqual(@as(u16, 1), evs[2].partial_close.group_id);
+    try testing.expectEqual(@as(u16, 4), evs[3].missing.group_id);
+    try testing.expectEqual(@as(u32, 9), evs[3].missing.pos);
 }

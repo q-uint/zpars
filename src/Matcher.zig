@@ -321,6 +321,11 @@ pub fn MatcherWith(comptime config: Config) type {
                     return .{ .value = input[0..1], .rest = input[1..] };
                 },
                 .capture => |inner| self.matchNode(inner.*, input, depth + 1),
+                // Recovery is a runtime VM/JIT feature, not a Matcher
+                // feature - dynamic grammars run via Matcher don't have
+                // an event log. Reject these AST variants here; programs
+                // wanting recovery should use the VM path.
+                .throw_label, .lcatch, .missing_label => null,
             };
         }
 

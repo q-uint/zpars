@@ -282,23 +282,36 @@ fn runTree(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !vo
     var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
+    // The tree subcommand enables recovery directives (#@) for the PEG
+    // front-end so users can author grammars with labeled-failure
+    // recovery and see ERROR / MISSING / partial nodes in the output.
+    // Other formats (ABNF/BNF/ERE) do not have a recovery surface
+    // syntax and use their default parsers.
+    const RecoveryPegParser = zpars.peg.ParserWith(.{ .recovery = true });
+
     const rules = switch (detectFormat(filename.?)) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, source, filename.?, stderr)).rules,
         .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, source, filename.?, stderr)).rules,
-        .peg => (try parseGrammar(zpars.peg.Scanner, zpars.peg.Parser, source, filename.?, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, RecoveryPegParser, source, filename.?, stderr)).rules,
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
 
-    var compiler = zpars.vm.Compiler.compileOpts(rules, .{
+    var compiler = try zpars.vm.Compiler.compileOpts(rules, .{
         .memoize = packrat_enabled,
         .memoize_captures = packrat_enabled,
         .rules_as_captures = true,
     });
 
-    // Build a name slice indexed by rule_id for the tree printer.
+    // Build name slices indexed by rule_id and label_id for the tree
+    // printer. Labels are populated only when the grammar actually uses
+    // recovery directives; for plain grammars the labels slice is empty.
     var names_buf: [256][]const u8 = undefined;
     const names = names_buf[0..compiler.rule_count];
     for (0..compiler.rule_count) |i| names[i] = compiler.getRuleName(@intCast(i));
+
+    var labels_buf: [256][]const u8 = undefined;
+    const labels = labels_buf[0..compiler.label_count];
+    for (0..compiler.label_count) |i| labels[i] = compiler.getLabelName(@intCast(i));
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
@@ -349,10 +362,11 @@ fn runTree(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !vo
     };
     defer tree.deinit();
 
+    const tree_names: zpars.vm.CaptureTree.Names = .{ .rules = names, .labels = labels };
     if (json_output) {
-        try tree.writeJson(stdout, names);
+        try tree.writeJson(stdout, tree_names);
     } else {
-        try tree.writeSExp(stdout, names);
+        try tree.writeSExp(stdout, tree_names);
     }
     try stdout.writeByte('\n');
     try stdout.flush();
@@ -395,7 +409,7 @@ fn runVm(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
 
-    var compiler = zpars.vm.Compiler.compileOpts(rules, .{ .memoize = packrat_enabled });
+    var compiler = try zpars.vm.Compiler.compileOpts(rules, .{ .memoize = packrat_enabled });
     const code = compiler.getCode();
     const charsets = compiler.getCharsets();
     const string_data = compiler.getStringData();
@@ -484,7 +498,7 @@ fn runCompile(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) 
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, source, filename.?, stderr)).rules,
     };
 
-    var compiler = zpars.vm.Compiler.compile(rules);
+    var compiler = try zpars.vm.Compiler.compile(rules);
 
     var blob = try zpars.vm.Aot.compileToBlob(
         allocator,

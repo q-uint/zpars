@@ -60,6 +60,8 @@ pub fn compileToBlob(
     string_data: []const u8,
     capture_count: u16,
 ) !Blob {
+    if (I.containsRecoveryOps(code)) return error.JitDoesNotSupportRecovery;
+
     // AOT currently always compiles with the default JIT config; capture
     // events are not yet serialized into the blob format.
     const est = backend.estimateSize(.{}, code.len);
@@ -185,24 +187,24 @@ const EreParser = @import("../ere/Parser.zig").Parser;
 const PegScanner = @import("../peg/Scanner.zig").Scanner;
 const PegParser = @import("../peg/Parser.zig").Parser;
 
-fn compileEre(source: []const u8) Compiler {
+fn compileEre(source: []const u8) !Compiler {
     var scanner = EreScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
-fn compilePeg(source: []const u8) Compiler {
+fn compilePeg(source: []const u8) !Compiler {
     var scanner = PegScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = PegParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
 fn expectAotMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
-    var compiler = compileEre(source);
+    var compiler = try compileEre(source);
     var blob = try compileToBlob(
         testing.allocator,
         compiler.getCode(),
@@ -223,7 +225,7 @@ fn expectAotMatch(source: []const u8, input: []const u8, expected: ?usize) !void
 }
 
 fn expectAotPegMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
-    var compiler = compilePeg(source);
+    var compiler = try compilePeg(source);
     var blob = try compileToBlob(
         testing.allocator,
         compiler.getCode(),

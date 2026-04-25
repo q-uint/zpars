@@ -6,19 +6,39 @@
 <title>zpars - Grammar Validator</title>
 <style>
   :root {
-    --bg: #1e1e2e;
-    --fg: #cdd6f4;
-    --surface: #313244;
-    --overlay: #45475a;
-    --red: #f38ba8;
-    --green: #a6e3a1;
-    --yellow: #f9e2af;
-    --blue: #89b4fa;
-    --mauve: #cba6f7;
-    --teal: #94e2d5;
-    --text: #cdd6f4;
-    --subtext: #a6adc8;
-    --border: #585b70;
+    /* zpars "lilac dusk" - dark, warm violet-grey base with soft pastel accents */
+    --bg: #2a2640;
+    --fg: #e8e3f5;
+    --surface: #38334d;
+    --overlay: #6a6488;
+    --red: #f5b1c7;
+    --green: #b4dcb6;
+    --yellow: #f0dca6;
+    --blue: #a8c4f0;
+    --mauve: #d4b3f0;
+    --teal: #a6d9d4;
+    --peach: #f0c8a8;
+    --text: #e8e3f5;
+    --subtext: #b8b3d0;
+    --border: #5a5478;
+  }
+
+  :root[data-theme="light"] {
+    /* zpars "paper noon" - light, warm ivory base with deeper pastel accents */
+    --bg: #f5f2ed;
+    --fg: #4a4458;
+    --surface: #ebe7df;
+    --overlay: #9a9286;
+    --red: #c84a6a;
+    --green: #4a8e5c;
+    --yellow: #b88820;
+    --blue: #4078c0;
+    --mauve: #7e5cb8;
+    --teal: #3e8a82;
+    --peach: #c66c30;
+    --text: #4a4458;
+    --subtext: #6f6878;
+    --border: #d8d2c4;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -293,9 +313,104 @@
   .match-result.no-match {
     color: var(--red);
   }
+
+  .tree-section {
+    width: 100%;
+    max-width: 720px;
+    margin-top: 1.25rem;
+  }
+
+  .tree-section.hidden {
+    display: none;
+  }
+
+  .tree-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .tree-label {
+    font-size: 0.85rem;
+    color: var(--overlay);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .tree-output {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    padding: 0.75rem 1rem;
+    background: var(--surface);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0;
+    min-height: 2.5rem;
+  }
+
+  .tree-output:empty::before {
+    content: "—";
+    color: var(--overlay);
+  }
+
+  .tree-output .tree-error {
+    color: var(--red);
+  }
+
+  .tree-output .tree-missing {
+    color: var(--yellow);
+  }
+
+  .tree-output .tree-partial {
+    color: var(--peach, #fab387);
+    font-style: italic;
+  }
+
+  .tree-output .tree-span {
+    color: var(--overlay);
+  }
+
+  .tree-output .tree-label-text {
+    color: var(--mauve);
+  }
+
+  .tree-output.empty {
+    color: var(--overlay);
+  }
+
+  .theme-toggle {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    width: 2rem;
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 0.95rem;
+    line-height: 1;
+    padding: 0;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .theme-toggle:hover {
+    border-color: var(--mauve);
+  }
 </style>
 </head>
 <body>
+
+<button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme"></button>
 
 <h1>zpars</h1>
 <p class="subtitle">Grammar validation powered by Zig</p>
@@ -327,6 +442,13 @@
   <div class="match-result" id="match-result"></div>
 </div>
 
+<div class="tree-section hidden" id="tree-section">
+  <div class="tree-header">
+    <span class="tree-label">Parse tree</span>
+  </div>
+  <pre class="tree-output" id="tree-output"></pre>
+</div>
+
 <script>
 // Languages that support matching (have Validator + Matcher).
 const MATCHABLE = new Set(["abnf", "bnf", "peg", "ere"]);
@@ -334,6 +456,9 @@ const MATCHABLE = new Set(["abnf", "bnf", "peg", "ere"]);
 const NEEDS_RULE = new Set(["abnf", "bnf", "peg"]);
 // Languages that support formatting.
 const FORMATTABLE = new Set(["abnf", "bnf", "peg", "ere"]);
+// Languages that support the parse-tree view (rules-as-captures via the VM).
+// PEG is the only front-end with #@ recovery directives wired through.
+const TREEABLE = new Set(["peg"]);
 
 const LANGUAGES = {
   abnf: {
@@ -408,8 +533,8 @@ const LANGUAGES = {
     ],
     eofTag: 15,
     ruleNameTag: 0,
-    example: 'Expr   <- Term ("+" Term)*\nTerm   <- Factor ("*" Factor)*\nFactor <- "(" Expr ")" / [0-9]+\n',
-    matchExample: "1+2*3",
+    example: 'Program <- Stmt*\nStmt    <- Expr ";"\n         / Expr     #@ throw missing_semi\nExpr    <- [a-z]+\n\n#@ rule Stmt catches missing_semi -> recover_missing\n',
+    matchExample: "foo;bar",
   },
   cfg: {
     id: 3,
@@ -722,6 +847,7 @@ function updateMatch() {
   if (grammar.length === 0 || input.length === 0) {
     resultEl.textContent = "";
     resultEl.className = "match-result";
+    updateTree();
     return;
   }
 
@@ -734,6 +860,117 @@ function updateMatch() {
   } else {
     resultEl.textContent = `matched: ${result.value}`;
     resultEl.className = "match-result matched";
+  }
+
+  updateTree();
+}
+
+// Call wasm.tree(grammar, input). Returns the parsed JSON tree array,
+// null on grammar parse error / compile failure, or [] on no-match.
+function treeJson(grammar, input) {
+  if (!wasm || !wasm.tree) return null;
+  const g = wasmAllocString(grammar);
+  if (!g) return null;
+  const inp = wasmAllocString(input);
+  if (!inp) { if (g.len > 0) wasm.free(g.ptr, g.len); return null; }
+
+  const resultPtr = wasm.tree(g.ptr, g.len, inp.ptr, inp.len);
+  if (g.len > 0) wasm.free(g.ptr, g.len);
+  if (inp.len > 0) wasm.free(inp.ptr, inp.len);
+  if (resultPtr === 0) return null;
+
+  const view = new DataView(wasm.memory.buffer);
+  const jsonLen = view.getUint32(resultPtr, true);
+  let parsed = [];
+  if (jsonLen > 0) {
+    const jsonBytes = new Uint8Array(wasm.memory.buffer, resultPtr + 4, jsonLen);
+    const jsonStr = new TextDecoder().decode(jsonBytes);
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch {
+      parsed = null;
+    }
+  }
+  wasm.free(resultPtr, 4 + jsonLen);
+  return parsed;
+}
+
+// Render a single tree node (and its children, recursively) as
+// colored S-expression markup. Returns a DocumentFragment.
+function renderTreeNode(node, depth) {
+  const indent = "  ".repeat(depth);
+  const frag = document.createDocumentFragment();
+  if (depth > 0) frag.appendChild(document.createTextNode("\n"));
+  frag.appendChild(document.createTextNode(indent + "("));
+
+  const head = document.createElement("span");
+  if (node.type === "ERROR" || node.type === "MISSING") {
+    head.className = node.type === "ERROR" ? "tree-error" : "tree-missing";
+    head.textContent = node.type;
+  } else if (node.partial) {
+    head.className = "tree-partial";
+    head.textContent = node.type;
+  } else {
+    head.textContent = node.type;
+  }
+  frag.appendChild(head);
+
+  const span = document.createElement("span");
+  span.className = "tree-span";
+  span.textContent = ` [${node.span[0]},${node.span[1]}]`;
+  frag.appendChild(span);
+
+  if (node.partial) {
+    const tag = document.createElement("span");
+    tag.className = "tree-partial";
+    tag.textContent = " partial";
+    frag.appendChild(tag);
+  }
+  if (node.label) {
+    const lbl = document.createElement("span");
+    lbl.className = "tree-label-text";
+    lbl.textContent = " " + node.label;
+    frag.appendChild(lbl);
+  }
+  if (node.children && node.children.length > 0) {
+    for (const child of node.children) {
+      frag.appendChild(renderTreeNode(child, depth + 1));
+    }
+  }
+  frag.appendChild(document.createTextNode(")"));
+  return frag;
+}
+
+function updateTree() {
+  const treeEl = document.getElementById("tree-output");
+  if (!TREEABLE.has(currentLang)) {
+    treeEl.textContent = "";
+    return;
+  }
+
+  const grammar = editor.value;
+  const input = matchInput.value;
+  if (grammar.length === 0) {
+    treeEl.textContent = "";
+    return;
+  }
+
+  const tree = treeJson(grammar, input);
+  treeEl.textContent = "";
+  if (tree === null) {
+    treeEl.textContent = "(grammar did not compile)";
+    treeEl.classList.add("empty");
+    return;
+  }
+  if (tree.length === 0) {
+    treeEl.textContent = input.length === 0 ? "" : "(no match)";
+    treeEl.classList.add("empty");
+    return;
+  }
+  treeEl.classList.remove("empty");
+  for (let i = 0; i < tree.length; i++) {
+    if (i > 0) treeEl.appendChild(document.createTextNode("\n"));
+    treeEl.appendChild(renderTreeNode(tree[i], 0));
   }
 }
 
@@ -752,6 +989,7 @@ function selectLang(name) {
   ruleInput.value = "";
   matchInput.value = lang.matchExample || "";
   formatBtn.classList.toggle("hidden", !FORMATTABLE.has(name));
+  treeSection.classList.toggle("hidden", !TREEABLE.has(name));
 
   update();
 }
@@ -773,6 +1011,7 @@ const matchSection = document.getElementById("match-section");
 const matchInput = document.getElementById("match-input");
 const ruleInput = document.getElementById("rule-input");
 const formatBtn = document.getElementById("format-btn");
+const treeSection = document.getElementById("tree-section");
 
 editor.addEventListener("input", update);
 matchInput.addEventListener("input", updateMatch);
@@ -792,6 +1031,25 @@ loadWasm().then(exports => {
 }).catch(err => {
   document.getElementById("status").textContent = "Failed to load WASM: " + err;
   document.getElementById("status").className = "status has-errors";
+});
+
+// Theme toggle: persist choice in localStorage; default to system preference.
+const themeToggle = document.getElementById("theme-toggle");
+const SUN_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+const MOON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  // Show the icon for the mode the toggle WILL switch TO (so users know
+  // what clicking it does): sun glyph in dark mode, moon glyph in light.
+  themeToggle.innerHTML = theme === "light" ? MOON_SVG : SUN_SVG;
+}
+const storedTheme = localStorage.getItem("zpars-theme");
+const systemPrefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+applyTheme(storedTheme || (systemPrefersLight ? "light" : "dark"));
+themeToggle.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  applyTheme(next);
+  localStorage.setItem("zpars-theme", next);
 });
 </script>
 <footer style="text-align:center;padding:2rem 0 1rem;color:var(--overlay)">

@@ -16,6 +16,7 @@ const Ast = @import("../Ast.zig");
 const Diagnostic = @import("Diagnostic.zig").Diagnostic;
 const parser_base = @import("../parser.zig");
 const Pool = @import("../pool.zig").Pool;
+const char_flags = @import("../char_flags.zig");
 
 pub const Config = struct {
     max_rules: usize = 256,
@@ -23,6 +24,21 @@ pub const Config = struct {
     max_ranges: usize = 1024,
     max_bytes: usize = 1024,
     max_diagnostics: usize = 64,
+    /// When true, line comments starting with `#@` are interpreted as
+    /// recovery directives (`#@ throw <label>`, `#@ rule <name> catches
+    /// <label> -> <handler>`, `#@ labels: ...`). When false (default),
+    /// `#@` comments are treated as ordinary PEG comments with no
+    /// recovery semantics - matching how every other PEG implementation
+    /// reads such files. Gating preserves backwards compatibility for
+    /// the common (no-recovery) case and avoids the directive tables'
+    /// stack footprint when unused.
+    recovery: bool = false,
+    /// Maximum number of `#@ throw` directives in a single file. Only
+    /// allocated when `recovery` is true.
+    max_throw_dirs: usize = 128,
+    /// Maximum number of `#@ rule ... catches ...` directives in a
+    /// single file. Only allocated when `recovery` is true.
+    max_catch_dirs: usize = 128,
 };
 
 pub const Parser = ParserWith(.{});
@@ -65,6 +81,38 @@ pub fn ParserWith(comptime config: Config) type {
         /// Accumulated parse diagnostics.
         diagnostics: Pool(Diagnostic, config.max_diagnostics) = .{},
 
+        /// `#@ throw <label>` directives, collected from comment tokens
+        /// in `parse()` before any rule is parsed. Each entry records the
+        /// label name and the index of the comment token in
+        /// `self.tokens`, used to determine which alternative the
+        /// directive trails. Only allocated when `config.recovery`.
+        throw_dirs: if (config.recovery) [config.max_throw_dirs]ThrowDir else void =
+            if (config.recovery) undefined else {},
+        throw_dir_count: if (config.recovery) usize else void =
+            if (config.recovery) 0 else {},
+
+        /// `#@ rule <name> catches <label> -> <handler>` directives.
+        catch_dirs: if (config.recovery) [config.max_catch_dirs]CatchDir else void =
+            if (config.recovery) undefined else {},
+        catch_dir_count: if (config.recovery) usize else void =
+            if (config.recovery) 0 else {},
+
+        pub const ThrowDir = struct {
+            label: []const u8,
+            /// Index into `self.tokens`.
+            token_idx: usize,
+        };
+
+        pub const CatchDir = struct {
+            rule_name: []const u8,
+            label: []const u8,
+            /// When `is_recover_missing` is true, the handler is the
+            /// builtin `recover_missing` form and `handler_rule_name`
+            /// is empty.
+            handler_rule_name: []const u8,
+            is_recover_missing: bool,
+        };
+
         pub fn init(tokens: []const Token, source: []const u8) Self {
             return .{
                 .tokens = tokens,
@@ -74,6 +122,7 @@ pub fn ParserWith(comptime config: Config) type {
 
         /// Parse all definitions from the token stream.
         pub fn parse(self: *Self) ParseError![]const Ast.Rule {
+            if (config.recovery) self.collectDirectives();
             self.skipTrivia();
             while (self.peek().tag != .eof) {
                 const rule = self.parseDefinition() catch |err| switch (err) {
@@ -90,6 +139,177 @@ pub fn ParserWith(comptime config: Config) type {
             }
 
             return self.rules.slice();
+        }
+
+        /// Pre-pass over comment tokens to collect `#@` directives.
+        /// Plain `#`-comments are skipped silently. Comments that begin
+        /// with `#@` but fail the directive grammar, or that hit a
+        /// directive-table capacity limit, raise a diagnostic so the
+        /// dropped intent surfaces instead of degrading to "recovery
+        /// just doesn't fire" at runtime. Only invoked when
+        /// `config.recovery` is true.
+        fn collectDirectives(self: *Self) void {
+            for (self.tokens, 0..) |tok, i| {
+                if (tok.tag != .comment) continue;
+                const lex = tok.lexeme(self.source);
+                if (lex.len < 2 or lex[0] != '#' or lex[1] != '@') continue;
+                const dir = parseDirective(lex) orelse {
+                    self.fail(.directive_malformed, tok);
+                    continue;
+                };
+                switch (dir) {
+                    .throw_d => |label| {
+                        if (self.throw_dir_count >= self.throw_dirs.len) {
+                            self.fail(.directive_throw_overflow, tok);
+                            continue;
+                        }
+                        self.throw_dirs[self.throw_dir_count] = .{ .label = label, .token_idx = i };
+                        self.throw_dir_count += 1;
+                    },
+                    .catch_d => |c| {
+                        if (self.catch_dir_count >= self.catch_dirs.len) {
+                            self.fail(.directive_catch_overflow, tok);
+                            continue;
+                        }
+                        self.catch_dirs[self.catch_dir_count] = c;
+                        self.catch_dir_count += 1;
+                    },
+                    .labels_d => {
+                        // Recognized but not enforced. Accepted silently
+                        // so that grammars carrying `#@ labels: ...` for
+                        // future enforcement aren't flagged as broken;
+                        // surface a diagnostic only once enforcement
+                        // exists to back it up.
+                    },
+                }
+            }
+        }
+
+        const Directive = union(enum) {
+            throw_d: []const u8,
+            catch_d: CatchDir,
+            labels_d: void,
+        };
+
+        /// Parse one directive from the comment text. The text starts
+        /// with `#`; a leading `#@` (with optional spacing) introduces
+        /// a directive. Recognized forms:
+        ///   `#@ throw <label>`
+        ///   `#@ rule <name> catches <label> -> <handler>`
+        ///       where <handler> is `recover_missing` or a rule name
+        ///   `#@ labels: <label> (',' <label>)*`
+        /// Returns null for plain comments and for malformed directives.
+        fn parseDirective(text: []const u8) ?Directive {
+            if (text.len < 2 or text[0] != '#' or text[1] != '@') return null;
+            var p: usize = 2;
+            skipSp(text, &p);
+            if (consumeWord(text, &p, "throw")) {
+                if (!skipSpRequired(text, &p)) return null;
+                const label = parseIdent(text, &p) orelse return null;
+                skipSp(text, &p);
+                if (p != text.len) return null;
+                return .{ .throw_d = label };
+            }
+            if (consumeWord(text, &p, "rule")) {
+                if (!skipSpRequired(text, &p)) return null;
+                const rule_name = parseIdent(text, &p) orelse return null;
+                if (!skipSpRequired(text, &p)) return null;
+                if (!consumeWord(text, &p, "catches")) return null;
+                if (!skipSpRequired(text, &p)) return null;
+                const label = parseIdent(text, &p) orelse return null;
+                if (!skipSpRequired(text, &p)) return null;
+                if (p + 1 >= text.len or text[p] != '-' or text[p + 1] != '>') return null;
+                p += 2;
+                if (!skipSpRequired(text, &p)) return null;
+                // Handler: 'recover_missing' !IdentCont / rule_name. The
+                // word-boundary check is enforced by consumeWord, so a
+                // false return there leaves p untouched and the rule_name
+                // path can take over.
+                if (consumeWord(text, &p, "recover_missing")) {
+                    skipSp(text, &p);
+                    if (p != text.len) return null;
+                    return .{ .catch_d = .{
+                        .rule_name = rule_name,
+                        .label = label,
+                        .handler_rule_name = "",
+                        .is_recover_missing = true,
+                    } };
+                }
+                const handler_rule = parseIdent(text, &p) orelse return null;
+                skipSp(text, &p);
+                if (p != text.len) return null;
+                return .{ .catch_d = .{
+                    .rule_name = rule_name,
+                    .label = label,
+                    .handler_rule_name = handler_rule,
+                    .is_recover_missing = false,
+                } };
+            }
+            if (consumeWord(text, &p, "labels")) {
+                // Label sets aren't enforced, but reject garbage after
+                // the keyword so typos surface as `directive_malformed`
+                // instead of being silently swallowed. Allowed trailing
+                // form: optional ':' then any mix of whitespace, commas,
+                // and identifiers.
+                if (p < text.len and text[p] == ':') p += 1;
+                while (p < text.len) {
+                    const c = text[p];
+                    if (c == ' ' or c == '\t' or c == ',') {
+                        p += 1;
+                    } else if (char_flags.isIdentStart(c)) {
+                        _ = parseIdent(text, &p);
+                    } else return null;
+                }
+                return .{ .labels_d = {} };
+            }
+            return null;
+        }
+
+        fn skipSp(text: []const u8, p: *usize) void {
+            while (p.* < text.len and (text[p.*] == ' ' or text[p.*] == '\t')) : (p.* += 1) {}
+        }
+
+        fn skipSpRequired(text: []const u8, p: *usize) bool {
+            const before = p.*;
+            skipSp(text, p);
+            return p.* > before;
+        }
+
+        fn parseIdent(text: []const u8, p: *usize) ?[]const u8 {
+            if (p.* >= text.len or !char_flags.isIdentStart(text[p.*])) return null;
+            const start = p.*;
+            p.* += 1;
+            while (p.* < text.len and char_flags.isIdentCont(text[p.*])) : (p.* += 1) {}
+            return text[start..p.*];
+        }
+
+        fn consumeWord(text: []const u8, p: *usize, word: []const u8) bool {
+            if (p.* + word.len > text.len) return false;
+            if (!std.mem.eql(u8, text[p.* .. p.* + word.len], word)) return false;
+            const after = p.* + word.len;
+            if (after < text.len and char_flags.isIdentCont(text[after])) return false;
+            p.* = after;
+            return true;
+        }
+
+        /// Find the throw label (if any) attached to the trivia range
+        /// `[from, to)` in `self.tokens`. Only one throw per range is
+        /// recognized; the spec disallows more.
+        fn throwInRange(self: *const Self, from: usize, to: usize) ?[]const u8 {
+            if (!config.recovery) return null;
+            for (self.throw_dirs[0..self.throw_dir_count]) |td| {
+                if (td.token_idx >= from and td.token_idx < to) return td.label;
+            }
+            return null;
+        }
+
+        /// Look up a catch directive for the given rule name.
+        fn lookupCatch(self: *const Self, name: []const u8) ?CatchDir {
+            if (!config.recovery) return null;
+            for (self.catch_dirs[0..self.catch_dir_count]) |cd| {
+                if (std.mem.eql(u8, cd.rule_name, name)) return cd;
+            }
+            return null;
         }
 
         pub fn getDiagnostics(self: *const Self) []const Diagnostic {
@@ -123,7 +343,24 @@ pub fn ParserWith(comptime config: Config) type {
                 self.fail(.expression, self.peek());
                 return error.SyntaxError;
             }
-            return .{ .name = name, .node = node, .incremental = false };
+            const wrapped = if (config.recovery) self.applyCatch(name, node) else node;
+            return .{ .name = name, .node = wrapped, .incremental = false };
+        }
+
+        /// If a `#@ rule <name> catches ...` directive targets `name`,
+        /// wrap `body` in an `lcatch` node. Otherwise return `body`
+        /// unchanged.
+        fn applyCatch(self: *Self, name: []const u8, body: Ast.Node) Ast.Node {
+            const cd = self.lookupCatch(name) orelse return body;
+            const handler_node: Ast.Node = if (cd.is_recover_missing)
+                .{ .missing_label = cd.label }
+            else
+                .{ .rulename = cd.handler_rule_name };
+            return .{ .lcatch = .{
+                .label = cd.label,
+                .body = self.nodes.addOne(body),
+                .handler = self.nodes.addOne(handler_node),
+            } };
         }
 
         /// True when the current position marks the end of a definition body:
@@ -160,11 +397,34 @@ pub fn ParserWith(comptime config: Config) type {
         fn parseSequence(self: *Self) ParseError!Ast.Node {
             var buf: [256]Ast.Node = undefined;
             var count: usize = 0;
+            // The trivia range immediately after the most recent prefix.
+            // After the loop exits, this range is the trailing trivia of
+            // the sequence, where a `#@ throw` directive may attach.
+            var last_trivia_from: usize = self.pos;
+            var last_trivia_to: usize = self.pos;
 
             while (self.isAtPrefix()) {
                 buf[count] = try self.parsePrefix();
                 count += 1;
+                last_trivia_from = self.pos;
                 self.skipTrivia();
+                last_trivia_to = self.pos;
+            }
+
+            // If a #@ throw directive sits in the trailing trivia of the
+            // last prefix, append a throw_label node to the sequence.
+            // Mid-sequence directives (between prefixes that were
+            // followed by more prefixes) are silently ignored - the
+            // spec requires the directive to trail a *complete*
+            // alternative.
+            if (config.recovery) {
+                if (count > 0) {
+                    if (self.throwInRange(last_trivia_from, last_trivia_to)) |label| {
+                        if (count >= buf.len) return error.Overflow;
+                        buf[count] = .{ .throw_label = label };
+                        count += 1;
+                    }
+                }
             }
 
             if (count == 0) {
@@ -624,4 +884,225 @@ test "Char rule multi-line" {
         \\     / !'\\' .
     );
     try std.testing.expectEqual(1, result.rules.len);
+}
+
+const RecoveryParser = ParserWith(.{ .recovery = true });
+
+fn parseRecoverySource(source: []const u8) RecoveryParser.ParseError!struct { parser: RecoveryParser, rules: []const Ast.Rule } {
+    var scanner = Scanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryParser.init(tokens, source);
+    const rules = try parser.parse();
+    if (parser.diagnostics.count != 0) return error.SyntaxError;
+    return .{ .parser = parser, .rules = rules };
+}
+
+test "directive: #@ comments are plain comments when recovery=false" {
+    // Default Parser does not recognize #@, so the AST is unchanged.
+    const result = try parseSource(
+        \\A <- 'a'   #@ throw missing_a
+    );
+    try std.testing.expectEqual(1, result.rules.len);
+    // The body should be just a literal, no throw_label appended.
+    try std.testing.expectEqualStrings("a", result.rules[0].node.char_val.value);
+}
+
+test "directive: #@ throw appends throw_label to alternative" {
+    const result = try parseRecoverySource(
+        \\A <- 'a' #@ throw missing_a
+    );
+    try std.testing.expectEqual(1, result.rules.len);
+    // Body becomes a concatenation of [literal 'a', throw_label "missing_a"].
+    const cat = result.rules[0].node.concatenation;
+    try std.testing.expectEqual(@as(usize, 2), cat.len);
+    try std.testing.expectEqualStrings("a", cat[0].char_val.value);
+    try std.testing.expectEqualStrings("missing_a", cat[1].throw_label);
+}
+
+test "directive: #@ throw on its own trailing line still attaches" {
+    const result = try parseRecoverySource(
+        \\A <- 'a'
+        \\     #@ throw L
+    );
+    try std.testing.expectEqual(1, result.rules.len);
+    const cat = result.rules[0].node.concatenation;
+    try std.testing.expectEqual(@as(usize, 2), cat.len);
+    try std.testing.expectEqualStrings("L", cat[1].throw_label);
+}
+
+test "directive: #@ throw attaches to specific alternative in /-list" {
+    // The throw should attach to the SECOND alternative only.
+    const result = try parseRecoverySource(
+        \\A <- 'a'
+        \\   / 'b' #@ throw L
+        \\   / 'c'
+    );
+    const alts = result.rules[0].node.alternation;
+    try std.testing.expectEqual(@as(usize, 3), alts.len);
+    // alt 0: just 'a'
+    try std.testing.expectEqualStrings("a", alts[0].char_val.value);
+    // alt 1: 'b' then throw L
+    const cat = alts[1].concatenation;
+    try std.testing.expectEqual(@as(usize, 2), cat.len);
+    try std.testing.expectEqualStrings("b", cat[0].char_val.value);
+    try std.testing.expectEqualStrings("L", cat[1].throw_label);
+    // alt 2: just 'c'
+    try std.testing.expectEqualStrings("c", alts[2].char_val.value);
+}
+
+test "directive: #@ rule ... catches ... -> recover_missing wraps body in lcatch" {
+    const result = try parseRecoverySource(
+        \\#@ rule A catches L -> recover_missing
+        \\A <- 'a' #@ throw L
+    );
+    try std.testing.expectEqual(1, result.rules.len);
+    const lcatch = result.rules[0].node.lcatch;
+    try std.testing.expectEqualStrings("L", lcatch.label);
+    // handler is missing_label "L" (the recover_missing builtin form).
+    try std.testing.expectEqualStrings("L", lcatch.handler.missing_label);
+    // body is the original concatenation.
+    const cat = lcatch.body.concatenation;
+    try std.testing.expectEqual(@as(usize, 2), cat.len);
+    try std.testing.expectEqualStrings("L", cat[1].throw_label);
+}
+
+test "directive: #@ rule ... catches ... -> rule_name wraps with rule handler" {
+    const result = try parseRecoverySource(
+        \\#@ rule A catches L -> recover
+        \\A <- 'a' #@ throw L
+        \\recover <- 'x'
+    );
+    try std.testing.expectEqual(2, result.rules.len);
+    const a_rule = result.rules[0];
+    try std.testing.expectEqualStrings("A", a_rule.name);
+    const lcatch = a_rule.node.lcatch;
+    try std.testing.expectEqualStrings("L", lcatch.label);
+    // handler is rulename "recover".
+    try std.testing.expectEqualStrings("recover", lcatch.handler.rulename);
+}
+
+test "directive: malformed directive emits diagnostic" {
+    // `#@ throw` without a label is malformed; the rule still parses
+    // (the AST is unaffected because the directive is dropped) but a
+    // diagnostic surfaces so the user can tell their directive was
+    // not applied.
+    var scanner = Scanner.init("A <- 'a'   #@ trow missing_a");
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryParser.init(tokens, "A <- 'a'   #@ trow missing_a");
+    const rules = try parser.parse();
+    try std.testing.expectEqual(1, rules.len);
+    try std.testing.expectEqualStrings("a", rules[0].node.char_val.value);
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_malformed, diags[0].expected);
+}
+
+test "directive: plain # comments do not emit directive diagnostics" {
+    // Only `#@`-prefixed comments are treated as directives. A bare
+    // `# foo` comment must not raise a malformed-directive diagnostic.
+    const result = try parseRecoverySource(
+        \\# regular comment
+        \\A <- 'a'
+    );
+    try std.testing.expectEqual(1, result.rules.len);
+}
+
+test "directive: #@ rule ... catches ... can sit anywhere" {
+    // The catch directive may appear after the rule it targets.
+    const result = try parseRecoverySource(
+        \\A <- 'a' #@ throw L
+        \\#@ rule A catches L -> recover_missing
+    );
+    try std.testing.expectEqual(1, result.rules.len);
+    const lcatch = result.rules[0].node.lcatch;
+    try std.testing.expectEqualStrings("L", lcatch.label);
+    try std.testing.expect(lcatch.handler.* == .missing_label);
+}
+
+test "directive: #@ labels declarations are accepted silently" {
+    // `#@ labels: ...` is recognized syntactically but not enforced.
+    // Until enforcement exists, a clean grammar using the directive
+    // must not raise a diagnostic - the only diagnostic surface is
+    // hard errors, so flagging every labels line would treat correct
+    // grammars as broken.
+    var scanner = Scanner.init("#@ labels: a, b, c\nA <- 'a'");
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryParser.init(tokens, "#@ labels: a, b, c\nA <- 'a'");
+    const rules = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqual(@as(usize, 0), parser.getDiagnostics().len);
+}
+
+test "directive: keyword glued to identifier reports malformed, not unsupported" {
+    // `#@ labelsxyz` must not be interpreted as a labels directive: the
+    // word-boundary check inside consumeWord makes it fall through to
+    // `directive_malformed` so the user notices the typo.
+    const src = "#@ labelsxyz\nA <- 'a'";
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryParser.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_malformed, diags[0].expected);
+}
+
+test "directive: throw keyword glued to identifier reports malformed" {
+    // Mirror of the labels case: `#@ throwfoo bar` must be rejected as
+    // malformed rather than treated as `throw` with a stray suffix.
+    const src = "A <- 'a' #@ throwfoo bar";
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryParser.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_malformed, diags[0].expected);
+}
+
+test "directive: #@ labels followed by non-list garbage is malformed" {
+    // Trailing content after `labels` must look like a (possibly empty)
+    // ident list — anything else surfaces as `directive_malformed`.
+    const src = "#@ labels @@!!\nA <- 'a'";
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RecoveryParser.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_malformed, diags[0].expected);
+}
+
+test "directive: throw overflow emits diagnostic" {
+    // Configure a parser that only accepts a single throw directive,
+    // then feed it two so the second triggers overflow.
+    const TinyThrow = ParserWith(.{ .recovery = true, .max_throw_dirs = 1 });
+    const src =
+        \\A <- 'a' #@ throw L1
+        \\B <- 'b' #@ throw L2
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = TinyThrow.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_throw_overflow, diags[0].expected);
+}
+
+test "directive: catch overflow emits diagnostic" {
+    const TinyCatch = ParserWith(.{ .recovery = true, .max_catch_dirs = 1 });
+    const src =
+        \\#@ rule A catches L -> recover_missing
+        \\#@ rule B catches L -> recover_missing
+        \\A <- 'a' #@ throw L
+        \\B <- 'b' #@ throw L
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = TinyCatch.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_catch_overflow, diags[0].expected);
 }

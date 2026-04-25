@@ -57,6 +57,11 @@ pub fn dump(self: *const Disassembler, writer: anytype) !void {
             .save => try writer.print("save    {d}\n", .{inst.data.slot}),
             .event_open => try writer.print("event_open  g{d}\n", .{inst.data.slot}),
             .event_close => try writer.print("event_close g{d}\n", .{inst.data.slot}),
+            .event_error_open => try writer.print("event_error_open  L{d}\n", .{inst.data.slot}),
+            .event_error_close => try writer.print("event_error_close L{d}\n", .{inst.data.slot}),
+            .event_missing => try writer.print("event_missing     L{d}\n", .{inst.data.slot}),
+            .throw => try writer.print("throw   L{d}\n", .{inst.data.slot}),
+            .lcatch => try writer.print("lcatch  L{d} -> {d}\n", .{ inst.data.catch_handler.label, inst.data.catch_handler.handler_pc }),
             .match => try writer.writeAll("match\n"),
         }
     }
@@ -107,7 +112,7 @@ test "disassemble literal" {
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, "abc");
     const rules = try parser.parse();
-    var compiler = Compiler.compile(rules);
+    var compiler = try Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
     var stream: std.Io.Writer = .fixed(&buf);
@@ -125,7 +130,7 @@ test "disassemble alternation" {
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, "a|b");
     const rules = try parser.parse();
-    var compiler = Compiler.compile(rules);
+    var compiler = try Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
     var stream: std.Io.Writer = .fixed(&buf);
@@ -146,7 +151,7 @@ test "disassemble star" {
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, "a*");
     const rules = try parser.parse();
-    var compiler = Compiler.compile(rules);
+    var compiler = try Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
     var stream: std.Io.Writer = .fixed(&buf);
@@ -166,7 +171,7 @@ test "disassemble charset" {
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, "[a-z]+");
     const rules = try parser.parse();
-    var compiler = Compiler.compile(rules);
+    var compiler = try Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
     var stream: std.Io.Writer = .fixed(&buf);
@@ -187,7 +192,7 @@ test "disassemble capture" {
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, "a(b)c");
     const rules = try parser.parse();
-    var compiler = Compiler.compile(rules);
+    var compiler = try Compiler.compile(rules);
 
     var buf: [1024]u8 = undefined;
     var stream: std.Io.Writer = .fixed(&buf);

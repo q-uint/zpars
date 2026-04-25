@@ -57,6 +57,21 @@ pub fn VmWith(comptime config: Config) type {
                 event_len: if (config.capture_events) u32 else void =
                     if (config.capture_events) 0 else {},
             },
+            /// Labeled-failure catch frame: pushed by `lcatch` when
+            /// capture_events recovery is in use. On a matching `throw`,
+            /// the unwinder stops here, synthesizes `partial_close`
+            /// events for unclosed opens above this frame, and transfers
+            /// control to `handler_pc` with `pos` left at the throw
+            /// site. Regular `fail` walks past this frame untouched, so
+            /// committed-choice semantics are preserved. `event_len` is
+            /// the events-log length at push time, used as the lower
+            /// bound for `synthesizePartialCloses`.
+            lcatch: struct {
+                label: u16,
+                handler_pc: u32,
+                event_len: if (config.capture_events) u32 else void =
+                    if (config.capture_events) 0 else {},
+            },
             /// Memo frame: pushed by `memo_call` on a table miss. Holds the
             /// information needed for (a) left-recursion detection via
             /// stack walking, (b) seed-growing re-entries, and (c) head
@@ -279,22 +294,54 @@ pub fn VmWith(comptime config: Config) type {
             const cached = self.memo_events.items[entry.events_start..][0..entry.events_count];
             for (cached) |ev| {
                 if (sp.* >= max_stack) return false;
-                const slot: u16 = switch (ev) {
-                    .open => |m| m.group_id << 1,
-                    .close => |m| (m.group_id << 1) | 1,
-                };
-                const ev_pos: u32 = switch (ev) {
-                    .open => |m| m.pos,
-                    .close => |m| m.pos,
-                };
-                const event_len = try events_mod.appendSave(state, slot, ev_pos);
-                stack[sp.*] = .{ .save = .{
-                    .slot = slot,
-                    .old = self.captures[slot],
-                    .event_len = event_len,
-                } };
-                sp.* += 1;
-                self.captures[slot] = ev_pos;
+                switch (ev) {
+                    .open => |m| {
+                        const slot: u16 = m.group_id << 1;
+                        const event_len = try events_mod.appendSave(state, slot, m.pos);
+                        stack[sp.*] = .{ .save = .{
+                            .slot = slot,
+                            .old = self.captures[slot],
+                            .event_len = event_len,
+                        } };
+                        sp.* += 1;
+                        self.captures[slot] = m.pos;
+                    },
+                    .close => |m| {
+                        const slot: u16 = (m.group_id << 1) | 1;
+                        const event_len = try events_mod.appendSave(state, slot, m.pos);
+                        stack[sp.*] = .{ .save = .{
+                            .slot = slot,
+                            .old = self.captures[slot],
+                            .event_len = event_len,
+                        } };
+                        sp.* += 1;
+                        self.captures[slot] = m.pos;
+                    },
+                    // Recovery-era variants don't write capture slots
+                    // (they're tree-only). An events-only undo frame is
+                    // sufficient: backtrack truncates the log back if
+                    // the caller of the memoized rule fails afterwards.
+                    .partial_close => |m| {
+                        const event_len = try events_mod.appendPartialClose(state, m.group_id, m.pos);
+                        stack[sp.*] = .{ .event = .{ .event_len = event_len } };
+                        sp.* += 1;
+                    },
+                    .error_open => |m| {
+                        const event_len = try events_mod.appendErrorOpen(state, m.group_id, m.pos);
+                        stack[sp.*] = .{ .event = .{ .event_len = event_len } };
+                        sp.* += 1;
+                    },
+                    .error_close => |m| {
+                        const event_len = try events_mod.appendErrorClose(state, m.group_id, m.pos);
+                        stack[sp.*] = .{ .event = .{ .event_len = event_len } };
+                        sp.* += 1;
+                    },
+                    .missing => |m| {
+                        const event_len = try events_mod.appendMissing(state, m.group_id, m.pos);
+                        stack[sp.*] = .{ .event = .{ .event_len = event_len } };
+                        sp.* += 1;
+                    },
+                }
             }
             return true;
         }
@@ -491,8 +538,17 @@ pub fn VmWith(comptime config: Config) type {
                         pc += 1;
                     },
                     .commit => {
-                        // Pop the backtrack entry (discard it) and jump.
-                        sp -= 1;
+                        // Discard the matching backtrack entry (.choice
+                        // or .lcatch) without disturbing any .save /
+                        // .event frames a rule call inside the alt body
+                        // pushed on top of it. Same shape as `.ret`'s
+                        // splice for .ret/.memo - the intervening
+                        // frames stay so the outer scope's backtrack
+                        // can still undo them if it later fails.
+                        // Only capture_events can land frames above the
+                        // matching .choice; without it, the top frame
+                        // is the choice itself, so a plain pop suffices.
+                        if (config.capture_events) spliceCtrlFrame(&stack, &sp) else sp -= 1;
                         pc = inst.data.offset;
                     },
                     .fail => {
@@ -500,8 +556,13 @@ pub fn VmWith(comptime config: Config) type {
                         return null;
                     },
                     .fail_twice => {
-                        // Pop one entry then fail.
-                        sp -= 1;
+                        // Predicate cut: discard the matching backtrack
+                        // entry, then fail again. Same splice as commit
+                        // so intervening event frames don't get popped
+                        // out of order (which would let the predicate
+                        // resume at the wrong choice and silently take
+                        // the wrong branch).
+                        if (config.capture_events) spliceCtrlFrame(&stack, &sp) else sp -= 1;
                         if (self.backtrack(&stack, &sp, &pc, &pos)) continue;
                         return null;
                     },
@@ -628,6 +689,7 @@ pub fn VmWith(comptime config: Config) type {
                             const tag = std.meta.activeTag(stack[ret_idx - 1]);
                             if (tag == .ret or tag == .memo) break;
                         }
+                        std.debug.assert(ret_idx > 0);
                         ret_idx -= 1;
                         const popped = stack[ret_idx];
                         var k: usize = ret_idx;
@@ -751,12 +813,84 @@ pub fn VmWith(comptime config: Config) type {
                         }
                         pc += 1;
                     },
+                    .event_error_open => {
+                        if (config.capture_events) {
+                            if (sp >= max_stack) return null;
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const event_len = try events_mod.appendErrorOpen(state, inst.data.slot, @intCast(pos));
+                            stack[sp] = .{ .event = .{ .event_len = event_len } };
+                            sp += 1;
+                        }
+                        pc += 1;
+                    },
+                    .event_error_close => {
+                        if (config.capture_events) {
+                            if (sp >= max_stack) return null;
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const event_len = try events_mod.appendErrorClose(state, inst.data.slot, @intCast(pos));
+                            stack[sp] = .{ .event = .{ .event_len = event_len } };
+                            sp += 1;
+                        }
+                        pc += 1;
+                    },
+                    .event_missing => {
+                        if (config.capture_events) {
+                            if (sp >= max_stack) return null;
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const event_len = try events_mod.appendMissing(state, inst.data.slot, @intCast(pos));
+                            stack[sp] = .{ .event = .{ .event_len = event_len } };
+                            sp += 1;
+                        }
+                        pc += 1;
+                    },
+                    .lcatch => {
+                        if (sp >= max_stack) return null;
+                        const ch = inst.data.catch_handler;
+                        if (config.capture_events) {
+                            stack[sp] = .{ .lcatch = .{
+                                .label = ch.label,
+                                .handler_pc = ch.handler_pc,
+                                .event_len = self.currentEventsLen(),
+                            } };
+                        } else {
+                            stack[sp] = .{ .lcatch = .{
+                                .label = ch.label,
+                                .handler_pc = ch.handler_pc,
+                            } };
+                        }
+                        sp += 1;
+                        pc += 1;
+                    },
+                    .throw => {
+                        if (try self.unwindThrow(&stack, &sp, &pc, &pos, inst.data.slot)) continue;
+                        return null;
+                    },
                     .match => {
                         return pos;
                     },
                 }
             }
             return null;
+        }
+
+        /// Find the most recent `.choice` or `.lcatch` frame and splice
+        /// it out of the stack, leaving any `.save` / `.event` / `.ret`
+        /// frames pushed on top of it intact. Used by `commit` and
+        /// `fail_twice` so a rule call inside an alt body (which leaves
+        /// event frames on top after returning) doesn't cause us to
+        /// pop the wrong frame and resume at the wrong control point.
+        /// Caller guarantees a matching frame exists.
+        fn spliceCtrlFrame(stack: *[max_stack]Entry, sp: *usize) void {
+            var idx = sp.*;
+            while (idx > 0) : (idx -= 1) {
+                const tag = std.meta.activeTag(stack[idx - 1]);
+                if (tag == .choice or tag == .lcatch) break;
+            }
+            std.debug.assert(idx > 0);
+            idx -= 1;
+            var k: usize = idx;
+            while (k + 1 < sp.*) : (k += 1) stack[k] = stack[k + 1];
+            sp.* -= 1;
         }
 
         fn backtrack(self: *Self, stack: *[max_stack]Entry, sp: *usize, pc: *u32, pos: *usize) bool {
@@ -782,6 +916,17 @@ pub fn VmWith(comptime config: Config) type {
                     .event => |e| {
                         if (config.capture_events) {
                             if (self.events) |*state| events_mod.truncate(state, e.event_len);
+                        }
+                    },
+                    .lcatch => |c| {
+                        // Regular `fail` walks past lcatch frames - they
+                        // only catch labeled failures. Truncate the
+                        // events log to the catch's pre-push length so
+                        // any events emitted inside the protected region
+                        // are dropped (consistent with the rest of the
+                        // backtrack rollback).
+                        if (config.capture_events) {
+                            if (self.events) |*state| events_mod.truncate(state, c.event_len);
                         }
                     },
                     .memo => |m| {
@@ -818,6 +963,97 @@ pub fn VmWith(comptime config: Config) type {
                 }
             }
             return false;
+        }
+
+        /// Sentinel label: an `lcatch` frame with `label == wildcard_label`
+        /// catches throws of any label.
+        pub const wildcard_label: u16 = std.math.maxInt(u16);
+
+        /// Labeled-failure unwind. Walks the stack downward, skipping
+        /// every frame except a matching `.lcatch`. Critically does NOT
+        /// roll back captures or events on `.save`/`.event`/`.memo`
+        /// frames - the throw policy preserves them, and the matching
+        /// `.lcatch` synthesizes `partial_close` events for any opens
+        /// left dangling above it. Returns true on a successful catch
+        /// (control transferred to the handler), false if no matching
+        /// catch was found (caller treats as a hard fail).
+        fn unwindThrow(
+            self: *Self,
+            stack: *[max_stack]Entry,
+            sp: *usize,
+            pc: *u32,
+            pos: *usize,
+            label: u16,
+        ) !bool {
+            while (sp.* > 0) {
+                sp.* -= 1;
+                switch (stack[sp.*]) {
+                    .lcatch => |c| {
+                        const matches = c.label == label or c.label == wildcard_label;
+                        if (!matches) continue;
+                        if (config.capture_events) {
+                            if (self.events) |*state| {
+                                try synthesizePartialCloses(state, c.event_len, @intCast(pos.*));
+                            }
+                        }
+                        if (self.trace) |t| {
+                            t.writer.print("      throw caught -> pc={d} pos={d}\n", .{ c.handler_pc, pos.* }) catch {};
+                        }
+                        pc.* = c.handler_pc;
+                        // pos stays at the throw site, by design.
+                        return true;
+                    },
+                    // Throw unwinds *past* every other frame without
+                    // rollback. Captures and events are preserved.
+                    else => continue,
+                }
+            }
+            return false;
+        }
+
+        /// Walk `events[catch_event_len..]` to find any `.open`s that
+        /// were not paired with a `.close` (or `.partial_close`) before
+        /// the throw site. For each such still-open frame, append a
+        /// `.partial_close` event at `throw_pos`, innermost-first, so
+        /// the captured-tree builder sees a balanced log with the
+        /// dangling rules tagged `.rule_partial`.
+        fn synthesizePartialCloses(
+            state: *events_mod.State,
+            catch_event_len: u32,
+            throw_pos: u32,
+        ) !void {
+            var open_stack: [max_stack]u16 = undefined;
+            var open_sp: usize = 0;
+
+            const live = state.list.items[catch_event_len..];
+            for (live) |ev| switch (ev) {
+                .open => |m| {
+                    // Capture nesting is bounded by call-stack depth, so
+                    // overflow here means we miscompiled the grammar.
+                    std.debug.assert(open_sp < max_stack);
+                    open_stack[open_sp] = m.group_id;
+                    open_sp += 1;
+                },
+                .close => |c| {
+                    // The live event log is balanced up to the throw site,
+                    // so a mismatch here is an invariant violation, not user error.
+                    std.debug.assert(open_sp > 0 and open_stack[open_sp - 1] == c.group_id);
+                    open_sp -= 1;
+                },
+                .partial_close => |c| {
+                    std.debug.assert(open_sp > 0 and open_stack[open_sp - 1] == c.group_id);
+                    open_sp -= 1;
+                },
+                // Diagnostic-only events: error_open/error_close are emitted by
+                // recovery handlers, which themselves can't throw, so they never
+                // appear inside an unwind window. `missing` is purely informational.
+                .error_open, .error_close, .missing => {},
+            };
+
+            while (open_sp > 0) {
+                open_sp -= 1;
+                _ = try events_mod.appendPartialClose(state, open_stack[open_sp], throw_pos);
+            }
         }
 
         /// Return the span for capture group `i`, or null if not captured.
@@ -964,6 +1200,11 @@ pub fn VmWith(comptime config: Config) type {
                 .save => w.print("save {d}", .{inst.data.slot}) catch {},
                 .event_open => w.print("event_open g{d}", .{inst.data.slot}) catch {},
                 .event_close => w.print("event_close g{d}", .{inst.data.slot}) catch {},
+                .event_error_open => w.print("event_error_open L{d}", .{inst.data.slot}) catch {},
+                .event_error_close => w.print("event_error_close L{d}", .{inst.data.slot}) catch {},
+                .event_missing => w.print("event_missing L{d}", .{inst.data.slot}) catch {},
+                .throw => w.print("throw L{d}", .{inst.data.slot}) catch {},
+                .lcatch => w.print("lcatch L{d} -> {d}", .{ inst.data.catch_handler.label, inst.data.catch_handler.handler_pc }) catch {},
                 .match => w.writeAll("match") catch {},
             }
             w.writeByte('\n') catch {};
@@ -978,31 +1219,31 @@ const EreParser = @import("../ere/Parser.zig").Parser;
 const PegScanner = @import("../peg/Scanner.zig").Scanner;
 const PegParser = @import("../peg/Parser.zig").Parser;
 
-fn compileEre(source: []const u8) Compiler {
+fn compileEre(source: []const u8) !Compiler {
     var scanner = EreScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = EreParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
-fn compilePeg(source: []const u8) Compiler {
+fn compilePeg(source: []const u8) !Compiler {
     var scanner = PegScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = PegParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compile(rules);
 }
 
 fn expectMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
-    var compiler = compileEre(source);
+    var compiler = try compileEre(source);
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
     const result = try vm.execute();
     try testing.expectEqual(expected, result);
 }
 
 fn expectPegMatch(source: []const u8, input: []const u8, expected: ?usize) !void {
-    var compiler = compilePeg(source);
+    var compiler = try compilePeg(source);
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
     const result = try vm.execute();
     try testing.expectEqual(expected, result);
@@ -1122,14 +1363,14 @@ test "peg: not predicate" {
 }
 
 test "capture: single group" {
-    var compiler = compileEre("a(bc)d");
+    var compiler = try compileEre("a(bc)d");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "abcd");
     try testing.expectEqual(@as(?usize, 4), try vm.execute());
     try testing.expectEqualStrings("bc", vm.getCaptureSlice(0).?);
 }
 
 test "capture: multiple groups" {
-    var compiler = compileEre("(a+)(b+)");
+    var compiler = try compileEre("(a+)(b+)");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaabb");
     try testing.expectEqual(@as(?usize, 5), try vm.execute());
     try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
@@ -1137,7 +1378,7 @@ test "capture: multiple groups" {
 }
 
 test "capture: alternation picks correct branch" {
-    var compiler = compileEre("(ab)|(cd)");
+    var compiler = try compileEre("(ab)|(cd)");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "cd");
     try testing.expectEqual(@as(?usize, 2), try vm.execute());
     // First group did not match.
@@ -1147,7 +1388,7 @@ test "capture: alternation picks correct branch" {
 }
 
 test "capture: nested groups" {
-    var compiler = compileEre("((a)(b))");
+    var compiler = try compileEre("((a)(b))");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "ab");
     try testing.expectEqual(@as(?usize, 2), try vm.execute());
     try testing.expectEqualStrings("ab", vm.getCaptureSlice(0).?);
@@ -1156,7 +1397,7 @@ test "capture: nested groups" {
 }
 
 test "capture: group with repetition" {
-    var compiler = compileEre("(a+)b");
+    var compiler = try compileEre("(a+)b");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaab");
     try testing.expectEqual(@as(?usize, 4), try vm.execute());
     try testing.expectEqualStrings("aaa", vm.getCaptureSlice(0).?);
@@ -1165,7 +1406,7 @@ test "capture: group with repetition" {
 test "capture: repeated capture is one group (POSIX)" {
     // `(a)+` must be a single group whose flat slot holds the last
     // match, not one fresh group per bytecode-level iteration.
-    var compiler = compileEre("(a)+");
+    var compiler = try compileEre("(a)+");
     try testing.expectEqual(@as(u16, 1), compiler.getCaptureCount());
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "aaa");
     try testing.expectEqual(@as(?usize, 3), try vm.execute());
@@ -1174,23 +1415,23 @@ test "capture: repeated capture is one group (POSIX)" {
 }
 
 test "capture: bounded repetition of capture is one group" {
-    var compiler = compileEre("(ab){2,3}");
+    var compiler = try compileEre("(ab){2,3}");
     try testing.expectEqual(@as(u16, 1), compiler.getCaptureCount());
 }
 
 test "capture: no match clears captures" {
-    var compiler = compileEre("(a)b");
+    var compiler = try compileEre("(a)b");
     var vm = Vm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "ac");
     try testing.expectEqual(@as(?usize, null), try vm.execute());
     // Capture should be null after failed match (undone by backtrack).
     try testing.expectEqual(@as(?Vm.Span, null), vm.getCapture(0));
 }
 
-fn compilePegOpts(source: []const u8, opts: Compiler.Options) Compiler {
+fn compilePegOpts(source: []const u8, opts: Compiler.Options) !Compiler {
     var scanner = PegScanner.init(source);
     const tokens = scanner.scanTokens();
     var parser = PegParser.init(tokens, source);
-    const rules = parser.parse() catch return Compiler{};
+    const rules = try parser.parse();
     return Compiler.compileOpts(rules, opts);
 }
 
@@ -1202,11 +1443,11 @@ test "packrat: same result as non-packrat on simple grammar" {
     ;
     const input = "hello world";
 
-    var plain = compilePegOpts(src, .{ .memoize = false });
+    var plain = try compilePegOpts(src, .{ .memoize = false });
     var vm_plain = Vm.init(plain.getCode(), plain.getCharsets(), plain.getStringData(), input);
     const r_plain = try vm_plain.execute();
 
-    var memo = compilePegOpts(src, .{ .memoize = true });
+    var memo = try compilePegOpts(src, .{ .memoize = true });
     var vm_memo = try Vm.initPackrat(
         testing.allocator,
         memo.getCode(),
@@ -1229,7 +1470,7 @@ test "packrat: rewrites rule callsites into memo_call" {
         \\A    <- "a"
         \\B    <- "b"
     ;
-    var c = compilePegOpts(src, .{ .memoize = true });
+    var c = try compilePegOpts(src, .{ .memoize = true });
     try testing.expectEqual(@as(u16, 3), c.getMemoRuleCount());
 
     var call_count: usize = 0;
@@ -1253,11 +1494,11 @@ test "packrat: redundant rule re-entry is cached" {
     ;
     const input = "abcd?";
 
-    var plain = compilePegOpts(src, .{ .memoize = false });
+    var plain = try compilePegOpts(src, .{ .memoize = false });
     var vm_plain = Vm.init(plain.getCode(), plain.getCharsets(), plain.getStringData(), input);
     const r_plain = try vm_plain.execute();
 
-    var memo = compilePegOpts(src, .{ .memoize = true });
+    var memo = try compilePegOpts(src, .{ .memoize = true });
     var vm_memo = try Vm.initPackrat(
         testing.allocator,
         memo.getCode(),
@@ -1285,11 +1526,11 @@ test "packrat: failure memoization" {
     ;
     const input = "abqy";
 
-    var plain = compilePegOpts(src, .{ .memoize = false });
+    var plain = try compilePegOpts(src, .{ .memoize = false });
     var vm_plain = Vm.init(plain.getCode(), plain.getCharsets(), plain.getStringData(), input);
     const r_plain = try vm_plain.execute();
 
-    var memo = compilePegOpts(src, .{ .memoize = true });
+    var memo = try compilePegOpts(src, .{ .memoize = true });
     var vm_memo = try Vm.initPackrat(
         testing.allocator,
         memo.getCode(),
@@ -1307,7 +1548,7 @@ test "packrat: failure memoization" {
 }
 
 fn runPackrat(src: []const u8, input: []const u8) !?usize {
-    var c = compilePegOpts(src, .{ .memoize = true });
+    var c = try compilePegOpts(src, .{ .memoize = true });
     var vm = try Vm.initPackrat(
         testing.allocator,
         c.getCode(),
@@ -1400,7 +1641,7 @@ test "rules_as_captures: PEG grammar produces a tree mirroring the call hierarch
         \\Expr <- Term ("+" Term)*
         \\Term <- [0-9]+
     ;
-    var c = compilePegOpts(src, .{ .rules_as_captures = true });
+    var c = try compilePegOpts(src, .{ .rules_as_captures = true });
     const Cfg = VmWith(.{ .capture_events = true });
     var vm = Cfg.initEvents(
         testing.allocator,
@@ -1475,8 +1716,15 @@ test "packrat + captures: memoized rule replays events on cache hit" {
 const EventVm = VmWith(.{ .capture_events = true });
 const CaptureTreeMod = @import("CaptureTree.zig");
 
+// Recovery tests live in their own file (programmatic-AST end-to-end
+// scenarios for labeled failures, partial_close synthesis, ERROR /
+// MISSING node mapping).
+comptime {
+    _ = @import("recovery_test.zig");
+}
+
 test "capture events: flat single group" {
-    var compiler = compileEre("a(bc)d");
+    var compiler = try compileEre("a(bc)d");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1497,7 +1745,7 @@ test "capture events: flat single group" {
 }
 
 test "capture events: tree with nested groups" {
-    var compiler = compileEre("((a)(b))");
+    var compiler = try compileEre("((a)(b))");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1526,7 +1774,7 @@ test "capture events: repetition yields sibling nodes" {
     // Non-obvious: the flat-slot API only retains the LAST (a) match, but
     // the event stream preserves every successful iteration so the tree
     // shows all three.
-    var compiler = compileEre("(a)(a)(a)");
+    var compiler = try compileEre("(a)(a)(a)");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1547,7 +1795,7 @@ test "capture events: repetition yields sibling nodes" {
 }
 
 test "capture events: same group repeated via +" {
-    var compiler = compileEre("(a)+");
+    var compiler = try compileEre("(a)+");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1573,7 +1821,7 @@ test "capture events: backtrack discards failed-branch events" {
     // First alternative matches (a)(b), fails on "c", backtracks; second
     // alternative matches (x)(y). Events from the discarded branch must
     // be truncated from the log.
-    var compiler = compileEre("(a)(b)c|(x)(y)");
+    var compiler = try compileEre("(a)(b)c|(x)(y)");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1595,7 +1843,7 @@ test "capture events: backtrack discards failed-branch events" {
 }
 
 test "capture events: failed match produces empty log" {
-    var compiler = compileEre("(a)b");
+    var compiler = try compileEre("(a)b");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1609,7 +1857,7 @@ test "capture events: failed match produces empty log" {
 }
 
 test "capture events: cleared between runs" {
-    var compiler = compileEre("(a)");
+    var compiler = try compileEre("(a)");
     var vm = EventVm.initEvents(
         testing.allocator,
         compiler.getCode(),
@@ -1630,7 +1878,7 @@ const StatsCompiler = @import("Compiler.zig").CompilerWith(.{});
 
 test "stats: per-instruction and per-opcode counts" {
     // "a|b" matching "b" must try "a" (fail), backtrack, then match "b".
-    var compiler = compileEre("a|b");
+    var compiler = try compileEre("a|b");
     const code = compiler.getCode();
     var vm = StatsVm.init(code, compiler.getCharsets(), compiler.getStringData(), "b");
     const result = try vm.execute();
@@ -1656,7 +1904,7 @@ test "stats: per-instruction and per-opcode counts" {
 test "stats: backtrack counts on choice points" {
     // "(ab|cd)e" matching "cde": first alternative "ab" fails at 'a',
     // backtracks to try "cd", which succeeds.
-    var compiler = compileEre("(ab|cd)e");
+    var compiler = try compileEre("(ab|cd)e");
     var vm = StatsVm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "cde");
     const result = try vm.execute();
     try testing.expectEqual(@as(?usize, 3), result);
@@ -1672,7 +1920,7 @@ test "stats: backtrack counts on choice points" {
 }
 
 test "stats: reset between executions" {
-    var compiler = compileEre("a|b");
+    var compiler = try compileEre("a|b");
     var vm = StatsVm.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), "a");
     _ = try vm.execute();
     const steps1 = vm.getStats().steps;

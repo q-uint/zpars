@@ -1,0 +1,20 @@
+# Statement parser with labeled-failure recovery: missing semicolons
+# are recorded as zero-width MISSING markers without aborting the parse.
+#
+# `#@` lines below are recovery directives recognized by `zpars tree`.
+# Other PEG tools see them as ordinary line comments and ignore them,
+# so this file remains a valid (but recovery-less) PEG grammar
+# everywhere else.
+#
+# Try:
+#   zpars tree examples/recovery.peg "foo;bar;"      # both stmts terminated
+#   zpars tree examples/recovery.peg "foo;bar"       # last stmt missing ';'
+#   zpars tree examples/recovery.peg "foo;bar;baz"   # last stmt missing ';'
+#   zpars tree examples/recovery.peg "foo"           # the only stmt missing ';'
+
+Program <- Stmt*
+Stmt    <- Expr ";"
+         / Expr     #@ throw missing_semi
+Expr    <- [a-z]+
+
+#@ rule Stmt catches missing_semi -> recover_missing

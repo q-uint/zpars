@@ -50,7 +50,7 @@ fn formatNode(node: Ast.Node, ctx: Context, writer: anytype) anyerror!void {
             try writer.writeByte(')');
         },
         // Nodes not produced by the ERE parser.
-        .num_val, .prose_val, .and_predicate, .not_predicate => unreachable,
+        .num_val, .prose_val, .and_predicate, .not_predicate, .throw_label, .lcatch, .missing_label => unreachable,
     }
 }
 

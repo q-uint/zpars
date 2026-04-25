@@ -49,6 +49,29 @@ pub const Opcode = enum(u8) {
     event_open,
     /// Append a matching "close capture" event. Mirror of event_open.
     event_close,
+    /// Initiate a labeled-failure unwind toward the nearest matching
+    /// `.lcatch` frame. The label id is carried in the slot data field.
+    /// Unlike `fail`, the unwind walks past `.choice` frames and
+    /// preserves the event log; the unwinder synthesizes
+    /// `partial_close` events for any `open`s left dangling above the
+    /// matching catch. If no matching catch is found, the match fails
+    /// (returns null), same as a top-level `fail`.
+    throw,
+    /// Push an `.lcatch` frame keyed by a label id and a handler PC. On
+    /// a matching `throw`, control transfers to the handler PC with
+    /// `pos` left at the throw site (not restored to entry). Regular
+    /// `fail` skips this frame entirely. The label / handler-pc pair is
+    /// carried in the `catch_handler` data field.
+    lcatch,
+    /// Append a synthesized ERROR-node start event. The label id is
+    /// carried in the slot data field. No-op when `capture_events` is
+    /// off. Always succeeds (no input consumed).
+    event_error_open,
+    /// Mirror of `event_error_open`. Closes the synthesized ERROR node.
+    event_error_close,
+    /// Append a zero-width MISSING marker keyed by label id. No-op when
+    /// `capture_events` is off. Always succeeds.
+    event_missing,
     /// Accept the match and halt.
     match,
 };
@@ -87,6 +110,7 @@ pub const Inst = struct {
         slot: u16,
         string: StringRef,
         memo: MemoCall,
+        catch_handler: CatchHandler,
         none: void,
     };
 
@@ -99,4 +123,22 @@ pub const Inst = struct {
         rule_id: u16,
         offset: u32,
     };
+
+    /// Immediate for `lcatch`: which label this frame catches and where
+    /// to transfer control when a matching `throw` is unwound to it.
+    pub const CatchHandler = struct {
+        label: u16,
+        handler_pc: u32,
+    };
 };
+
+/// Returns true if `code` contains any opcode that the JIT/AOT backends
+/// do not yet support. Entry points use this to reject recovery grammars
+/// up front rather than walking into an `unreachable` during code-gen.
+pub fn containsRecoveryOps(code: []const Inst) bool {
+    for (code) |inst| switch (inst.op) {
+        .throw, .lcatch, .event_error_open, .event_error_close, .event_missing => return true,
+        else => {},
+    };
+    return false;
+}

@@ -258,10 +258,37 @@ defer tree.deinit();
 // Look up node names by group_id.
 var names: [256][]const u8 = undefined;
 for (0..compiler.rule_count) |i| names[i] = compiler.getRuleName(@intCast(i));
-try tree.writeSExp(stdout, names[0..compiler.rule_count]);
+try tree.writeSExp(stdout, .{ .rules = names[0..compiler.rule_count] });
 ```
 
 The same `JitWith(.{ .capture_events = true })` API works with the JIT for native-speed tree construction.
+
+### Error recovery (PEG, experimental)
+
+PEG grammars can opt into labeled-failure recovery via backwards-compatible `#@` comment directives that other PEG tools see as plain `#` comments:
+
+```peg
+Program <- Stmt*
+Stmt    <- Expr ";"
+         / Expr     #@ throw missing_semi
+Expr    <- [a-z]+
+
+#@ rule Stmt catches missing_semi -> recover_missing
+```
+
+`#@ throw <label>` ends an alternative with a labeled failure that propagates past ordered-choice points. `#@ rule <name> catches <label> -> <handler>` wraps the rule's body in a catch frame; `recover_missing` is a builtin handler that emits a zero-width `MISSING(label)` marker. `zpars tree` runs the resulting bytecode through the VM with capture events on and renders synthesized `ERROR` / `MISSING` nodes and `partial` rule subtrees:
+
+```
+$ zpars tree examples/recovery.peg "foo;bar"
+(Program [0,7]
+  (Stmt [0,4]
+    (Expr [0,3]))
+  (Stmt [4,7]
+    (Expr [4,7])
+    (MISSING [7,7] missing_semi)))
+```
+
+Recovery is currently VM-only; the JIT raises `unreachable` for the recovery opcodes. Mixing recovery directives with the legacy flat-capture combinator (`Capture`) is not supported.
 
 Try the example grammars:
 
@@ -273,6 +300,7 @@ zpars vm examples/uri.peg "http://example.com"   # URI structure
 zpars vm examples/bit.bnf "01010011"             # binary byte
 zpars tree examples/calc.peg "1+2*3"             # parse tree
 zpars tree --jit -j examples/calc.peg "1+2*3"    # JIT, JSON output
+zpars tree examples/recovery.peg "foo;bar"       # labeled-failure recovery
 ```
 
 ## CLI
@@ -371,3 +399,5 @@ zig build vsx                  # build the Open VSX extension (WASM + TypeScript
 - [RFC 9804 - S-Expressions](https://www.rfc-editor.org/rfc/rfc9804)
 - [A Text Pattern-Matching Tool based on Parsing Expression Grammars (2009)](http://www.inf.puc-rio.br/~roberto/docs/peg.pdf) - Ierusalimschy's LPeg parsing machine
 - [Packrat Parsers Can Support Left Recursion (2008)](https://web.cs.ucla.edu/~todd/research/pepm08.pdf) - Warth et al.'s seed-growing algorithm for left recursion in PEGs
+- Maidl, A. M., Mascarenhas, F., Medeiros, S., & Ierusalimschy, R. (2016). *Error Reporting in Parsing Expression Grammars* - labeled-failure model
+- Medeiros, F., & Ierusalimschy, R. (2018). *Syntax Error Recovery in Parsing Expression Grammars* - the recovery model zpars's `#@` directives implement

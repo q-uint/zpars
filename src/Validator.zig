@@ -269,7 +269,11 @@ fn collectRefs(self: *Validator, node: Ast.Node, refs: *CiHashMap(void)) !void {
         .and_predicate => |inner| try self.collectRefs(inner.*, refs),
         .not_predicate => |inner| try self.collectRefs(inner.*, refs),
         .capture => |inner| try self.collectRefs(inner.*, refs),
-        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => {},
+        .lcatch => |c| {
+            try self.collectRefs(c.body.*, refs);
+            try self.collectRefs(c.handler.*, refs);
+        },
+        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .throw_label, .missing_label => {},
     }
 }
 
@@ -294,7 +298,8 @@ fn nodeReferences(node: Ast.Node, name: []const u8) bool {
         .and_predicate => |inner| nodeReferences(inner.*, name),
         .not_predicate => |inner| nodeReferences(inner.*, name),
         .capture => |inner| nodeReferences(inner.*, name),
-        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end => false,
+        .lcatch => |c| nodeReferences(c.body.*, name) or nodeReferences(c.handler.*, name),
+        .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .throw_label, .missing_label => false,
     };
 }
 
@@ -338,6 +343,13 @@ fn isProductive(
         .and_predicate => |inner| isProductive(inner.*, merged_rules, name_index, productive),
         .not_predicate => |inner| isProductive(inner.*, merged_rules, name_index, productive),
         .capture => |inner| isProductive(inner.*, merged_rules, name_index, productive),
+        // A throw never produces a match in the regular sense, but a
+        // lcatch wrapping it is productive iff the body or handler is.
+        // `missing_label` succeeds zero-width and so is productive.
+        .throw_label => false,
+        .missing_label => true,
+        .lcatch => |c| isProductive(c.body.*, merged_rules, name_index, productive) or
+            isProductive(c.handler.*, merged_rules, name_index, productive),
     };
 }
 
@@ -385,6 +397,12 @@ fn isNullable(
             return isNullable(rep.element.*, merged_rules, name_index, nullable);
         },
         .capture => |inner| isNullable(inner.*, merged_rules, name_index, nullable),
+        // throw never succeeds, missing always succeeds zero-width,
+        // lcatch is nullable iff its body is (handler runs on throw,
+        // not on body success).
+        .throw_label => false,
+        .missing_label => true,
+        .lcatch => |c| isNullable(c.body.*, merged_rules, name_index, nullable),
     };
 }
 
@@ -437,6 +455,12 @@ fn collectLeftReachable(
         .capture => |inner| {
             collectLeftReachable(inner.*, merged_rules, name_index, nullable, visited);
         },
+        .lcatch => |c| {
+            // The handler only runs on a labeled failure inside the
+            // body, not as part of the body's left-reachable path.
+            // Recurse through the body only.
+            collectLeftReachable(c.body.*, merged_rules, name_index, nullable, visited);
+        },
         .char_val,
         .num_val,
         .prose_val,
@@ -445,6 +469,8 @@ fn collectLeftReachable(
         .any,
         .anchor_start,
         .anchor_end,
+        .throw_label,
+        .missing_label,
         => {},
     }
 }
@@ -478,6 +504,8 @@ fn hasZeroWidthLoop(
         .and_predicate => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
         .not_predicate => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
         .capture => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
+        .lcatch => |c| hasZeroWidthLoop(c.body.*, merged_rules, name_index, nullable) or
+            hasZeroWidthLoop(c.handler.*, merged_rules, name_index, nullable),
         .char_val,
         .num_val,
         .prose_val,
@@ -487,6 +515,8 @@ fn hasZeroWidthLoop(
         .anchor_start,
         .anchor_end,
         .rulename,
+        .throw_label,
+        .missing_label,
         => false,
     };
 }

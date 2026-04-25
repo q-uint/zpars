@@ -125,6 +125,7 @@ pub fn build(b: *std.Build) void {
         "alloc",
         "free",
         "analyze",
+        "tree",
     };
     const install_wasm = b.addInstallArtifact(wasm_lib, .{
         .dest_dir = .{ .override = .{ .custom = "../editors/vsx/wasm" } },
@@ -147,6 +148,7 @@ pub fn build(b: *std.Build) void {
         "analyze",
         "match",
         "format",
+        "tree",
     };
     const install_web_wasm = b.addInstallArtifact(web_wasm, .{
         .dest_dir = .{ .override = .{ .custom = "../web" } },
