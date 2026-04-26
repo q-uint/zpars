@@ -60,7 +60,10 @@ pub fn compileToBlob(
     string_data: []const u8,
     capture_count: u16,
 ) !Blob {
-    if (I.containsJitUnsupportedOps(code)) return error.JitDoesNotSupportOp;
+    // AOT currently always compiles with the default JIT config
+    // (capture_events = false). Recovery opcodes need an event-log
+    // state at runtime, so reject those grammars up front.
+    if (I.requiresCaptureEvents(code)) return error.JitDoesNotSupportOp;
 
     // AOT currently always compiles with the default JIT config; capture
     // events are not yet serialized into the blob format.

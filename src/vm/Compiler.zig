@@ -132,9 +132,8 @@ pub fn CompilerWith(comptime config: Config) type {
             ///   `tagged_tokens` get the event. Lets grammars opt in
             ///   selectively (typically keywords/operators).
             /// Requires `capture_events = true` at runtime; the events
-            /// are no-ops otherwise. Forces the JIT/AOT path off
-            /// (parallel to recovery): the VM is the only backend
-            /// that handles `event_token` today.
+            /// are no-ops otherwise. Supported by the VM and both JIT
+            /// backends; AOT inherits JIT support.
             token_events: TokenEvents = .off,
             /// Literal bytes to instrument under `token_events =
             /// .tagged`. Each entry is a literal as it appears in the
@@ -146,9 +145,9 @@ pub fn CompilerWith(comptime config: Config) type {
             /// `event_field` instruction before the body so the parse
             /// tree carries the field name on the corresponding node.
             /// When false (default), the field tag is dropped at
-            /// compile time and the body compiles unchanged. Forces
-            /// the JIT/AOT path off when set, parallel to recovery
-            /// and token events.
+            /// compile time and the body compiles unchanged. Supported
+            /// by the VM and both JIT backends; AOT inherits JIT
+            /// support.
             field_events: bool = false,
         };
 

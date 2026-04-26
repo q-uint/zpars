@@ -11,6 +11,7 @@
 /// to the C-ABI wrappers at the bottom of this file.
 const std = @import("std");
 const CaptureTree = @import("CaptureTree.zig");
+const jit_abi = @import("jit_abi.zig");
 
 pub const State = struct {
     list: std.ArrayListUnmanaged(CaptureTree.Event),
@@ -113,11 +114,7 @@ pub fn truncate(state: *State, new_len: u32) void {
 pub const oom_sentinel: u64 = std.math.maxInt(u64);
 
 /// C-ABI wrapper for `appendSave`. Returns `oom_sentinel` on allocator
-/// failure; the JIT jumps to the fail handler on that value. Recovery,
-/// token, and field events have no JIT helpers because the JIT/AOT
-/// path rejects grammars carrying those opcodes (see
-/// `Instruction.containsJitUnsupportedOps`); add helpers here if/when
-/// the JIT grows support.
+/// failure; the JIT jumps to the fail handler on that value.
 pub fn helperAppendSave(
     state_ptr: *State,
     slot: u64,
@@ -127,12 +124,172 @@ pub fn helperAppendSave(
     return pre_len;
 }
 
+/// C-ABI wrapper for `appendToken`. Same OOM sentinel convention as
+/// `helperAppendSave`. The JIT computes `start = pos - len` itself so
+/// the helper just records the span.
+pub fn helperAppendToken(
+    state_ptr: *State,
+    start: u64,
+    end: u64,
+) callconv(.c) u64 {
+    const pre_len = appendToken(state_ptr, @intCast(start), @intCast(end)) catch return oom_sentinel;
+    return pre_len;
+}
+
+/// C-ABI wrapper for `appendField`. Same OOM sentinel convention as
+/// `helperAppendSave`.
+pub fn helperAppendField(
+    state_ptr: *State,
+    field_id: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendField(state_ptr, @intCast(field_id), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
+/// C-ABI wrapper for `appendErrorOpen`. Same OOM sentinel convention.
+pub fn helperAppendErrorOpen(
+    state_ptr: *State,
+    label: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendErrorOpen(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
+/// C-ABI wrapper for `appendErrorClose`. Same OOM sentinel convention.
+pub fn helperAppendErrorClose(
+    state_ptr: *State,
+    label: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendErrorClose(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
+/// C-ABI wrapper for `appendMissing`. Same OOM sentinel convention.
+pub fn helperAppendMissing(
+    state_ptr: *State,
+    label: u64,
+    pos: u64,
+) callconv(.c) u64 {
+    const pre_len = appendMissing(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
+    return pre_len;
+}
+
 /// C-ABI wrapper for `truncate`. Always succeeds.
 pub fn helperTruncate(
     state_ptr: *State,
     new_len: u64,
 ) callconv(.c) void {
     truncate(state_ptr, @intCast(new_len));
+}
+
+/// Returns the current events-log length. Used by `lcatch` codegen to
+/// snapshot the log length on its catch frame so a later `throw` can
+/// synthesize partial-close events for the right window. Done via a
+/// helper rather than an inline load so the JIT does not bake in
+/// `std.ArrayListUnmanaged`'s field layout.
+pub fn helperEventsLen(state_ptr: *State) callconv(.c) u64 {
+    return @intCast(state_ptr.list.items.len);
+}
+
+/// Sentinel returned by `helperThrow` when no matching `lcatch` is on
+/// the stack. The JIT branches to the fail handler on this value.
+pub const throw_miss: u64 = std.math.maxInt(u64);
+
+/// Wildcard label: an `lcatch` frame stamped with this value catches
+/// throws of any label. Mirrors `Vm.wildcard_label`.
+pub const wildcard_label: u64 = std.math.maxInt(u16);
+
+/// JIT-side throw unwinder. Walks `stack[0..sp_in_out.*]` downward
+/// looking for an `lcatch` frame (tag=4) with a matching label (or
+/// the wildcard sentinel). On hit:
+///   - synthesizes `partial_close` events for any unclosed `open`s
+///     above the catch frame (mirrors `Vm.synthesizePartialCloses`);
+///   - writes the new stack depth (just below the matched frame) into
+///     `sp_in_out`;
+///   - returns the bytecode PC of the catch's handler so the JIT can
+///     index its jump table.
+/// On miss: writes 0 to `sp_in_out` and returns `throw_miss`.
+///
+/// `state_ptr` may be null when capture_events is off; partial-close
+/// synthesis is skipped in that case.
+///
+/// Note: unlike the JIT's regular backtrack handler, this helper does
+/// NOT roll back capture slots or events stored on `.save`/`.event`
+/// frames it walks past. That preserves throw semantics — the matching
+/// catch decides what stays and what becomes a partial_close.
+pub fn helperThrow(
+    state_ptr: ?*State,
+    stack_ptr: [*]jit_abi.StackEntry,
+    sp_in_out: *u64,
+    label: u64,
+    throw_pos: u64,
+) callconv(.c) u64 {
+    const lcatch_tag: u64 = 4;
+    var sp = sp_in_out.*;
+    while (sp > 0) {
+        sp -= 1;
+        const entry = stack_ptr[@intCast(sp)];
+        if (entry.tag != lcatch_tag) continue;
+        const frame_label = entry.val1;
+        const matches = frame_label == label or frame_label == wildcard_label;
+        if (!matches) continue;
+
+        const handler_pc = entry.val2;
+        const event_len: u32 = @intCast(entry.event_len);
+        if (state_ptr) |state| {
+            synthesizePartialCloses(state, event_len, @intCast(throw_pos)) catch {
+                sp_in_out.* = sp;
+                return throw_miss;
+            };
+        }
+        sp_in_out.* = sp;
+        return handler_pc;
+    }
+    sp_in_out.* = 0;
+    return throw_miss;
+}
+
+/// Mirror of `Vm.synthesizePartialCloses`: walks the live event window
+/// `[catch_event_len..]` to find still-open captures (no matching
+/// close/partial_close), then appends a `partial_close` for each at
+/// `throw_pos`, innermost-first.
+fn synthesizePartialCloses(
+    state: *State,
+    catch_event_len: u32,
+    throw_pos: u32,
+) std.mem.Allocator.Error!void {
+    // Stack-allocated open-id stack. Bound matches the JIT's
+    // `Jit.max_stack`; capture nesting can't exceed call-stack depth.
+    var open_stack: [1024]u16 = undefined;
+    var open_sp: usize = 0;
+
+    const live = state.list.items[catch_event_len..];
+    for (live) |ev| switch (ev) {
+        .open => |m| {
+            std.debug.assert(open_sp < open_stack.len);
+            open_stack[open_sp] = m.group_id;
+            open_sp += 1;
+        },
+        .close => |c| {
+            std.debug.assert(open_sp > 0 and open_stack[open_sp - 1] == c.group_id);
+            open_sp -= 1;
+        },
+        .partial_close => |c| {
+            std.debug.assert(open_sp > 0 and open_stack[open_sp - 1] == c.group_id);
+            open_sp -= 1;
+        },
+        // error_open/close, missing, token, field_marker have no
+        // nesting effect on the open stack.
+        .error_open, .error_close, .missing, .token, .field_marker => {},
+    };
+
+    while (open_sp > 0) {
+        open_sp -= 1;
+        _ = try appendPartialClose(state, open_stack[open_sp], throw_pos);
+    }
 }
 
 const testing = std.testing;

@@ -147,15 +147,27 @@ pub const Inst = struct {
     };
 };
 
-/// Returns true if `code` contains any opcode that the JIT/AOT backends
-/// do not yet support. Entry points use this to reject affected grammars
-/// up front rather than walking into an `unreachable` during code-gen.
-/// Currently covers the recovery opcodes (`throw`, `lcatch`, the
-/// `event_error_*` / `event_missing` synthesizers) and `event_token`.
-pub fn containsJitUnsupportedOps(code: []const Inst) bool {
+/// Returns true if `code` contains any opcode whose JIT/AOT lowering
+/// requires `capture_events = true` at runtime. The recovery family
+/// (`throw`, `lcatch`, `event_error_*`, `event_missing`) needs an
+/// event-log state to snapshot lengths on catch frames and synthesize
+/// partial-close events on unwind. Entry points reject grammars with
+/// these opcodes when running with `capture_events = false`.
+pub fn requiresCaptureEvents(code: []const Inst) bool {
     for (code) |inst| switch (inst.op) {
-        .throw, .lcatch, .event_error_open, .event_error_close, .event_missing, .event_token, .event_field => return true,
+        .throw, .lcatch, .event_error_open, .event_error_close, .event_missing => return true,
         else => {},
     };
+    return false;
+}
+
+/// Returns true if `code` contains any `memo_call` opcode. Entry
+/// points use this to reject memoized bytecode when running with
+/// `memoize = false`, where the JIT/AOT path would have nowhere to
+/// dispatch the memo lookup.
+pub fn containsMemoCall(code: []const Inst) bool {
+    for (code) |inst| {
+        if (inst.op == .memo_call) return true;
+    }
     return false;
 }

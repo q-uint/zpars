@@ -6,7 +6,6 @@ const I = @import("Instruction.zig");
 const Jit = @import("Jit.zig");
 
 const page_size = Jit.page_size;
-const StackEntry = Jit.StackEntry;
 
 // rbx  = pos        (current input position)
 // rbp  = bsp        (backtrack stack index)
@@ -44,21 +43,65 @@ const r8_r: Reg = 8;
 const r9_r: Reg = 9;
 const rsp_r: Reg = 4;
 
-// Stack frame layout. The final three slots are only reserved/populated
-// when `Jit.Config.capture_events` is true; `stkSize` returns the
-// correct frame size for the given config.
+// Stack frame layout. The 4 prefix slots hold values aarch64 keeps in
+// callee-saved registers (jump table / code base / charsets / string
+// data); the rest mirror `Jit.StackSlots` 1:1 -- adding or reordering
+// a helper slot there updates both backends.
 const stk_csp: i32 = 0;
 const stk_sdp: i32 = 8;
 const stk_jtp: i32 = 16;
 const stk_cbp: i32 = 24;
-const stk_hsm: i32 = 32; // helper_string_match
-const stk_hcm: i32 = 40; // helper_charset_match
-const stk_esp: i32 = 48; // events_state_ptr (capture_events only)
-const stk_has: i32 = 56; // helper_append_save (capture_events only)
-const stk_hte: i32 = 64; // helper_truncate_events (capture_events only)
+const stk_shared_base: i32 = 32;
+
+fn stkSlot(comptime field: []const u8) i32 {
+    return stk_shared_base + @as(i32, @intCast(@offsetOf(Jit.StackSlots, field)));
+}
+
+const stk_hsm: i32 = stkSlot("helper_string_match");
+const stk_hcm: i32 = stkSlot("helper_charset_match");
+const stk_esp: i32 = stkSlot("events_state_ptr");
+const stk_has: i32 = stkSlot("helper_append_save");
+const stk_hte: i32 = stkSlot("helper_truncate_events");
+const stk_hat: i32 = stkSlot("helper_append_token");
+const stk_haf: i32 = stkSlot("helper_append_field");
+const stk_haeo: i32 = stkSlot("helper_append_error_open");
+const stk_haec: i32 = stkSlot("helper_append_error_close");
+const stk_haem: i32 = stkSlot("helper_append_missing");
+const stk_ht: i32 = stkSlot("helper_throw");
+const stk_hel: i32 = stkSlot("helper_events_len");
+const stk_call_scratch: i32 = stkSlot("call_scratch");
+const stk_memo_ctx: i32 = stkSlot("memo_ctx");
+const stk_memo_scratch1: i32 = stkSlot("memo_scratch1");
+const stk_memo_scratch2: i32 = stkSlot("memo_scratch2");
 
 fn stkSize(comptime config: Jit.Config) i32 {
-    return if (config.capture_events) 72 else 48;
+    // SysV: rsp must be 8 mod 16 just before an inner CALL so the
+    // callee enters with rsp 0 mod 16. Function entry rsp is 8 mod 16,
+    // 6 register pushes drop it by 48 bytes (still 8 mod 16), so
+    // stkSize must itself be ≡ 8 mod 16 to preserve the invariant.
+    if (config.memoize) return 168;
+    if (config.capture_events) return 136;
+    return 48;
+}
+
+/// Comptime offset of a `Jit.JitCtx` field, narrowed to `i32` for the
+/// x86_64 displacement encoding. Using `@offsetOf` here keeps the
+/// prologue in lock-step with `JitCtx`'s layout: reorder or insert a
+/// field and the codegen follows automatically.
+fn ctxOff(comptime field: []const u8) i32 {
+    return @intCast(@offsetOf(Jit.JitCtx, field));
+}
+
+/// Same idea for `Jit.MemoCtx`. Used by the `memo_call` / `ret` /
+/// backtrack lowerings when they index into the runtime memo bundle.
+fn memoOff(comptime field: []const u8) i32 {
+    return @intCast(@offsetOf(Jit.MemoCtx, field));
+}
+
+/// Same idea for `Jit.Frame` (memo side-table entry). Used by the
+/// `memo_call` miss path when it writes the new frame.
+fn frameOff(comptime field: []const u8) i32 {
+    return @intCast(@offsetOf(Jit.Frame, field));
 }
 
 // Condition codes for Jcc
@@ -171,6 +214,38 @@ fn emitMovMI(buf: *Buf, base: Reg, disp: i32, imm: i32) void {
     buf.emitI32(imm);
 }
 
+/// `mov dword ptr [base + disp], imm32`. 32-bit memory store with a
+/// 32-bit immediate (no sign extension to 64 bits unlike `emitMovMI`).
+fn emitMovMI32(buf: *Buf, base: Reg, disp: i32, imm: i32) void {
+    if (regHi(base) != 0) buf.emit1(0x40 | @as(u8, regHi(base)));
+    buf.emit1(0xC7);
+    emitModRMDisp(buf, @as(Reg, 0), base, disp);
+    buf.emitI32(imm);
+}
+
+/// `mov dword ptr [base + disp], src` (32-bit register store).
+fn emitMov32MR(buf: *Buf, base: Reg, disp: i32, src: Reg) void {
+    const need_rex = regHi(base) != 0 or regHi(src) != 0;
+    if (need_rex) buf.emit1(0x40 | (@as(u8, regHi(src)) << 2) | @as(u8, regHi(base)));
+    buf.emit1(0x89);
+    emitModRMDisp(buf, src, base, disp);
+}
+
+/// `imul dst, src` (64-bit). `dst = dst * src`.
+fn emitImulRR(buf: *Buf, dst: Reg, src: Reg) void {
+    buf.emit1(rexW(dst, src));
+    buf.emit1(0x0F);
+    buf.emit1(0xAF);
+    buf.emit1(modrmByte(3, regLo(dst), regLo(src)));
+}
+
+/// `add dst, src` (64-bit register-to-register).
+fn emitAddRR(buf: *Buf, dst: Reg, src: Reg) void {
+    buf.emit1(rexW(src, dst));
+    buf.emit1(0x01);
+    buf.emit1(modrmByte(3, regLo(src), regLo(dst)));
+}
+
 fn emitMovRI64(buf: *Buf, dst: Reg, val: u64) void {
     buf.emit1(0x48 | @as(u8, regHi(dst)));
     buf.emit1(0xB8 | @as(u8, regLo(dst)));
@@ -217,6 +292,14 @@ fn emitLeaRip(buf: *Buf, dst: Reg, disp: i32) void {
     buf.emit1(0x8D);
     buf.emit1(modrmByte(0, regLo(dst), 5));
     buf.emitI32(disp);
+}
+
+/// `lea dst, [base + disp]`. The ModR/M emitter handles the rsp/r12
+/// SIB-byte requirement transparently.
+fn emitLeaRMDisp(buf: *Buf, dst: Reg, base: Reg, disp: i32) void {
+    buf.emit1(rexW(dst, base));
+    buf.emit1(0x8D);
+    emitModRMDisp(buf, dst, base, disp);
 }
 
 fn emitAddRI(buf: *Buf, dst: Reg, imm: i32) void {
@@ -387,7 +470,12 @@ pub const GenerateResult = struct {
 };
 
 pub fn estimateSize(comptime config: Jit.Config, code_len: usize) usize {
-    const per_inst: usize = if (config.capture_events) 192 else 128;
+    // memo_call is the largest opcode (~140 bytes including the
+    // success-path replay setup); bump the budget when it can appear
+    // so we don't underprovision the mmap.
+    const per_inst: usize = if (config.memoize)
+        480
+    else if (config.capture_events) 192 else 128;
     return (code_len + 1) * per_inst + 4096;
 }
 
@@ -405,7 +493,7 @@ pub fn generate(
 
     for (code, 0..) |inst, i| {
         bc_map[i] = buf.off();
-        emitInst(config, &buf, inst, &fixups, &fcount);
+        emitInst(config, &buf, inst, @intCast(i), &fixups, &fcount);
     }
     if (code.len < 4096)
         bc_map[code.len] = buf.off();
@@ -440,9 +528,16 @@ pub fn generate(
 }
 
 pub fn compile(self: anytype) !void {
-    if (I.containsJitUnsupportedOps(self.code)) return error.JitDoesNotSupportOp;
-
     const config = @TypeOf(self.*).jit_config;
+    // Recovery opcodes need an event log to snapshot lcatch frames and
+    // synthesize partial-close events. Reject grammars that use them
+    // when capture_events is off, rather than miscompiling.
+    if (!config.capture_events and I.requiresCaptureEvents(self.code))
+        return error.JitDoesNotSupportOp;
+    // memo_call only has a code path when memoize is on. Reject up
+    // front rather than walking into an `unreachable` during emit.
+    if (!config.memoize and I.containsMemoCall(self.code))
+        return error.JitDoesNotSupportOp;
     const est = estimateSize(config, self.code.len);
     const size = std.mem.alignForward(usize, est, page_size);
 
@@ -476,30 +571,48 @@ fn emitPrologue(comptime config: Jit.Config, buf: *Buf) void {
     emitSubRI(buf, rsp_r, stkSize(config));
 
     // rdi = pointer to JitCtx. Load fields into regs and stack slots.
-    emitMovRM(buf, inp, rdi_r, 0); // r14 = ctx->input_ptr
-    emitMovRM(buf, inl, rdi_r, 8); // r13 = ctx->input_len
-    emitMovRM(buf, t0, rdi_r, 16);
-    emitMovMR(buf, rsp_r, stk_csp, t0); // [rsp+0] = charsets_ptr
-    emitMovRM(buf, t0, rdi_r, 24);
-    emitMovMR(buf, rsp_r, stk_sdp, t0); // [rsp+8] = string_data_ptr
-    emitMovRM(buf, cap, rdi_r, 32); // r12 = ctx->captures_ptr
-    emitMovRM(buf, skp, rdi_r, 40); // r15 = ctx->stack_ptr
-    emitMovRM(buf, t0, rdi_r, 48);
-    emitMovMR(buf, rsp_r, stk_jtp, t0); // [rsp+16] = jump_table_ptr
-    emitMovRM(buf, t0, rdi_r, 56);
-    emitMovMR(buf, rsp_r, stk_cbp, t0); // [rsp+24] = code_base_ptr
-    emitMovRM(buf, t0, rdi_r, 64);
-    emitMovMR(buf, rsp_r, stk_hsm, t0); // [rsp+32] = helper_string_match
-    emitMovRM(buf, t0, rdi_r, 72);
-    emitMovMR(buf, rsp_r, stk_hcm, t0); // [rsp+40] = helper_charset_match
+    emitMovRM(buf, inp, rdi_r, ctxOff("input_ptr"));
+    emitMovRM(buf, inl, rdi_r, ctxOff("input_len"));
+    emitMovRM(buf, t0, rdi_r, ctxOff("charsets_ptr"));
+    emitMovMR(buf, rsp_r, stk_csp, t0);
+    emitMovRM(buf, t0, rdi_r, ctxOff("string_data_ptr"));
+    emitMovMR(buf, rsp_r, stk_sdp, t0);
+    emitMovRM(buf, cap, rdi_r, ctxOff("captures_ptr"));
+    emitMovRM(buf, skp, rdi_r, ctxOff("stack_ptr"));
+    emitMovRM(buf, t0, rdi_r, ctxOff("jump_table_ptr"));
+    emitMovMR(buf, rsp_r, stk_jtp, t0);
+    emitMovRM(buf, t0, rdi_r, ctxOff("code_base_ptr"));
+    emitMovMR(buf, rsp_r, stk_cbp, t0);
+    emitMovRM(buf, t0, rdi_r, ctxOff("helper_string_match"));
+    emitMovMR(buf, rsp_r, stk_hsm, t0);
+    emitMovRM(buf, t0, rdi_r, ctxOff("helper_charset_match"));
+    emitMovMR(buf, rsp_r, stk_hcm, t0);
 
     if (config.capture_events) {
-        emitMovRM(buf, t0, rdi_r, 80);
-        emitMovMR(buf, rsp_r, stk_esp, t0); // events_state_ptr
-        emitMovRM(buf, t0, rdi_r, 88);
-        emitMovMR(buf, rsp_r, stk_has, t0); // helper_append_save
-        emitMovRM(buf, t0, rdi_r, 96);
-        emitMovMR(buf, rsp_r, stk_hte, t0); // helper_truncate_events
+        emitMovRM(buf, t0, rdi_r, ctxOff("events_state_ptr"));
+        emitMovMR(buf, rsp_r, stk_esp, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_append_save"));
+        emitMovMR(buf, rsp_r, stk_has, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_truncate_events"));
+        emitMovMR(buf, rsp_r, stk_hte, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_append_token"));
+        emitMovMR(buf, rsp_r, stk_hat, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_append_field"));
+        emitMovMR(buf, rsp_r, stk_haf, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_append_error_open"));
+        emitMovMR(buf, rsp_r, stk_haeo, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_append_error_close"));
+        emitMovMR(buf, rsp_r, stk_haec, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_append_missing"));
+        emitMovMR(buf, rsp_r, stk_haem, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_throw"));
+        emitMovMR(buf, rsp_r, stk_ht, t0);
+        emitMovRM(buf, t0, rdi_r, ctxOff("helper_events_len"));
+        emitMovMR(buf, rsp_r, stk_hel, t0);
+    }
+    if (config.memoize) {
+        emitMovRM(buf, t0, rdi_r, ctxOff("memo_ctx_ptr"));
+        emitMovMR(buf, rsp_r, stk_memo_ctx, t0);
     }
 
     emitXorRR32(buf, pos);
@@ -542,9 +655,21 @@ fn emitBacktrackHandler(
     emitCmp32RI8(buf, t1, 2);
     const save_rel32 = emitJccRel32(buf, CC.eq);
 
-    const event_rel32 = if (config.capture_events) blk: {
-        emitCmp32RI8(buf, t1, 3);
+    // Memo frames (tag=5) are dispatched before the event check so the
+    // `ae` event check stays correct -- it would otherwise catch tag=5
+    // too.
+    const memo_rel32 = if (config.memoize) blk: {
+        emitCmp32RI8(buf, t1, 5);
         break :blk emitJccRel32(buf, CC.eq);
+    } else 0;
+
+    const event_rel32 = if (config.capture_events) blk: {
+        // Tags 3 (event) and 4 (lcatch) both go to event_handler:
+        // both truncate the event log to the snapshot in slot 24 and
+        // do not restore any capture slot. `ae` (unsigned >=) catches
+        // both. tag 5 was dispatched above when memoize is on.
+        emitCmp32RI8(buf, t1, 3);
+        break :blk emitJccRel32(buf, CC.ae);
     } else 0;
 
     // tag == 1 (ret): skip, continue loop
@@ -594,6 +719,20 @@ fn emitBacktrackHandler(
         break :blk off;
     } else 0;
 
+    // memo handler (memoize only): mark the entry .fail and continue.
+    const memo_handler_off = if (config.memoize) blk: {
+        const off = buf.off();
+        emitMovRM(buf, rsi_r, t0, 8); // rsi = side_idx (val1)
+        emitMovRM(buf, rdi_r, rsp_r, stk_memo_ctx); // rdi = memo_ctx
+        emitMovRM(buf, t3, rdi_r, memoOff("helper_ret_fail"));
+        emitCallR(buf, t3);
+        emitTestRR(buf, bsp, bsp);
+        addFixup(fixups, fcount, emitJccRel32(buf, CC.z), .fail);
+        const jmp_off = emitJmpRel32(buf);
+        patchRel32(buf, jmp_off, loop_off);
+        break :blk off;
+    } else 0;
+
     // choice handler
     const choice_handler_off = buf.off();
     emitMovRM(buf, pos, t0, 8);
@@ -607,6 +746,7 @@ fn emitBacktrackHandler(
     patchRel32(buf, choice_rel32, choice_handler_off);
     patchRel32(buf, save_rel32, save_handler_off);
     if (config.capture_events) patchRel32(buf, event_rel32, event_handler_off);
+    if (config.memoize) patchRel32(buf, memo_rel32, memo_handler_off);
 }
 
 fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup, fcount: *usize) void {
@@ -627,6 +767,7 @@ fn emitInst(
     comptime config: Jit.Config,
     buf: *Buf,
     inst: I.Inst,
+    bc_pc: u32,
     fixups: *[8192]Fixup,
     fcount: *usize,
 ) void {
@@ -691,16 +832,141 @@ fn emitInst(
             patchRel32(buf, lea_disp_off, buf.off());
         },
         .memo_call => {
-            // Packrat memoization is a VM-only path. Compile with
-            // Options{ .memoize = false } when targeting the JIT.
-            unreachable;
+            // Mirrors `Vm`'s `memo_call` switch: look up the memo
+            // entry, dispatch to fail/success/miss. The miss path
+            // builds a side-table frame at depth `bsp`, pushes a
+            // tag=5 marker onto the stack, and jumps to the rule
+            // body. The eventual `ret` walks down to that marker
+            // (the tag dispatches it through `helperMemoRetSuccess`
+            // instead of treating it as a regular call return).
+            const mc = inst.data.memo;
+
+            // 1. Compute idx = rule_id * stride + pos.
+            emitMovRM(buf, t0, rsp_r, stk_memo_ctx); // t0 = MemoCtx*
+            emitMovRM(buf, t1, t0, memoOff("stride"));
+            emitMovRI32(buf, t2, mc.rule_id); // t2 = rule_id
+            emitImulRR(buf, t1, t2); // t1 = stride * rule_id
+            emitAddRR(buf, t1, pos); // t1 = idx
+
+            // 2. helperMemoLookup(table, idx, &end_pos_out).
+            emitMovRM(buf, rdi_r, t0, memoOff("table_ptr"));
+            emitMovRR(buf, rsi_r, t1); // rsi = idx
+            emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1); // rdx = &end_pos_out
+            emitMovRM(buf, t3, t0, memoOff("helper_lookup"));
+            emitCallR(buf, t3);
+
+            // 3. Dispatch on action code (rax = t0).
+            emitCmpRI8(buf, t0, 1); // == lookup_fail?
+            addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .backtrack);
+
+            emitCmpRI8(buf, t0, 2); // == lookup_success?
+            const success_branch_off = emitJccRel32(buf, CC.eq);
+
+            // `lookup_lr` falls through into the miss path here. Once
+            // Warth's left-recursion SETUP-LR path is wired up (not on
+            // this backend yet), replace this fallthrough with a
+            // SETUP-LR dispatch.
+
+            // ----- Miss path
+            // 4a. Get events_len_at_entry into t4.
+            if (config.capture_events) {
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+                emitMovRM(buf, t3, rsp_r, stk_hel);
+                emitCallR(buf, t3);
+                emitMovRR(buf, t4, t0); // t4 = events_len
+            } else {
+                emitXorRR32(buf, t4); // t4 = 0
+            }
+
+            // 4b. Compute &side[bsp].
+            emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
+            emitMovRM(buf, t1, t0, memoOff("side_ptr"));
+            emitMovRR(buf, t2, bsp);
+            emitShlRI(buf, t2, 4);
+            emitAddRR(buf, t1, t2); // t1 = &side[bsp]
+
+            // 4c. Write Frame fields.
+            emitMovMI32(buf, t1, frameOff("rule_id"), mc.rule_id);
+            emitMov32MR(buf, t1, frameOff("start_pos"), pos);
+            emitMovMI32(buf, t1, frameOff("return_pc"), @intCast(bc_pc + 1));
+            emitMov32MR(buf, t1, frameOff("events_len_at_entry"), t4);
+
+            // 4d. Push tag=5 marker at stack[bsp].
+            emitMovRR(buf, t1, bsp);
+            emitShlRI(buf, t1, 5);
+            emitLeaRR(buf, t1, skp, t1);
+            emitMovMI(buf, t1, 0, 5); // tag=5
+            emitMovMR(buf, t1, 8, bsp); // val1=bsp
+            emitMovMI(buf, t1, 16, 0); // val2=0
+            emitMovMI(buf, t1, 24, 0); // event_len=0
+            emitInc(buf, bsp);
+
+            // 4e. Jump to rule body.
+            addFixup(fixups, fcount, emitJmpRel32(buf), FixupTarget.bytecodePC(mc.offset));
+
+            // ----- Success path
+            const success_handler = buf.off();
+            patchRel32(buf, success_branch_off, success_handler);
+
+            if (config.capture_events) {
+                // Look up cached event range, replay if non-empty.
+                emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
+                emitMovRM(buf, rdi_r, t0, memoOff("table_ptr"));
+                // Recompute idx (regs were clobbered by the lookup call).
+                emitMovRM(buf, t1, t0, memoOff("stride"));
+                emitMovRI32(buf, t2, mc.rule_id);
+                emitImulRR(buf, t1, t2);
+                emitAddRR(buf, t1, pos);
+                emitMovRR(buf, rsi_r, t1);
+                emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1); // rdx = &cached_start
+                emitMovRM(buf, t3, t0, memoOff("helper_cached_slice"));
+                emitCallR(buf, t3);
+                // rax = count.
+                emitMovRR(buf, t4, t0); // preserve count
+
+                // If count == 0 skip replay.
+                emitTestRR(buf, t4, t4);
+                const skip_replay_off = emitJccRel32(buf, CC.eq);
+
+                // helperMemoReplayEvents(state, events_buf, start, count, stack, &sp, captures).
+                // 7 args -> 6 in registers + 1 on the stack. We sub
+                // rsp by 16 first so the outgoing-arg area sits below
+                // our own locals (preserving stk_csp/stk_sdp at the
+                // bottom of the locals frame). The 16-byte adjustment
+                // also keeps rsp ≡ 0 mod 16 across the inner CALL.
+                emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp); // arg1 = state
+                emitMovRM(buf, rsi_r, t0, memoOff("events_buf_ptr"));
+                emitMovRM(buf, t2, rsp_r, stk_memo_scratch1); // arg3 = start (rdx)
+                emitMovRR(buf, t1, t4); // arg4 = count (rcx)
+                emitMovRR(buf, r8_r, skp); // arg5 = stack
+                emitMovMR(buf, rsp_r, stk_memo_scratch2, bsp); // stash bsp
+                emitLeaRMDisp(buf, r9_r, rsp_r, stk_memo_scratch2); // arg6 = &sp
+                emitMovRM(buf, t3, t0, memoOff("helper_replay_events"));
+                // Make outgoing-arg area below our locals; arg7 lives
+                // at [new_rsp + 0] = [old_rsp - 16].
+                emitSubRI(buf, rsp_r, 16);
+                emitMovMR(buf, rsp_r, 0, cap); // [rsp+0] = captures
+                emitCallR(buf, t3);
+                emitAddRI(buf, rsp_r, 16);
+                // rax = 0 ok or oom_sentinel.
+                emitCmpRI8(buf, t0, -1);
+                addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                emitMovRM(buf, bsp, rsp_r, stk_memo_scratch2); // reload bsp
+
+                patchRel32(buf, skip_replay_off, buf.off());
+            }
+
+            // Advance pos to the cached end position and fall through.
+            emitMovRM(buf, pos, rsp_r, stk_memo_scratch1);
         },
         .ret => {
-            if (config.capture_events) {
-                // The body may have left save/event frames on top of
-                // the call's ret frame. Walk down to find the ret
-                // frame, then shift the intervening frames down by
-                // one so they remain live for outer backtrack.
+            if (config.capture_events or config.memoize) {
+                // Find the call's ret frame (tag=1) -- or, when memoize
+                // is on, the matching memo frame (tag=5) -- by walking
+                // down from sp-1, stash the native return address, then
+                // shift any save / event / lcatch frames above it down
+                // by one so the outer backtrack can still undo them.
                 emitMovRR(buf, t1, bsp);
                 emitDec(buf, t1); // t1 = sp - 1 (top frame index)
 
@@ -711,6 +977,10 @@ fn emitInst(
                 emitMovRM(buf, t2, t0, 0); // t2 = tag
                 emitCmp32RI8(buf, t2, 1);
                 const found_rel32 = emitJccRel32(buf, CC.eq);
+                const found_memo_branch_off = if (config.memoize) blk: {
+                    emitCmp32RI8(buf, t2, 5);
+                    break :blk emitJccRel32(buf, CC.eq);
+                } else 0;
                 emitDec(buf, t1);
                 {
                     const back = emitJmpRel32(buf);
@@ -721,6 +991,38 @@ fn emitInst(
                 // t0 -> ret frame, t1 = ret_idx. Stash ret addr in t3
                 // so it survives the shift loop.
                 emitMovRM(buf, t3, t0, 8);
+
+                const skip_memo_block_off = if (config.memoize) emitJmpRel32(buf) else 0;
+
+                if (config.memoize) {
+                    patchRel32(buf, found_memo_branch_off, buf.off());
+                    // Stash t1 (= the matched-frame index from
+                    // find_loop) before the call clobbers caller-saved
+                    // regs; the shift loop below depends on it.
+                    emitMovMR(buf, rsp_r, stk_call_scratch, t1);
+                    // helperMemoRetSuccess(memo_ctx, side_idx, end_pos,
+                    // state_ptr, jump_table, code_base) -> native_addr
+                    // (or oom_sentinel on OOM). 6 args, all in regs.
+                    emitMovRM(buf, rsi_r, t0, 8); // arg2 = side_idx (val1)
+                    emitMovRM(buf, rdi_r, rsp_r, stk_memo_ctx); // arg1 = memo_ctx
+                    emitMovRR(buf, t2, pos); // arg3 = end_pos (rdx)
+                    if (config.capture_events) {
+                        emitMovRM(buf, t1, rsp_r, stk_esp); // arg4 = state (rcx)
+                    } else {
+                        emitXorRR32(buf, t1); // arg4 = 0
+                    }
+                    emitMovRM(buf, r8_r, rsp_r, stk_jtp); // arg5 = jump_table
+                    emitMovRM(buf, r9_r, rsp_r, stk_cbp); // arg6 = code_base
+                    emitMovRM(buf, t3, rdi_r, memoOff("helper_ret_success"));
+                    emitCallR(buf, t3);
+                    // rax = native target or oom_sentinel.
+                    emitCmpRI8(buf, t0, -1);
+                    addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                    emitMovRR(buf, t3, t0); // t3 = native target
+                    emitMovRM(buf, t1, rsp_r, stk_call_scratch); // restore t1
+
+                    patchRel32(buf, skip_memo_block_off, buf.off());
+                }
 
                 const shift_loop_off = buf.off();
                 emitMovRR(buf, t2, t1);
@@ -848,9 +1150,134 @@ fn emitInst(
             }
             // capture_events off: no-op (tree mode requires events on).
         },
-        // VM-only opcodes (recovery + token events). `compile` rejects any
-        // grammar carrying these with `error.JitDoesNotSupportOp`, so
-        // reaching here would mean the gate was bypassed.
-        .event_error_open, .event_error_close, .event_missing, .throw, .lcatch, .event_token, .event_field => unreachable,
+        .event_token => {
+            if (config.capture_events) {
+                const len: u8 = inst.data.byte;
+                // Call helper_append_token(state, start, end) where
+                // start = pos - len and end = pos.
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+                emitMovRR(buf, rsi_r, pos);
+                if (len > 0) emitSubRI(buf, rsi_r, @intCast(len));
+                emitMovRR(buf, t2, pos); // t2 is rdx
+                emitMovRM(buf, t3, rsp_r, stk_hat);
+                emitCallR(buf, t3);
+                emitCmpRI8(buf, t0, -1);
+                addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                // Build event stack entry: tag=3, event_len = pre_len.
+                emitMovRR(buf, t1, bsp);
+                emitShlRI(buf, t1, 5);
+                emitLeaRR(buf, t1, skp, t1);
+                emitMovMI(buf, t1, 0, 3);
+                emitMovMR(buf, t1, 24, t0);
+                emitInc(buf, bsp);
+            }
+            // capture_events off: no-op (mirrors VM behavior).
+        },
+        .event_field => {
+            if (config.capture_events) {
+                const field_id: u16 = inst.data.slot;
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+                emitMovRI32(buf, rsi_r, @intCast(field_id));
+                emitMovRR(buf, t2, pos);
+                emitMovRM(buf, t3, rsp_r, stk_haf);
+                emitCallR(buf, t3);
+                emitCmpRI8(buf, t0, -1);
+                addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                emitMovRR(buf, t1, bsp);
+                emitShlRI(buf, t1, 5);
+                emitLeaRR(buf, t1, skp, t1);
+                emitMovMI(buf, t1, 0, 3);
+                emitMovMR(buf, t1, 24, t0);
+                emitInc(buf, bsp);
+            }
+            // capture_events off: no-op (mirrors VM behavior).
+        },
+        .event_error_open, .event_error_close, .event_missing => {
+            if (config.capture_events) {
+                const label: u16 = inst.data.slot;
+                const helper_slot: i32 = switch (inst.op) {
+                    .event_error_open => stk_haeo,
+                    .event_error_close => stk_haec,
+                    .event_missing => stk_haem,
+                    else => unreachable,
+                };
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+                emitMovRI32(buf, rsi_r, @intCast(label));
+                emitMovRR(buf, t2, pos);
+                emitMovRM(buf, t3, rsp_r, helper_slot);
+                emitCallR(buf, t3);
+                emitCmpRI8(buf, t0, -1);
+                addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+                emitMovRR(buf, t1, bsp);
+                emitShlRI(buf, t1, 5);
+                emitLeaRR(buf, t1, skp, t1);
+                emitMovMI(buf, t1, 0, 3);
+                emitMovMR(buf, t1, 24, t0);
+                emitInc(buf, bsp);
+            }
+            // capture_events off: no-op.
+        },
+        .lcatch => {
+            // Push a frame with tag=4, val1=label, val2=handler_pc,
+            // event_len=current events length. The backtrack handler
+            // treats tag>=3 like an event frame (truncate-and-skip), so
+            // a regular `fail` walks past lcatch as required by
+            // committed-choice semantics. A matching `throw` is what
+            // honors the catch.
+            //
+            // Compile rejects grammars with .lcatch when capture_events
+            // is off, so we always have a state pointer here.
+            const ch = inst.data.catch_handler;
+            // rdi = state_ptr; call helper_events_len.
+            emitMovRM(buf, rdi_r, rsp_r, stk_esp);
+            emitMovRM(buf, t3, rsp_r, stk_hel);
+            emitCallR(buf, t3);
+            // rax (t0) = events length. Build the stack entry; t1 holds
+            // the &stack_entry, t0 still holds events_len for the final
+            // store.
+            emitMovRR(buf, t1, bsp);
+            emitShlRI(buf, t1, 5);
+            emitLeaRR(buf, t1, skp, t1);
+            emitMovMI(buf, t1, 0, 4); // tag=4 (lcatch)
+            emitMovMI(buf, t1, 8, @intCast(ch.label));
+            emitMovMI(buf, t1, 16, @intCast(ch.handler_pc));
+            emitMovMR(buf, t1, 24, t0); // event_len = events_len
+            emitInc(buf, bsp);
+        },
+        .throw => {
+            // Call helperThrow(state, stack, &sp, label, throw_pos).
+            // The helper modifies *sp via the pointer, then returns
+            // either the handler bytecode PC (jump via the existing
+            // jump table) or the `throw_miss` sentinel (route to fail).
+            const label: u16 = inst.data.slot;
+
+            // Stash current bsp at stk_call_scratch so the helper sees
+            // the right depth and we can read back the new depth.
+            emitMovMR(buf, rsp_r, stk_call_scratch, bsp);
+
+            emitMovRM(buf, rdi_r, rsp_r, stk_esp); // arg1 = state_ptr
+            emitMovRR(buf, rsi_r, skp); // arg2 = stack_ptr
+            emitLeaRMDisp(buf, t2, rsp_r, stk_call_scratch); // arg3 = &sp
+            emitMovRI32(buf, t1, @intCast(label)); // arg4 = label (rcx)
+            emitMovRR(buf, r8_r, pos); // arg5 = throw_pos
+
+            emitMovRM(buf, t3, rsp_r, stk_ht);
+            emitCallR(buf, t3);
+
+            // Reload bsp from the scratch slot (helper updated it).
+            emitMovRM(buf, bsp, rsp_r, stk_call_scratch);
+
+            // Check throw_miss sentinel (= -1).
+            emitCmpRI8(buf, t0, -1);
+            addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
+
+            // rax = handler bytecode PC. Index into jump_table to get
+            // the native code offset, add code_base, jmp.
+            emitMovRM(buf, t1, rsp_r, stk_jtp);
+            emitMovRMSib8(buf, t0, t1, t0); // rax = jt[bc_pc] (scale=8)
+            emitMovRM(buf, t1, rsp_r, stk_cbp);
+            emitLeaRR(buf, t0, t1, t0); // rax = cbp + offset
+            emitJmpR(buf, t0);
+        },
     }
 }
