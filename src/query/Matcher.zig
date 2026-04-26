@@ -127,15 +127,20 @@ fn matchPattern(
             break :blk false;
         },
         .group => |gp| blk: {
-            // Tier-1 limitation: predicates are evaluated *after* the
-            // inner match returns success; they don't trigger backtracking
-            // within complex inners (e.g. `+` quantifiers). The dominant
-            // use case `((Rule) @cap (#pred? @cap ...))` has no internal
-            // backtracking dimension, so this is fine in practice.
-            if (try matchPattern(ctx, gp.inner.*, node)) {
-                if (runPredicates(ctx, gp.predicates)) break :blk true;
+            // Two shapes, distinguished by structure:
+            //   Single .pattern child, no anchors -> "predicate-scoping"
+            //   wrapper: match the inner against the visited node, with
+            //   the group's predicates folded into the inner's own
+            //   matchChildSeq (so a failing predicate triggers
+            //   backtracking through quantified inner children).
+            //   Otherwise (multi-pattern, or contains an anchor) ->
+            //   sibling-sequence match against the visited node's
+            //   children. Predicates fire at the success base case via
+            //   the standard matchChildSeq plumbing.
+            if (isPredicateScopingGroup(gp)) {
+                break :blk try matchScopingGroup(ctx, gp, node);
             }
-            break :blk false;
+            break :blk try matchChildSeq(ctx, gp.children, 0, node.children, 0, false, gp.predicates);
         },
     };
     if (matched) {
@@ -149,12 +154,73 @@ fn matchPattern(
     return matched;
 }
 
+/// True when a `GroupPattern` is the predicate-scoping shape: exactly
+/// one inner child, which is a plain `.pattern` (not an anchor and not
+/// field-tagged). Anything else -- multi-pattern, contains an anchor,
+/// or a field-tagged child -- is a sibling-sequence pattern over the
+/// visited node's children.
+fn isPredicateScopingGroup(gp: ast.GroupPattern) bool {
+    if (gp.children.len != 1) return false;
+    return gp.children[0] == .pattern;
+}
+
+/// Match a single-inner ("predicate-scoping") grouping against `node`.
+/// The outer pattern's `@capture` is bound speculatively before the
+/// inner runs, so the merged predicate set can reference it. When the
+/// inner is a node pattern, the group's predicates are folded into the
+/// inner's `matchChildSeq` predicates -- a failing predicate then
+/// triggers backtracking through any quantified inner children, fixing
+/// the case where a greedy `*`/`+` bound a capture the predicate then
+/// rejected. For non-node inners (alt / nested group), we fall back to
+/// the simpler "match then check" path.
+fn matchScopingGroup(
+    ctx: *MatchCtx,
+    gp: ast.GroupPattern,
+    node: *const CaptureTree.Node,
+) Error!bool {
+    const inner = gp.children[0].pattern;
+    const save = ctx.scratch_captures.items.len;
+
+    if (inner.body == .node) {
+        const np = inner.body.node;
+        if (!kindMatches(ctx, np, node)) return false;
+        // Bind the outer capture up front so the merged predicates can
+        // reference it (this is the only @cap they could plausibly read
+        // since predicates run before matchPattern's normal capture-on-
+        // success path).
+        if (inner.capture) |cap_id| {
+            try ctx.scratch_captures.append(ctx.scratch_alloc, .{
+                .name_id = cap_id,
+                .node = node,
+            });
+        }
+        // Merge the inner's own predicates with the group's predicates.
+        // Single small heap alloc per attempt; bounded by the number of
+        // predicates in the query.
+        var merged: std.ArrayListUnmanaged(ast.Predicate) = .empty;
+        defer merged.deinit(ctx.scratch_alloc);
+        try merged.appendSlice(ctx.scratch_alloc, np.predicates);
+        try merged.appendSlice(ctx.scratch_alloc, gp.predicates);
+        const ok = try matchChildSeq(ctx, np.children, 0, node.children, 0, false, merged.items);
+        if (!ok) ctx.scratch_captures.shrinkRetainingCapacity(save);
+        return ok;
+    }
+
+    // Non-node inner: match-then-check (no inner backtracking dimension
+    // for predicates to push against here).
+    if (try matchPattern(ctx, inner, node)) {
+        if (runPredicates(ctx, gp.predicates)) return true;
+        ctx.scratch_captures.shrinkRetainingCapacity(save);
+    }
+    return false;
+}
+
 fn matchNode(
     ctx: *MatchCtx,
     np: ast.NodePattern,
     node: *const CaptureTree.Node,
 ) Error!bool {
-    if (!kindMatches(np, node)) return false;
+    if (!kindMatches(ctx, np, node)) return false;
     // Predicates run at the success base case of the child sequence so
     // that a failing predicate triggers backtracking into matchChildSeq
     // (which can then try a different child binding for `@captures`
@@ -169,7 +235,7 @@ fn matchNode(
     return matchChildSeq(ctx, np.children, 0, node.children, 0, false, np.predicates);
 }
 
-fn kindMatches(np: ast.NodePattern, node: *const CaptureTree.Node) bool {
+fn kindMatches(ctx: *const MatchCtx, np: ast.NodePattern, node: *const CaptureTree.Node) bool {
     switch (np.kind) {
         .any => return true,
         .rule_named => |id| {
@@ -183,6 +249,11 @@ fn kindMatches(np: ast.NodePattern, node: *const CaptureTree.Node) bool {
         },
         .error_kind => return node.kind == .error_node,
         .missing_kind => return node.kind == .missing_node,
+        .token_text => |literal| {
+            if (node.kind != .token) return false;
+            const text = ctx.input[node.span.start..node.span.end];
+            return std.mem.eql(u8, text, literal);
+        },
     }
 }
 
@@ -221,6 +292,20 @@ fn matchChildSeq(
                     ai,
                     local_anchored,
                     predicates,
+                    null,
+                );
+            },
+            .field_pattern => |fp| {
+                return matchPatternInSeq(
+                    ctx,
+                    fp.pattern,
+                    patterns,
+                    local_pi + 1,
+                    actuals,
+                    ai,
+                    local_anchored,
+                    predicates,
+                    fp.field_id,
                 );
             },
         }
@@ -240,17 +325,18 @@ fn matchPatternInSeq(
     ai: usize,
     anchored: bool,
     predicates: []const ast.Predicate,
+    required_field: ?u16,
 ) Error!bool {
     switch (pat.quantifier) {
-        .one => return matchOneInSeq(ctx, pat, patterns, next_pi, actuals, ai, anchored, false, predicates),
-        .optional => return matchOneInSeq(ctx, pat, patterns, next_pi, actuals, ai, anchored, true, predicates),
+        .one => return matchOneInSeq(ctx, pat, patterns, next_pi, actuals, ai, anchored, false, predicates, required_field),
+        .optional => return matchOneInSeq(ctx, pat, patterns, next_pi, actuals, ai, anchored, true, predicates, required_field),
         .zero_or_more, .one_or_more => {
             const min: usize = if (pat.quantifier == .one_or_more) 1 else 0;
             // Try each starting position. With `anchored`, only `ai` is allowed.
             const start_max = if (anchored) ai else actuals.len;
             var start: usize = ai;
             while (start <= start_max) : (start += 1) {
-                if (try matchRun(ctx, pat, min, actuals, start, patterns, next_pi, predicates)) return true;
+                if (try matchRun(ctx, pat, min, actuals, start, patterns, next_pi, predicates, required_field)) return true;
             }
             return false;
         },
@@ -269,10 +355,15 @@ fn matchOneInSeq(
     anchored: bool,
     optional_skip: bool,
     predicates: []const ast.Predicate,
+    required_field: ?u16,
 ) Error!bool {
     const end = if (anchored) @min(ai + 1, actuals.len) else actuals.len;
     var try_ai = ai;
     while (try_ai < end) : (try_ai += 1) {
+        if (required_field) |fid| {
+            const node_field = actuals[try_ai].field orelse continue;
+            if (node_field != fid) continue;
+        }
         const save = ctx.scratch_captures.items.len;
         if (try matchPattern(ctx, pat, &actuals[try_ai])) {
             if (try matchChildSeq(ctx, patterns, next_pi, actuals, try_ai + 1, false, predicates)) return true;
@@ -298,13 +389,19 @@ fn matchRun(
     patterns: []const ast.Child,
     next_pi: usize,
     predicates: []const ast.Predicate,
+    required_field: ?u16,
 ) Error!bool {
     var saves: std.ArrayListUnmanaged(usize) = .empty;
     defer saves.deinit(ctx.scratch_alloc);
 
     while (start_ai + saves.items.len < actuals.len) {
+        const idx = start_ai + saves.items.len;
+        if (required_field) |fid| {
+            const node_field = actuals[idx].field orelse break;
+            if (node_field != fid) break;
+        }
         const save = ctx.scratch_captures.items.len;
-        if (try matchPattern(ctx, pat, &actuals[start_ai + saves.items.len])) {
+        if (try matchPattern(ctx, pat, &actuals[idx])) {
             try saves.append(ctx.scratch_alloc, save);
         } else {
             ctx.scratch_captures.shrinkRetainingCapacity(save);
@@ -338,8 +435,23 @@ fn evalPredicate(ctx: *MatchCtx, pred: ast.Predicate) bool {
     // currently equivalent.
     if (std.mem.eql(u8, pred.name, "eq")) return evalEq(ctx, pred, false);
     if (std.mem.eql(u8, pred.name, "not-eq")) return evalEq(ctx, pred, true);
-    if (std.mem.eql(u8, pred.name, "match")) return evalMatch(ctx, pred, false);
-    if (std.mem.eql(u8, pred.name, "not-match")) return evalMatch(ctx, pred, true);
+    // `#match?`, `#vim-match?`, `#lua-match?` all dispatch to the same
+    // ERE engine. The Vim and Lua flavors aren't ERE-equivalent in their
+    // metacharacters, but for the simple ASCII patterns most highlight
+    // queries actually use (`[A-Z][a-zA-Z0-9_]*`, `^_`, etc.) the three
+    // flavors agree -- aliasing them lets common nvim-treesitter `.scm`
+    // files load without per-engine rewrites. Patterns that depend on
+    // a specific flavor's quirks will misbehave.
+    if (std.mem.eql(u8, pred.name, "match") or
+        std.mem.eql(u8, pred.name, "vim-match") or
+        std.mem.eql(u8, pred.name, "lua-match")) return evalMatch(ctx, pred, false);
+    if (std.mem.eql(u8, pred.name, "not-match") or
+        std.mem.eql(u8, pred.name, "not-vim-match") or
+        std.mem.eql(u8, pred.name, "not-lua-match")) return evalMatch(ctx, pred, true);
+    if (std.mem.eql(u8, pred.name, "any-of")) return evalAnyOf(ctx, pred, false);
+    if (std.mem.eql(u8, pred.name, "not-any-of")) return evalAnyOf(ctx, pred, true);
+    if (std.mem.eql(u8, pred.name, "contains")) return evalContains(ctx, pred, false);
+    if (std.mem.eql(u8, pred.name, "not-contains")) return evalContains(ctx, pred, true);
     // Unknown predicate: tree-sitter passes through unknown predicates so
     // queries written for richer matchers degrade gracefully.
     return true;
@@ -371,6 +483,47 @@ fn regexMatchesAnywhere(compiled: ast.CompiledRegex, text: []const u8) !bool {
         if ((try v.execute()) != null) return true;
     }
     return false;
+}
+
+/// `(#any-of? @cap "a" "b" "c")` -- the captured text equals one of the
+/// literal string args. Capture must be the first arg; remaining args
+/// must all be strings. With no string args, no value can match -- so
+/// `any-of` is false (and `not-any-of` is true).
+fn evalAnyOf(ctx: *MatchCtx, pred: ast.Predicate, negate: bool) bool {
+    if (pred.args.len < 1) return false;
+    const text = argText(ctx, pred.args[0]) orelse return false;
+    var matched = false;
+    for (pred.args[1..]) |arg| {
+        const lit = switch (arg) {
+            .string => |s| s,
+            else => return false, // ill-formed: non-string after the capture
+        };
+        if (std.mem.eql(u8, text, lit)) {
+            matched = true;
+            break;
+        }
+    }
+    return if (negate) !matched else matched;
+}
+
+/// `(#contains? @cap "needle")` -- true when the captured text contains
+/// the literal `needle` as a substring. Multiple needles are ANDed (the
+/// capture must contain *every* needle), matching tree-sitter behavior.
+fn evalContains(ctx: *MatchCtx, pred: ast.Predicate, negate: bool) bool {
+    if (pred.args.len < 2) return false;
+    const text = argText(ctx, pred.args[0]) orelse return false;
+    var all_present = true;
+    for (pred.args[1..]) |arg| {
+        const needle = switch (arg) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (std.mem.indexOf(u8, text, needle) == null) {
+            all_present = false;
+            break;
+        }
+    }
+    return if (negate) !all_present else all_present;
 }
 
 fn argText(ctx: *MatchCtx, arg: ast.Arg) ?[]const u8 {
@@ -680,6 +833,130 @@ test "predicate #match? rejects non-matching captures" {
     try testing.expect(cursor.next() == null);
 }
 
+test "predicate #vim-match? aliases to ERE #match?" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    var query = try parser.compile(testing.allocator,
+        \\((Factor) @f (#vim-match? @f "[13579]"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    var count: usize = 0;
+    while (cursor.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 2), count); // "1" and "3"
+}
+
+test "single-inner grouping predicate backtracks through quantified inner" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    // Without backtracking, the greedy `(Factor)+` would bind @f to the
+    // last Factor of each Term and the predicate `(#eq? @f "2")` would
+    // reject Term [2,5]'s greedy bind ("3"). With backtracking through
+    // matchChildSeq, the inner retries with shorter counts and finds
+    // the run ending at "2".
+    var query = try parser.compile(testing.allocator,
+        \\((Term (Factor)+ @f) (#eq? @f "2"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    // The capture should bind to the Factor with text "2", not "3".
+    try testing.expectEqualStrings("2", "1+2*3"[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
+test "predicate #any-of? matches captures whose text is in the list" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    var query = try parser.compile(testing.allocator,
+        \\((Factor) @f (#any-of? @f "1" "3"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    var seen: [3][]const u8 = undefined;
+    var n: usize = 0;
+    while (cursor.next()) |m| : (n += 1) {
+        const span = m.captures[0].node.span;
+        seen[n] = "1+2*3"[span.start..span.end];
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("1", seen[0]);
+    try testing.expectEqualStrings("3", seen[1]);
+}
+
+test "predicate #not-any-of? excludes the listed captures" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    var query = try parser.compile(testing.allocator,
+        \\((Factor) @f (#not-any-of? @f "1" "3"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("2", "1+2*3"[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
+test "predicate #contains? finds substring in captured text" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    // Capture every Term; "2*3" contains "*", "1" doesn't.
+    var query = try parser.compile(testing.allocator,
+        \\((Term) @t (#contains? @t "*"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("2*3", "1+2*3"[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
+test "predicate #contains? with multiple needles ANDs them" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    // The Expr text "1+2*3" contains both "+" and "*".
+    var query = try parser.compile(testing.allocator,
+        \\((Expr) @e (#contains? @e "+" "*"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+    try testing.expect(cursor.next() != null);
+    try testing.expect(cursor.next() == null);
+}
+
+test "predicate #not-contains? rejects captures with the substring" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    var query = try parser.compile(testing.allocator,
+        \\((Term) @t (#not-contains? @t "*"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("1", "1+2*3"[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
 test "predicate #not-match? inverts" {
     var tree = try buildCalcTree();
     defer tree.deinit();
@@ -771,6 +1048,246 @@ test "end-to-end: real calc.peg grammar through PEG parser + VM + matcher" {
         try testing.expect(text[0] == '1' or text[0] == '3');
     }
     try testing.expectEqual(@as(usize, 2), odd_count);
+}
+
+test "anonymous-token query: matches keyword via real PEG + tagged tokens" {
+    const grammar =
+        \\#@ tokens "function" "if"
+        \\Stmt   <- "function" Ident / "if" Ident
+        \\Ident  <- [a-z]+
+    ;
+    const input = "functionfoo";
+
+    const RP = @import("../peg/Parser.zig").Parser;
+    var scanner = PegScanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var pp = @import("../peg/Parser.zig").ParserWith(.{ .recovery = true }).init(tokens, grammar);
+    const rules = try pp.parse();
+    try testing.expectEqual(@as(usize, 0), pp.getDiagnostics().len);
+    _ = RP;
+
+    const tagged = pp.getTaggedTokens();
+    try testing.expectEqual(@as(usize, 2), tagged.len);
+
+    var compiler = try VmCompiler.compileOpts(rules, .{
+        .rules_as_captures = true,
+        .token_events = .tagged,
+        .tagged_tokens = tagged,
+    });
+    const EventVm = vm_mod.VmWith(.{ .capture_events = true });
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        input,
+    );
+    defer vm.deinit();
+    try testing.expect((try vm.execute()) != null);
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    var names_buf: [16][]const u8 = undefined;
+    const rule_names = names_buf[0..compiler.rule_count];
+    for (0..compiler.rule_count) |i| rule_names[i] = compiler.getRuleName(@intCast(i));
+    const names: CaptureTree.Names = .{ .rules = rule_names };
+
+    // Query: capture the parent Stmt of any "function" token.
+    var query = try parser.compile(testing.allocator,
+        \\(Stmt "function") @s
+    , names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, input);
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("functionfoo", input[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
+test "multi-pattern grouping matches a sibling sequence under any parent" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    // The second Term in calc tree has two Factor children; this group
+    // matches that Term as the parent and binds both factors.
+    var query = try parser.compile(testing.allocator,
+        \\((Factor) @a (Factor) @b)
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqual(@as(usize, 2), m.captures.len);
+    try testing.expectEqualStrings("2", "1+2*3"[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expectEqualStrings("3", "1+2*3"[m.captures[1].node.span.start..m.captures[1].node.span.end]);
+    // No other parent has two consecutive Factor children.
+    try testing.expect(cursor.next() == null);
+}
+
+test "multi-pattern grouping with anchor enforces strict adjacency" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    // `.` between two Factors requires they be adjacent siblings -- which
+    // they are inside the second Term, so this still matches.
+    var query = try parser.compile(testing.allocator,
+        \\((Factor) @a . (Factor) @b)
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqual(@as(usize, 2), m.captures.len);
+    try testing.expect(cursor.next() == null);
+}
+
+test "multi-pattern grouping with predicate filters captured siblings" {
+    var tree = try buildCalcTree();
+    defer tree.deinit();
+    var query = try parser.compile(testing.allocator,
+        \\((Factor) @a (Factor) @b (#eq? @a "2"))
+    , calc_names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, "1+2*3");
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("2", "1+2*3"[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
+test "anonymous-token query: token_events=.all emits a leaf for every literal" {
+    const grammar =
+        \\Expr <- Term ("+" Term)*
+        \\Term <- [0-9]+
+    ;
+    const input = "1+2";
+
+    var scanner = PegScanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var pp = PegParser.init(tokens, grammar);
+    const rules = try pp.parse();
+
+    var compiler = try VmCompiler.compileOpts(rules, .{
+        .rules_as_captures = true,
+        .token_events = .all,
+    });
+    const EventVm = vm_mod.VmWith(.{ .capture_events = true });
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        input,
+    );
+    defer vm.deinit();
+    try testing.expect((try vm.execute()) != null);
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    var names_buf: [16][]const u8 = undefined;
+    const rule_names = names_buf[0..compiler.rule_count];
+    for (0..compiler.rule_count) |i| rule_names[i] = compiler.getRuleName(@intCast(i));
+    const names: CaptureTree.Names = .{ .rules = rule_names };
+
+    var query = try parser.compile(testing.allocator,
+        \\"+" @plus
+    , names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, input);
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("+", input[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+}
+
+test "field selector matches only field-tagged children" {
+    const grammar =
+        \\#@ tokens "function"
+        \\#@ field Func name = Ident
+        \\#@ field Func body = Body
+        \\Func  <- "function" _ Ident _ Body
+        \\Ident <- [a-z]+
+        \\Body  <- "{" _ "}"
+        \\_     <- " "*
+    ;
+    const input = "function foo{}";
+
+    const RP = @import("../peg/Parser.zig").ParserWith(.{ .recovery = true });
+    var scanner = PegScanner.init(grammar);
+    const tokens = scanner.scanTokens();
+    var pp = RP.init(tokens, grammar);
+    const rules = try pp.parse();
+    try testing.expectEqual(@as(usize, 0), pp.getDiagnostics().len);
+
+    var compiler = try VmCompiler.compileOpts(rules, .{
+        .rules_as_captures = true,
+        .field_events = true,
+        .token_events = .tagged,
+        .tagged_tokens = pp.getTaggedTokens(),
+    });
+    const EventVm = vm_mod.VmWith(.{ .capture_events = true });
+    var vm = EventVm.initEvents(
+        testing.allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        input,
+    );
+    defer vm.deinit();
+    try testing.expect((try vm.execute()) != null);
+
+    var tree = try vm.buildCaptureTree(testing.allocator);
+    defer tree.deinit();
+
+    var rname_buf: [16][]const u8 = undefined;
+    const rule_names = rname_buf[0..compiler.rule_count];
+    for (0..compiler.rule_count) |i| rule_names[i] = compiler.getRuleName(@intCast(i));
+    var fname_buf: [16][]const u8 = undefined;
+    const field_names = fname_buf[0..compiler.field_count];
+    for (0..compiler.field_count) |i| field_names[i] = compiler.getFieldName(@intCast(i));
+    const names: CaptureTree.Names = .{ .rules = rule_names, .fields = field_names };
+
+    // `name: (Ident)` should match the Ident field child but NOT the Body child.
+    var query = try parser.compile(testing.allocator,
+        \\(Func name: (Ident) @n)
+    , names, null);
+    defer query.deinit();
+
+    var cursor = try Cursor.init(testing.allocator, query, &tree, input);
+    defer cursor.deinit();
+
+    const m = cursor.next().?;
+    try testing.expectEqualStrings("foo", input[m.captures[0].node.span.start..m.captures[0].node.span.end]);
+    try testing.expect(cursor.next() == null);
+
+    // `body: (Body)` should match the Body child captured as @b.
+    var body_query = try parser.compile(testing.allocator,
+        \\(Func body: (Body) @b)
+    , names, null);
+    defer body_query.deinit();
+    var body_cursor = try Cursor.init(testing.allocator, body_query, &tree, input);
+    defer body_cursor.deinit();
+    const bm = body_cursor.next().?;
+    try testing.expectEqualStrings("{}", input[bm.captures[0].node.span.start..bm.captures[0].node.span.end]);
+
+    // `body: (Ident)` should NOT match -- the Ident child has field=name, not body.
+    var miss_query = try parser.compile(testing.allocator,
+        \\(Func body: (Ident) @n)
+    , names, null);
+    defer miss_query.deinit();
+    var miss_cursor = try Cursor.init(testing.allocator, miss_query, &tree, input);
+    defer miss_cursor.deinit();
+    try testing.expect(miss_cursor.next() == null);
 }
 
 test "no matches yields empty cursor" {

@@ -73,6 +73,25 @@ pub fn CompilerWith(comptime config: Config) type {
 
         rules: []const Ast.Rule = &.{},
 
+        /// Token-event emission state, populated by `compileOpts` from
+        /// `Options.token_events` / `Options.tagged_tokens`. Read by
+        /// `shouldEmitToken` during literal compilation.
+        token_events: TokenEvents = .off,
+        tagged_tokens: []const []const u8 = &.{},
+
+        /// Field-event emission flag, populated from
+        /// `Options.field_events`. When false, `.field` AST nodes
+        /// compile to just their body (no `event_field` emission).
+        field_events: bool = false,
+
+        /// Field-name table. Populated lazily by `fieldIdFor` when a
+        /// `.field` node is compiled with `field_events = true`. The
+        /// `getFieldName` accessor maps an id back for renderers and
+        /// query-side resolution. Empty for grammars that don't use
+        /// fields (or compile with `field_events = false`).
+        field_names: [256]I.Inst.StringRef = [_]I.Inst.StringRef{.{ .offset = 0, .len = 0 }} ** 256,
+        field_count: u16 = 0,
+
         const Patch = struct {
             addr: u32,
             name: []const u8,
@@ -102,7 +121,38 @@ pub fn CompilerWith(comptime config: Config) type {
             /// to run with `capture_events = true`; the events are
             /// no-ops otherwise. Single-rule grammars are unchanged.
             rules_as_captures: bool = false,
+            /// Anonymous-token event emission. Tri-state:
+            /// - `.off` (default): literal-matching opcodes emit no
+            ///   events; trees contain only rule nodes.
+            /// - `.all`: every literal (`char`, `string` after
+            ///   optimization) is followed by an `event_token` so all
+            ///   anonymous tokens appear in the tree. Mirrors
+            ///   tree-sitter, but inflates the event log.
+            /// - `.tagged`: only literals whose bytes appear in
+            ///   `tagged_tokens` get the event. Lets grammars opt in
+            ///   selectively (typically keywords/operators).
+            /// Requires `capture_events = true` at runtime; the events
+            /// are no-ops otherwise. Forces the JIT/AOT path off
+            /// (parallel to recovery): the VM is the only backend
+            /// that handles `event_token` today.
+            token_events: TokenEvents = .off,
+            /// Literal bytes to instrument under `token_events =
+            /// .tagged`. Each entry is a literal as it appears in the
+            /// grammar (e.g. `"function"`, `"+"`). Ignored in other
+            /// modes. The slice must outlive the compile call.
+            tagged_tokens: []const []const u8 = &.{},
+            /// When true, `.field`-tagged AST nodes (produced by the
+            /// PEG front-end from `name:Expr` syntax) emit an
+            /// `event_field` instruction before the body so the parse
+            /// tree carries the field name on the corresponding node.
+            /// When false (default), the field tag is dropped at
+            /// compile time and the body compiles unchanged. Forces
+            /// the JIT/AOT path off when set, parallel to recovery
+            /// and token events.
+            field_events: bool = false,
         };
+
+        pub const TokenEvents = enum { off, all, tagged };
 
         pub fn compileOpts(rules: []const Ast.Rule, opts: Options) Error!Self {
             var c = Self{};
@@ -110,6 +160,9 @@ pub fn CompilerWith(comptime config: Config) type {
 
             c.rules = rules;
             c.optimize_enabled = opts.optimize;
+            c.token_events = opts.token_events;
+            c.tagged_tokens = opts.tagged_tokens;
+            c.field_events = opts.field_events;
             c.rule_count = @intCast(rules.len);
             for (rules, 0..) |rule, i| c.rule_names[i] = c.internRuleName(rule.name);
 
@@ -180,6 +233,12 @@ pub fn CompilerWith(comptime config: Config) type {
             return self.string_data[ref.offset..][0..ref.len];
         }
 
+        /// Look up a field's name by id. Valid for ids < `field_count`.
+        pub fn getFieldName(self: *const Self, field_id: u16) []const u8 {
+            const ref = self.field_names[field_id];
+            return self.string_data[ref.offset..][0..ref.len];
+        }
+
         /// Resolve a label name to an id, allocating a fresh id on first
         /// use. Names are interned into `string_data` so they outlive
         /// the AST.
@@ -193,6 +252,23 @@ pub fn CompilerWith(comptime config: Config) type {
             self.label_names[self.label_count] = self.internRuleName(name);
             const id: u16 = self.label_count;
             self.label_count += 1;
+            return id;
+        }
+
+        /// Resolve a field name to an id, allocating a fresh id on first
+        /// use. Reuses `internRuleName` for string storage. Reuses the
+        /// `TooManyLabels` error for capacity overflow since fields and
+        /// labels share the same `[256]StringRef` shape.
+        fn fieldIdFor(self: *Self, name: []const u8) Error!u16 {
+            for (0..self.field_count) |i| {
+                const ref = self.field_names[i];
+                const stored = self.string_data[ref.offset..][0..ref.len];
+                if (std.mem.eql(u8, stored, name)) return @intCast(i);
+            }
+            if (self.field_count >= self.field_names.len) return Error.TooManyLabels;
+            self.field_names[self.field_count] = self.internRuleName(name);
+            const id: u16 = self.field_count;
+            self.field_count += 1;
             return id;
         }
 
@@ -255,6 +331,7 @@ pub fn CompilerWith(comptime config: Config) type {
                     for (cv.value) |b| {
                         try self.emit(.{ .op = .char, .data = .{ .byte = b } });
                     }
+                    try self.maybeEmitTokenEvent(cv.value);
                 },
                 .any => try self.emit(.{ .op = .any }),
                 .concatenation => |nodes| {
@@ -310,6 +387,13 @@ pub fn CompilerWith(comptime config: Config) type {
                 .missing_label => |name| {
                     const label_id = try self.labelIdFor(name);
                     try self.emit(.{ .op = .event_missing, .data = .{ .slot = label_id } });
+                },
+                .field => |f| {
+                    if (self.field_events) {
+                        const fid = try self.fieldIdFor(f.name);
+                        try self.emit(.{ .op = .event_field, .data = .{ .slot = fid } });
+                    }
+                    try self.compileNode(f.body);
                 },
                 .lcatch => |c| {
                     // Lowers to:
@@ -415,7 +499,11 @@ pub fn CompilerWith(comptime config: Config) type {
 
         fn compileNumVal(self: *Self, nv: Ast.NumVal) Error!void {
             switch (nv) {
-                .single => |b| try self.emit(.{ .op = .char, .data = .{ .byte = b } }),
+                .single => |b| {
+                    try self.emit(.{ .op = .char, .data = .{ .byte = b } });
+                    const literal = [_]u8{b};
+                    try self.maybeEmitTokenEvent(&literal);
+                },
                 .range => |r| {
                     const ranges = [_][2]u8{.{ r.lo, r.hi }};
                     const idx = try self.addCharsetFromRaw(&ranges);
@@ -425,8 +513,32 @@ pub fn CompilerWith(comptime config: Config) type {
                     for (bytes) |b| {
                         try self.emit(.{ .op = .char, .data = .{ .byte = b } });
                     }
+                    try self.maybeEmitTokenEvent(bytes);
                 },
             }
+        }
+
+        /// Emit an `event_token` instruction immediately after a literal-
+        /// matching opcode if the current `token_events` mode opts in for
+        /// this literal. The `byte` operand encodes the literal length so
+        /// the VM can compute `start = pos - len` after the literal
+        /// succeeds. Literals longer than 255 bytes (or empty) skip
+        /// emission since the operand is `u8`; in practice grammars
+        /// don't write multi-hundred-byte literals.
+        fn maybeEmitTokenEvent(self: *Self, literal: []const u8) Error!void {
+            if (literal.len == 0 or literal.len > 255) return;
+            const want = switch (self.token_events) {
+                .off => false,
+                .all => true,
+                .tagged => blk: {
+                    for (self.tagged_tokens) |t| {
+                        if (std.mem.eql(u8, t, literal)) break :blk true;
+                    }
+                    break :blk false;
+                },
+            };
+            if (!want) return;
+            try self.emit(.{ .op = .event_token, .data = .{ .byte = @intCast(literal.len) } });
         }
 
         fn addCharset(self: *Self, ranges: []const Ast.ClassRange) Error!u16 {

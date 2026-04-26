@@ -60,6 +60,8 @@ pub fn dump(self: *const Disassembler, writer: anytype) !void {
             .event_error_open => try writer.print("event_error_open  L{d}\n", .{inst.data.slot}),
             .event_error_close => try writer.print("event_error_close L{d}\n", .{inst.data.slot}),
             .event_missing => try writer.print("event_missing     L{d}\n", .{inst.data.slot}),
+            .event_token => try writer.print("event_token len={d}\n", .{inst.data.byte}),
+            .event_field => try writer.print("event_field f{d}\n", .{inst.data.slot}),
             .throw => try writer.print("throw   L{d}\n", .{inst.data.slot}),
             .lcatch => try writer.print("lcatch  L{d} -> {d}\n", .{ inst.data.catch_handler.label, inst.data.catch_handler.handler_pc }),
             .match => try writer.writeAll("match\n"),

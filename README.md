@@ -25,7 +25,7 @@
 - **JIT compilers** - Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
 - **AOT compilation** - Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
 - **Parse trees** - Run any multi-rule grammar with auto-rule-captures to produce a hierarchical tree (S-expression or JSON), with each rule call becoming a node typed by rule name. Works on both the VM and the JIT, with optional packrat memoization.
-- **Tree queries** - Tree-sitter-style structural queries over parse trees, with `@captures`, alternation, quantifiers, anchors, and `#eq?`/`#match?` predicates (regex compiled at query-compile time via the bundled ERE engine).
+- **Tree queries** - Tree-sitter-style structural queries over parse trees, with `@captures`, alternation, quantifiers, anchors, field selectors (`name: (pattern)`, declared via backwards-compatible `#@ field` directives), anonymous-token literal matches (`#@ tokens "..."` or `--tokens=all`), and `#eq?`/`#match?` predicates (regex compiled at query-compile time via the bundled ERE engine).
 - **Benchmarks** - 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
 ## Comptime ABNF Compiler
@@ -338,7 +338,75 @@ Built-in predicates:
 - `(#not-eq? ...)` -- negated.
 - `(#match? @cap "regex")` -- ERE regex (compiled at query-compile time, substring search).
 - `(#not-match? ...)` -- negated.
+- `(#vim-match? ...)` / `(#lua-match? ...)` -- aliased to `#match?` so `nvim-treesitter`-style queries load. Patterns that depend on a flavor's specific metacharacters (Vim's `\v`, Lua's `%`) will misbehave.
+- `(#any-of? @cap "a" "b" ...)` -- captured text equals one of the listed strings.
+- `(#not-any-of? ...)` -- negated.
+- `(#contains? @cap "needle" ...)` -- captured text contains every listed substring (multiple needles are ANDed).
+- `(#not-contains? ...)` -- negated.
 - Unknown predicates pass through (tree-sitter convention) so queries written for richer matchers still parse.
+
+#### Anonymous tokens
+
+Bare string atoms in queries match anonymous-token nodes (literal-text matches in the parse tree). Token emission is opt-in via `--tokens=<mode>` on the CLI (or `Compiler.Options.token_events` programmatically). Three modes:
+
+- `--tokens=off` -- no token nodes (default for non-PEG grammars).
+- `--tokens=tagged` (default for PEG) -- only literals listed in `#@ tokens "..."` directives become token nodes. Backwards-compatible: other PEG tools see the directives as plain comments.
+- `--tokens=all` -- every literal-matching opcode emits a token node. Most ecosystem-compatible, but inflates the event log.
+
+```peg
+#@ tokens "+" "*"
+Expr   <- Term ("+" Term)*
+Term   <- Factor ("*" Factor)*
+Factor <- "(" Expr ")" / [0-9]+
+```
+
+```scheme
+; operators.scm -- captures every "+" and "*" anonymous-token node.
+"+" @plus
+"*" @star
+```
+
+```
+$ zpars query examples/calc-tokens.peg examples/operators.scm "1+2*3"
+pattern: 0
+  capture: name=plus, range=[1,2], text='+'
+pattern: 1
+  capture: name=star, range=[3,4], text='*'
+```
+
+Token events are currently VM-only (the JIT/AOT backends fall back to the VM when `event_token` is present, parallel to the labeled-failure recovery opcodes).
+
+#### Fields
+
+Field annotations let queries select children by role rather than position. zpars stays PEG-compliant: fields are declared via backwards-compatible `#@ field` comment directives (other PEG tools see them as plain comments), then referenced from queries with the standard tree-sitter `name: (pattern)` syntax.
+
+```peg
+#@ tokens "function"
+#@ field Func name = Ident
+#@ field Func body = Body
+Func  <- "function" _ Ident _ Body
+Ident <- [a-z]+
+Body  <- "{" _ "}"
+_     <- " "*
+```
+
+When the same target appears multiple times in a rule body, an explicit ordinal disambiguates: `#@ field Bin left = Expr#1`, `#@ field Bin right = Expr#2`. Targets can also be quoted literals (`= "function"`) for tagging anonymous-token children.
+
+```scheme
+; func.scm
+(Func
+  name: (Ident) @fname
+  body: (Body) @fbody)
+```
+
+```
+$ zpars query examples/func.peg examples/func.scm "function foo{}"
+pattern: 0
+  capture: name=fname, range=[9,12], text='foo'
+  capture: name=fbody, range=[12,14], text='{}'
+```
+
+Field events are auto-enabled when the PEG parser collects at least one `#@ field` directive. Like token events, they're currently VM-only.
 
 Programmatic API:
 
@@ -360,7 +428,9 @@ while (cursor.next()) |m| {
 }
 ```
 
-Tier-1 scope (current): query syntax, capture model, predicates, ERROR/MISSING/partial heads, `zpars query` CLI. Not yet supported: tree-sitter `field: (...)` syntax, anonymous-token nodes (`"+"`), and multi-pattern groupings -- these are the remaining wall before upstream `tree-sitter-*` `.scm` files would be reusable verbatim.
+Multi-pattern groupings are supported: `((a) (b) (#pred? ...))` matches when the visited node has children matching `a` and `b` in order (gap-allowed by default; use `.` between them for strict adjacency). Predicates fire after the full sequence binds, so a failed predicate triggers backtracking through quantifiers naturally. Single-pattern groupings (`((Rule (Factor)+ @f) (#eq? @f "x"))`) get the same treatment: the group's predicates fold into the inner's child-sequence match so a rejected greedy bind retries with a shorter count.
+
+The CLI prints one entry per pattern match by default; pass `-c` (or `--captures`) to flatten the output into one entry per capture, ordered by source position. JSON forms are available for both modes via `-j`. An empty result set prints `no matches` to stderr.
 
 Try the example grammars:
 
@@ -373,7 +443,9 @@ zpars vm examples/bit.bnf "01010011"             # binary byte
 zpars tree examples/calc.peg "1+2*3"             # parse tree
 zpars tree --jit -j examples/calc.peg "1+2*3"    # JIT, JSON output
 zpars tree examples/recovery.peg "foo;bar"       # labeled-failure recovery
-zpars query examples/calc.peg examples/calc.scm "1+2*3"  # structural query
+zpars query examples/calc.peg examples/calc.scm "1+2*3"           # structural query
+zpars query examples/calc-tokens.peg examples/operators.scm "1+2*3"  # query anonymous tokens
+zpars query examples/func.peg examples/func.scm "function foo{}"  # query by field name
 ```
 
 ## CLI
@@ -386,7 +458,7 @@ zpars match   -r <rule> <file> <input>        # match input against a rule
 zpars run     <blob> <input>                  # run a compiled .zpar blob
 zpars tree    [-j] [-p|--jit] <file> <input>  # print parse tree (S-exp default, -j JSON)
 zpars vm      [-t] [-p] <file> [<input>]      # disassemble and run via VM
-zpars query   [-j] <grammar> <query-file> <input>  # run a tree-sitter-style query
+zpars query   [-j] [-c] [--tokens=off|all|tagged] <grammar> <query-file> <input>  # run a tree-sitter-style query
 ```
 
 ### check

@@ -28,9 +28,30 @@ pub const Event = union(enum) {
     /// Zero-width "expected X here" marker. `group_id` is a label id;
     /// `pos` is the insertion point.
     missing: Marker,
+    /// Anonymous token (literal match). The span is `[start, end)`; the
+    /// token is identified by `input[start..end]` -- there is no group id.
+    token: TokenMarker,
+    /// "Stamp" event emitted by the compiler immediately before a
+    /// rule call or literal that's tagged with a field name in the
+    /// source grammar (e.g. `name:Identifier`). `buildFromEvents`
+    /// attaches `field_id` to the *next* `open` or `token` node it
+    /// produces and then clears the pending field. The event survives
+    /// backtrack-and-discard via the same `event_len` undo path as
+    /// other event-style ops.
+    field_marker: FieldMarker,
 
     pub const Marker = struct {
         group_id: u16,
+        pos: u32,
+    };
+
+    pub const TokenMarker = struct {
+        start: u32,
+        end: u32,
+    };
+
+    pub const FieldMarker = struct {
+        field_id: u16,
         pos: u32,
     };
 };
@@ -45,23 +66,33 @@ pub const NodeKind = enum {
     rule_partial,
     error_node,
     missing_node,
+    token,
 };
 
 pub const Node = struct {
     kind: NodeKind,
     /// Rule id for `.rule`/`.rule_partial`; label id for the others.
     group_id: u16,
+    /// Field-name id stamped onto this node by a preceding
+    /// `field_marker` event, or `null` if untagged. Only meaningful
+    /// for `.rule`/`.rule_partial`/`.token` -- ERROR/MISSING nodes are
+    /// synthesized by the recovery handler and never carry fields.
+    field: ?u16 = null,
     span: Span,
     children: []Node,
 };
 
 /// Naming context passed to the renderers. `rules` resolves `group_id`
 /// for `.rule`/`.rule_partial` nodes; `labels` resolves it for
-/// `.error_node`/`.missing_node` nodes. Either may be empty - missing
-/// names render as a hyphen.
+/// `.error_node`/`.missing_node` nodes; `fields` resolves a node's
+/// optional `field` slot. `source`, when non-null, is used to render
+/// `.token` nodes as `("text" [s,e])`; without it, token nodes render
+/// as `(TOKEN [s,e])`. Any field may be empty/null.
 pub const Names = struct {
     rules: []const []const u8 = &.{},
     labels: []const []const u8 = &.{},
+    fields: []const []const u8 = &.{},
+    source: ?[]const u8 = null,
 };
 
 /// Tree owns its nodes via the provided allocator. Call `deinit` to free.
@@ -109,8 +140,13 @@ fn labelName(names: Names, group_id: u16) []const u8 {
     return if (group_id < names.labels.len) names.labels[group_id] else "-";
 }
 
+fn fieldName(names: Names, field_id: u16) []const u8 {
+    return if (field_id < names.fields.len) names.fields[field_id] else "-";
+}
+
 fn writeSExpNode(node: Node, writer: anytype, names: Names, depth: usize) !void {
     try writer.splatByteAll(' ', depth);
+    if (node.field) |fid| try writer.print("{s}: ", .{fieldName(names, fid)});
     switch (node.kind) {
         .rule => try writer.print("({s} [{d},{d}]", .{
             ruleName(names, node.group_id), node.span.start, node.span.end,
@@ -124,6 +160,12 @@ fn writeSExpNode(node: Node, writer: anytype, names: Names, depth: usize) !void 
         .missing_node => try writer.print("(MISSING [{d},{d}] {s}", .{
             node.span.start, node.span.end, labelName(names, node.group_id),
         }),
+        .token => if (names.source) |src|
+            try writer.print("(\"{s}\" [{d},{d}]", .{
+                src[node.span.start..node.span.end], node.span.start, node.span.end,
+            })
+        else
+            try writer.print("(TOKEN [{d},{d}]", .{ node.span.start, node.span.end }),
     }
     for (node.children) |child| {
         try writer.writeByte('\n');
@@ -134,19 +176,17 @@ fn writeSExpNode(node: Node, writer: anytype, names: Names, depth: usize) !void 
 
 fn writeJsonNode(node: Node, writer: anytype, names: Names) !void {
     switch (node.kind) {
-        .rule => try writer.print("{{\"type\":\"{s}\",\"span\":[{d},{d}]", .{
-            ruleName(names, node.group_id), node.span.start, node.span.end,
-        }),
-        .rule_partial => try writer.print("{{\"type\":\"{s}\",\"span\":[{d},{d}],\"partial\":true", .{
-            ruleName(names, node.group_id), node.span.start, node.span.end,
-        }),
-        .error_node => try writer.print("{{\"type\":\"ERROR\",\"label\":\"{s}\",\"span\":[{d},{d}]", .{
-            labelName(names, node.group_id), node.span.start, node.span.end,
-        }),
-        .missing_node => try writer.print("{{\"type\":\"MISSING\",\"label\":\"{s}\",\"span\":[{d},{d}]", .{
-            labelName(names, node.group_id), node.span.start, node.span.end,
-        }),
+        .rule => try writer.print("{{\"type\":\"{s}\"", .{ruleName(names, node.group_id)}),
+        .rule_partial => try writer.print("{{\"type\":\"{s}\",\"partial\":true", .{ruleName(names, node.group_id)}),
+        .error_node => try writer.print("{{\"type\":\"ERROR\",\"label\":\"{s}\"", .{labelName(names, node.group_id)}),
+        .missing_node => try writer.print("{{\"type\":\"MISSING\",\"label\":\"{s}\"", .{labelName(names, node.group_id)}),
+        .token => if (names.source) |src|
+            try writer.print("{{\"type\":\"TOKEN\",\"text\":\"{s}\"", .{src[node.span.start..node.span.end]})
+        else
+            try writer.writeAll("{\"type\":\"TOKEN\""),
     }
+    if (node.field) |fid| try writer.print(",\"field\":\"{s}\"", .{fieldName(names, fid)});
+    try writer.print(",\"span\":[{d},{d}]", .{ node.span.start, node.span.end });
     if (node.children.len > 0) {
         try writer.writeAll(",\"children\":[");
         for (node.children, 0..) |child, i| {
@@ -181,6 +221,9 @@ pub fn buildFromEvents(allocator: std.mem.Allocator, events: []const Event) Buil
         /// `.error_open`. The closing-event variant must agree with this.
         open_kind: NodeKind,
         group_id: u16,
+        /// Field id stamped on by a preceding `field_marker` event,
+        /// inherited by the resulting Node when the frame closes.
+        field: ?u16,
         start: u32,
         children: std.ArrayListUnmanaged(Node),
     };
@@ -202,22 +245,36 @@ pub fn buildFromEvents(allocator: std.mem.Allocator, events: []const Event) Buil
         }
     }
 
+    // `pending_field` is set by a `field_marker` event and consumed by
+    // the very next node-producing event (`.open` or `.token`). Any
+    // other event in between clears it -- the compiler always emits
+    // field markers immediately before the call/literal they tag, so
+    // an intervening event would be a broken bytecode assumption.
+    var pending_field: ?u16 = null;
+
     for (events) |ev| switch (ev) {
+        .field_marker => |fm| {
+            pending_field = fm.field_id;
+        },
         .open => |o| {
             try stack.append(allocator, .{
                 .open_kind = .rule,
                 .group_id = o.group_id,
+                .field = pending_field,
                 .start = o.pos,
                 .children = .empty,
             });
+            pending_field = null;
         },
         .error_open => |o| {
             try stack.append(allocator, .{
                 .open_kind = .error_node,
                 .group_id = o.group_id,
+                .field = null,
                 .start = o.pos,
                 .children = .empty,
             });
+            pending_field = null;
         },
         .close => |c| try popInto(&stack, &roots, allocator, c, .rule, .rule),
         .partial_close => |c| try popInto(&stack, &roots, allocator, c, .rule, .rule_partial),
@@ -230,6 +287,18 @@ pub fn buildFromEvents(allocator: std.mem.Allocator, events: []const Event) Buil
                 .children = &.{},
             };
             try appendNode(&stack, &roots, allocator, node);
+            pending_field = null;
+        },
+        .token => |t| {
+            const node = Node{
+                .kind = .token,
+                .group_id = 0,
+                .field = pending_field,
+                .span = .{ .start = t.start, .end = t.end },
+                .children = &.{},
+            };
+            try appendNode(&stack, &roots, allocator, node);
+            pending_field = null;
         },
     };
 
@@ -260,6 +329,7 @@ fn popInto(
     const node = Node{
         .kind = produce_kind,
         .group_id = top.group_id,
+        .field = top.field,
         .span = .{ .start = top.start, .end = close.pos },
         .children = children,
     };
@@ -559,7 +629,7 @@ test "writeJson: rule_partial carries partial:true" {
     var stream: std.Io.Writer = .fixed(&buf);
     try tree.writeJson(&stream, .{ .rules = &.{"Stmt"} });
     try testing.expectEqualStrings(
-        \\[{"type":"Stmt","span":[0,2],"partial":true}]
+        \\[{"type":"Stmt","partial":true,"span":[0,2]}]
     , stream.buffered());
 }
 
@@ -577,4 +647,50 @@ test "writeJson: error_node uses ERROR type with label field" {
     try testing.expectEqualStrings(
         \\[{"type":"ERROR","label":"stmt_garbage","span":[1,4]}]
     , stream.buffered());
+}
+
+test "buildFromEvents: token event produces leaf node" {
+    const events = [_]Event{
+        .{ .open = .{ .group_id = 0, .pos = 0 } },
+        .{ .token = .{ .start = 1, .end = 4 } },
+        .{ .close = .{ .group_id = 0, .pos = 4 } },
+    };
+    var tree = try buildFromEvents(testing.allocator, &events);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 1), tree.roots[0].children.len);
+    const tok = tree.roots[0].children[0];
+    try testing.expectEqual(NodeKind.token, tok.kind);
+    try testing.expectEqual(Span{ .start = 1, .end = 4 }, tok.span);
+    try testing.expectEqual(@as(usize, 0), tok.children.len);
+}
+
+test "writeSExp: token renders quoted text when source is provided" {
+    const events = [_]Event{
+        .{ .open = .{ .group_id = 0, .pos = 0 } },
+        .{ .token = .{ .start = 0, .end = 3 } },
+        .{ .close = .{ .group_id = 0, .pos = 3 } },
+    };
+    var tree = try buildFromEvents(testing.allocator, &events);
+    defer tree.deinit();
+
+    var buf: [128]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try tree.writeSExp(&stream, .{ .rules = &.{"Stmt"}, .source = "fn x" });
+    try testing.expectEqualStrings(
+        \\(Stmt [0,3]
+        \\  ("fn " [0,3]))
+    , stream.buffered());
+}
+
+test "writeSExp: token renders TOKEN placeholder without source" {
+    const events = [_]Event{
+        .{ .token = .{ .start = 2, .end = 5 } },
+    };
+    var tree = try buildFromEvents(testing.allocator, &events);
+    defer tree.deinit();
+
+    var buf: [64]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try tree.writeSExp(&stream, .{});
+    try testing.expectEqualStrings("(TOKEN [2,5])", stream.buffered());
 }

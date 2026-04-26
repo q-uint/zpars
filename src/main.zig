@@ -50,7 +50,7 @@ fn printUsage() void {
         \\  run     <blob> <input>             Run a compiled .zpar blob
         \\  tree    [-j] [-p|--jit] <file> <input>  Parse input and print parse tree (-j JSON, -p packrat, --jit native)
         \\  vm      [-t] [-p] <file> [<input>]  Disassemble (and optionally run) via VM (-t trace, -p packrat)
-        \\  query   [-j] <grammar> <query-file> <input>  Run a tree-sitter-style query over the parse tree (-j JSON)
+        \\  query   [-j] [-c] [--tokens=off|all|tagged] <grammar> <query-file> <input>  Run a tree-sitter-style query (-c flattens captures)
         \\
         \\Format is auto-detected from file extension (.abnf, .peg, .ere).
         \\
@@ -554,10 +554,20 @@ fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
     var query_file: ?[]const u8 = null;
     var input: ?[]const u8 = null;
     var json_output = false;
+    var captures_mode = false;
+    var token_mode: zpars.vm.Compiler.TokenEvents = .tagged;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--json")) {
             json_output = true;
+        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--captures")) {
+            captures_mode = true;
+        } else if (std.mem.eql(u8, arg, "--tokens=off")) {
+            token_mode = .off;
+        } else if (std.mem.eql(u8, arg, "--tokens=all")) {
+            token_mode = .all;
+        } else if (std.mem.eql(u8, arg, "--tokens=tagged")) {
+            token_mode = .tagged;
         } else if (grammar_file == null) {
             grammar_file = arg;
         } else if (query_file == null) {
@@ -568,7 +578,7 @@ fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
     }
 
     if (grammar_file == null or query_file == null or input == null) {
-        std.debug.print("usage: zpars query [-j] <grammar> <query-file> <input>\n", .{});
+        std.debug.print("usage: zpars query [-j] [-c|--captures] [--tokens=off|all|tagged] <grammar> <query-file> <input>\n", .{});
         std.process.exit(1);
     }
 
@@ -581,15 +591,49 @@ fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
     var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
+    // Inline PEG parse so we can pull `#@ tokens "..."` directives off
+    // the parser for `--tokens=tagged` mode. Other formats don't have
+    // the directive infrastructure, so their tagged-tokens list is
+    // empty (and `.tagged` reduces to a no-op for them).
     const RecoveryPegParser = zpars.peg.ParserWith(.{ .recovery = true });
+    var peg_parser_box: ?RecoveryPegParser = null;
     const rules = switch (detectFormat(grammar_file.?)) {
         .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, grammar_src, grammar_file.?, stderr)).rules,
         .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, grammar_src, grammar_file.?, stderr)).rules,
-        .peg => (try parseGrammar(zpars.peg.Scanner, RecoveryPegParser, grammar_src, grammar_file.?, stderr)).rules,
+        .peg => blk: {
+            var scanner = zpars.peg.Scanner.init(grammar_src);
+            const tokens = scanner.scanTokens();
+            peg_parser_box = RecoveryPegParser.init(tokens, grammar_src);
+            const rs = try peg_parser_box.?.parse();
+            const diags = peg_parser_box.?.getDiagnostics();
+            if (diags.len > 0) {
+                for (diags) |diag| diag.format(grammar_src, grammar_file.?, stderr) catch {};
+                stderr.flush() catch {};
+                std.process.exit(1);
+            }
+            break :blk rs;
+        },
         .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, grammar_src, grammar_file.?, stderr)).rules,
     };
 
-    var compiler = try zpars.vm.Compiler.compileOpts(rules, .{ .rules_as_captures = true });
+    const tagged_tokens: []const []const u8 = if (peg_parser_box) |*p| p.getTaggedTokens() else &.{};
+    // Field events are enabled whenever the PEG parser collected at
+    // least one `#@ field` directive; otherwise they're a no-op so we
+    // leave the JIT/AOT path eligible for grammars that don't use
+    // them.
+    const field_events_on = blk: {
+        if (peg_parser_box != null) {
+            for (rules) |r| if (zpars.Validator.containsField(r.node)) break :blk true;
+        }
+        break :blk false;
+    };
+
+    var compiler = try zpars.vm.Compiler.compileOpts(rules, .{
+        .rules_as_captures = true,
+        .field_events = field_events_on,
+        .token_events = token_mode,
+        .tagged_tokens = tagged_tokens,
+    });
 
     var rule_names_buf: [256][]const u8 = undefined;
     const rule_names = rule_names_buf[0..compiler.rule_count];
@@ -599,7 +643,15 @@ fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
     const label_names = label_names_buf[0..compiler.label_count];
     for (0..compiler.label_count) |i| label_names[i] = compiler.getLabelName(@intCast(i));
 
-    const names: zpars.vm.CaptureTree.Names = .{ .rules = rule_names, .labels = label_names };
+    var field_names_buf: [256][]const u8 = undefined;
+    const field_names = field_names_buf[0..compiler.field_count];
+    for (0..compiler.field_count) |i| field_names[i] = compiler.getFieldName(@intCast(i));
+
+    const names: zpars.vm.CaptureTree.Names = .{
+        .rules = rule_names,
+        .labels = label_names,
+        .fields = field_names,
+    };
 
     const EventVm = zpars.vm.VmWith(.{ .capture_events = true });
     var vm = EventVm.initEvents(
@@ -635,21 +687,48 @@ fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
     var cursor = try zpars.query.Cursor.init(allocator, query, &tree, input.?);
     defer cursor.deinit();
 
-    if (json_output) try stdout.writeByte('[');
-    var first = true;
-    while (cursor.next()) |m| {
+    // Drain the cursor up front so we can count for the "no matches"
+    // check and (in captures mode) re-order captures by source position.
+    var matches: std.ArrayList(zpars.query.Match) = .empty;
+    defer matches.deinit(allocator);
+    while (cursor.next()) |m| try matches.append(allocator, m);
+
+    if (matches.items.len == 0) {
+        try stderr.print("no matches\n", .{});
+        try stderr.flush();
         if (json_output) {
-            if (!first) try stdout.writeByte(',');
-            try stdout.print(
-                "{{\"pattern\":{d},\"captures\":[",
-                .{m.pattern_id},
-            );
+            try stdout.writeAll("[]\n");
+            try stdout.flush();
+        }
+        return;
+    }
+
+    if (captures_mode) {
+        try writeCapturesOutput(allocator, stdout, &matches, query, input.?, json_output);
+    } else {
+        try writeMatchesOutput(stdout, matches.items, query, input.?, json_output);
+    }
+    try stdout.flush();
+}
+
+fn writeMatchesOutput(
+    stdout: anytype,
+    matches: []const zpars.query.Match,
+    query: *const zpars.query.Query,
+    input: []const u8,
+    json_output: bool,
+) !void {
+    if (json_output) try stdout.writeByte('[');
+    for (matches, 0..) |m, mi| {
+        if (json_output) {
+            if (mi > 0) try stdout.writeByte(',');
+            try stdout.print("{{\"pattern\":{d},\"captures\":[", .{m.pattern_id});
             for (m.captures, 0..) |cap, ci| {
                 if (ci > 0) try stdout.writeByte(',');
                 const span = cap.node.span;
                 try stdout.print(
                     "{{\"name\":\"{s}\",\"range\":[{d},{d}],\"text\":\"{s}\"}}",
-                    .{ query.captureName(cap.name_id), span.start, span.end, input.?[span.start..span.end] },
+                    .{ query.captureName(cap.name_id), span.start, span.end, input[span.start..span.end] },
                 );
             }
             try stdout.writeAll("]}");
@@ -659,17 +738,70 @@ fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !v
                 const span = cap.node.span;
                 try stdout.print(
                     "  capture: name={s}, range=[{d},{d}], text='{s}'\n",
-                    .{ query.captureName(cap.name_id), span.start, span.end, input.?[span.start..span.end] },
+                    .{ query.captureName(cap.name_id), span.start, span.end, input[span.start..span.end] },
                 );
             }
         }
-        first = false;
     }
     if (json_output) {
         try stdout.writeByte(']');
         try stdout.writeByte('\n');
     }
-    try stdout.flush();
+}
+
+/// `-c` output: flatten every (pattern, capture) pair, sort by source
+/// position (start ascending, end descending so broader spans come
+/// first), and emit one line / JSON object per capture.
+fn writeCapturesOutput(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    matches: *const std.ArrayList(zpars.query.Match),
+    query: *const zpars.query.Query,
+    input: []const u8,
+    json_output: bool,
+) !void {
+    const Flat = struct {
+        pattern_id: u16,
+        cap: zpars.query.Capture,
+    };
+
+    var flat: std.ArrayList(Flat) = .empty;
+    defer flat.deinit(allocator);
+    for (matches.items) |m| {
+        for (m.captures) |c| try flat.append(allocator, .{ .pattern_id = m.pattern_id, .cap = c });
+    }
+    std.mem.sort(Flat, flat.items, {}, struct {
+        fn lt(_: void, a: Flat, b: Flat) bool {
+            const sa = a.cap.node.span;
+            const sb = b.cap.node.span;
+            if (sa.start != sb.start) return sa.start < sb.start;
+            if (sa.end != sb.end) return sa.end > sb.end;
+            return a.pattern_id < b.pattern_id;
+        }
+    }.lt);
+
+    if (json_output) try stdout.writeByte('[');
+    for (flat.items, 0..) |entry, i| {
+        const span = entry.cap.node.span;
+        const text = input[span.start..span.end];
+        const name = query.captureName(entry.cap.name_id);
+        if (json_output) {
+            if (i > 0) try stdout.writeByte(',');
+            try stdout.print(
+                "{{\"name\":\"{s}\",\"pattern\":{d},\"range\":[{d},{d}],\"text\":\"{s}\"}}",
+                .{ name, entry.pattern_id, span.start, span.end, text },
+            );
+        } else {
+            try stdout.print(
+                "capture: name={s}, pattern={d}, range=[{d},{d}], text='{s}'\n",
+                .{ name, entry.pattern_id, span.start, span.end, text },
+            );
+        }
+    }
+    if (json_output) {
+        try stdout.writeByte(']');
+        try stdout.writeByte('\n');
+    }
 }
 
 fn readSource(io: Io, allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {

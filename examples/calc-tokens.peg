@@ -1,0 +1,7 @@
+# calc.peg with anonymous-token markup. The `#@ tokens "..."` directive
+# lists literals that should appear as token nodes in the parse tree.
+# Other PEG tools see this as a plain comment.
+#@ tokens "+" "*"
+Expr   <- Term ("+" Term)*
+Term   <- Factor ("*" Factor)*
+Factor <- "(" Expr ")" / [0-9]+

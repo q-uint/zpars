@@ -34,6 +34,8 @@ pub const Tag = enum {
     identifier,
     /// `; ...` line comment. Includes the leading `;` but not the trailing newline.
     comment,
+    /// `:` -- field-name separator: `name: (pattern)`.
+    colon,
 
     eof,
     invalid,

@@ -136,7 +136,7 @@ pub fn formatNode(node: Ast.Node, writer: anytype) anyerror!void {
         },
         .rulename => |name| try writer.writeAll(name),
         // Nodes not produced by the ABNF parser.
-        .and_predicate, .not_predicate, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .capture, .throw_label, .lcatch, .missing_label => unreachable,
+        .and_predicate, .not_predicate, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .capture, .throw_label, .lcatch, .missing_label, .field => unreachable,
     }
 }
 

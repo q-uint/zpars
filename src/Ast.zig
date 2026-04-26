@@ -62,6 +62,18 @@ pub const Node = union(enum) {
     /// recovery handler (or via the `recover_missing` builtin handler form
     /// in PEG).
     missing_label: []const u8,
+    /// Field-tagged sub-expression: produced by the PEG front-end from
+    /// `name:Expr` syntax. Compiled identically to `body` plus a leading
+    /// `event_field` instruction (under `Compiler.Options.field_events`)
+    /// that stamps `name` onto the next open/token node the body
+    /// produces. Other front-ends (ABNF/BNF/CFG/ERE) don't emit this
+    /// variant.
+    field: FieldNode,
+};
+
+pub const FieldNode = struct {
+    name: []const u8,
+    body: *const Node,
 };
 
 /// Payload for `Node.lcatch`.

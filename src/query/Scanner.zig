@@ -55,6 +55,7 @@ pub const Scanner = struct {
             '?' => try self.addToken(allocator, .question),
             '*' => try self.addToken(allocator, .star),
             '+' => try self.addToken(allocator, .plus),
+            ':' => try self.addToken(allocator, .colon),
             ';' => try self.scanComment(allocator),
             '"' => try self.scanString(allocator),
             '@' => try self.scanSigil(allocator, .at_identifier),

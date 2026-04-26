@@ -321,6 +321,10 @@ pub fn MatcherWith(comptime config: Config) type {
                     return .{ .value = input[0..1], .rest = input[1..] };
                 },
                 .capture => |inner| self.matchNode(inner.*, input, depth + 1),
+                // `field` is a tree-level annotation; for the dynamic
+                // string Matcher (no event log), transparently match the
+                // body and discard the field name.
+                .field => |f| self.matchNode(f.body.*, input, depth + 1),
                 // Recovery is a runtime VM/JIT feature, not a Matcher
                 // feature - dynamic grammars run via Matcher don't have
                 // an event log. Reject these AST variants here; programs

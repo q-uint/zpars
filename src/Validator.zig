@@ -3,6 +3,26 @@ const Ast = @import("Ast.zig");
 
 const Validator = @This();
 
+/// True if any node in `node`'s subtree is `.field`-tagged. Used by
+/// callers (e.g. the `zpars query` CLI) to decide whether the VM
+/// compiler's `field_events` flag needs to be on, without needing to
+/// know the AST shape themselves.
+pub fn containsField(node: Ast.Node) bool {
+    return switch (node) {
+        .field => true,
+        .alternation => |alts| for (alts) |alt| {
+            if (containsField(alt)) break true;
+        } else false,
+        .concatenation => |elems| for (elems) |elem| {
+            if (containsField(elem)) break true;
+        } else false,
+        .repetition => |rep| containsField(rep.element.*),
+        .and_predicate, .not_predicate, .capture => |inner| containsField(inner.*),
+        .lcatch => |c| containsField(c.body.*) or containsField(c.handler.*),
+        else => false,
+    };
+}
+
 /// Case-insensitive hash map context for rule name lookups (RFC 5234 §2.1).
 const CaseInsensitiveContext = struct {
     pub fn hash(_: CaseInsensitiveContext, s: []const u8) u64 {
@@ -273,6 +293,7 @@ fn collectRefs(self: *Validator, node: Ast.Node, refs: *CiHashMap(void)) !void {
             try self.collectRefs(c.body.*, refs);
             try self.collectRefs(c.handler.*, refs);
         },
+        .field => |f| try self.collectRefs(f.body.*, refs),
         .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .throw_label, .missing_label => {},
     }
 }
@@ -299,6 +320,7 @@ fn nodeReferences(node: Ast.Node, name: []const u8) bool {
         .not_predicate => |inner| nodeReferences(inner.*, name),
         .capture => |inner| nodeReferences(inner.*, name),
         .lcatch => |c| nodeReferences(c.body.*, name) or nodeReferences(c.handler.*, name),
+        .field => |f| nodeReferences(f.body.*, name),
         .char_val, .num_val, .prose_val, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .throw_label, .missing_label => false,
     };
 }
@@ -350,6 +372,7 @@ fn isProductive(
         .missing_label => true,
         .lcatch => |c| isProductive(c.body.*, merged_rules, name_index, productive) or
             isProductive(c.handler.*, merged_rules, name_index, productive),
+        .field => |f| isProductive(f.body.*, merged_rules, name_index, productive),
     };
 }
 
@@ -403,6 +426,7 @@ fn isNullable(
         .throw_label => false,
         .missing_label => true,
         .lcatch => |c| isNullable(c.body.*, merged_rules, name_index, nullable),
+        .field => |f| isNullable(f.body.*, merged_rules, name_index, nullable),
     };
 }
 
@@ -461,6 +485,7 @@ fn collectLeftReachable(
             // Recurse through the body only.
             collectLeftReachable(c.body.*, merged_rules, name_index, nullable, visited);
         },
+        .field => |f| collectLeftReachable(f.body.*, merged_rules, name_index, nullable, visited),
         .char_val,
         .num_val,
         .prose_val,
@@ -506,6 +531,7 @@ fn hasZeroWidthLoop(
         .capture => |inner| hasZeroWidthLoop(inner.*, merged_rules, name_index, nullable),
         .lcatch => |c| hasZeroWidthLoop(c.body.*, merged_rules, name_index, nullable) or
             hasZeroWidthLoop(c.handler.*, merged_rules, name_index, nullable),
+        .field => |f| hasZeroWidthLoop(f.body.*, merged_rules, name_index, nullable),
         .char_val,
         .num_val,
         .prose_val,

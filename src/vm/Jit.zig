@@ -561,7 +561,7 @@ test "jit: rejects recovery grammars with explicit error" {
 
     var compiler = try Compiler.compileOpts(&rules, .{ .rules_as_captures = true });
     try testing.expectError(
-        error.JitDoesNotSupportRecovery,
+        error.JitDoesNotSupportOp,
         Jit.init(compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), ""),
     );
 }

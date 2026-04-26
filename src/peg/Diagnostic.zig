@@ -13,6 +13,15 @@ pub const Expected = enum {
     /// `#@ rule ... catches ...` directive dropped because `max_catch_dirs`
     /// was reached.
     directive_catch_overflow,
+    /// `#@ tokens "..."` entry dropped because `max_tagged_tokens` was
+    /// reached for this grammar.
+    directive_tokens_overflow,
+    /// `#@ field` directive dropped because `max_field_dirs` was reached.
+    directive_field_overflow,
+    /// `#@ field` directive references a rule body site that doesn't
+    /// exist (e.g. wrong target name, or the requested ordinal exceeds
+    /// the actual count).
+    directive_field_not_found,
 
     /// Custom message hook honoured by `diagnostic.Diagnostic.format`.
     /// Returns true when this variant produced its own message and the
@@ -29,6 +38,18 @@ pub const Expected = enum {
             ),
             .directive_catch_overflow => try writer.print(
                 "catch directive dropped (max_catch_dirs reached): '{s}'",
+                .{found_lexeme},
+            ),
+            .directive_tokens_overflow => try writer.print(
+                "tokens directive entry dropped (max_tagged_tokens reached): '{s}'",
+                .{found_lexeme},
+            ),
+            .directive_field_overflow => try writer.print(
+                "field directive dropped (max_field_dirs reached): '{s}'",
+                .{found_lexeme},
+            ),
+            .directive_field_not_found => try writer.print(
+                "field directive target not found in rule body: '{s}'",
                 .{found_lexeme},
             ),
             else => return false,

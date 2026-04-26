@@ -26,18 +26,23 @@ pub const Pattern = struct {
         node: NodePattern,
         /// `[ p1 p2 ... ]` -- match any of the alternatives.
         alt: []const Pattern,
-        /// `(inner-pattern (#pred? ...) ...)` -- a "grouping" with no
-        /// head identifier. Used to attach predicates to a pattern so
-        /// they can reference its captures. Tier-1 limitation: the
-        /// inner is a single pattern; multi-pattern groupings (which
-        /// would match a sequence of siblings at the parent level) are
-        /// not supported yet.
+        /// `(p1 p2 ... (#pred? ...))` -- a "grouping" with no head
+        /// identifier. Two semantic shapes, distinguished by the
+        /// number of inner patterns and the presence of anchors:
+        ///   - Exactly one pattern child (no anchors): the group
+        ///     matches the visited node like a normal pattern; the
+        ///     predicates scope to the captures bound on that match.
+        ///     Common form: `((Rule) @cap (#pred? @cap ...))`.
+        ///   - More than one pattern child OR any anchor: the group's
+        ///     children sequence is matched against the visited node's
+        ///     children list using the same gap-allowed positional
+        ///     semantics as a node body.
         group: GroupPattern,
     };
 };
 
 pub const GroupPattern = struct {
-    inner: *const Pattern,
+    children: []const Child,
     predicates: []const Predicate,
 };
 
@@ -66,7 +71,7 @@ pub const NodePattern = struct {
 };
 
 pub const NodeKindMatch = union(enum) {
-    /// `(_ ...)` -- any node kind, including ERROR/MISSING.
+    /// `(_ ...)` -- any node kind, including ERROR/MISSING/token.
     any,
     /// `(RuleName ...)` -- match `.rule`/`.rule_partial` with this rule id.
     rule_named: u16,
@@ -74,14 +79,26 @@ pub const NodeKindMatch = union(enum) {
     error_kind,
     /// `(MISSING ...)` -- match `.missing_node`.
     missing_kind,
+    /// `"literal"` (a bare string atom) -- match a `.token` node whose
+    /// text equals these bytes. Set by the parser when an atom is a
+    /// quoted string with no head identifier.
+    token_text: []const u8,
 };
 
 /// A child slot inside a node pattern's body. Plain patterns match an
 /// actual child; anchors `.` constrain adjacency between surrounding
-/// patterns and never match a node themselves.
+/// patterns and never match a node themselves; field-tagged patterns
+/// only match if the candidate child carries the named field id.
 pub const Child = union(enum) {
     pattern: Pattern,
     anchor,
+    field_pattern: FieldPattern,
+};
+
+pub const FieldPattern = struct {
+    /// Field-id index resolved against the names table at compile time.
+    field_id: u16,
+    pattern: Pattern,
 };
 
 pub const Predicate = struct {

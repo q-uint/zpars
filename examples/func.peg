@@ -1,0 +1,8 @@
+# Tiny "function definition" grammar with field annotations.
+#@ tokens "function"
+#@ field Func name = Ident
+#@ field Func body = Body
+Func  <- "function" _ Ident _ Body
+Ident <- [a-z]+
+Body  <- "{" _ "}"
+_     <- " "*

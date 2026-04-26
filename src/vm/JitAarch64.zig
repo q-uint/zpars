@@ -307,7 +307,7 @@ pub fn generate(
 }
 
 pub fn compile(self: anytype) !void {
-    if (I.containsRecoveryOps(self.code)) return error.JitDoesNotSupportRecovery;
+    if (I.containsJitUnsupportedOps(self.code)) return error.JitDoesNotSupportOp;
 
     const config = @TypeOf(self.*).jit_config;
     const est = estimateSize(config, self.code.len);
@@ -733,9 +733,9 @@ fn emitInst(
             }
             // capture_events off: no-op.
         },
-        // Recovery opcodes are VM-only for now. `compile` rejects any
-        // grammar carrying these with `error.JitDoesNotSupportRecovery`,
-        // so reaching here would mean the gate was bypassed.
-        .event_error_open, .event_error_close, .event_missing, .throw, .lcatch => unreachable,
+        // VM-only opcodes (recovery + token events). `compile` rejects any
+        // grammar carrying these with `error.JitDoesNotSupportOp`, so
+        // reaching here would mean the gate was bypassed.
+        .event_error_open, .event_error_close, .event_missing, .throw, .lcatch, .event_token, .event_field => unreachable,
     }
 }

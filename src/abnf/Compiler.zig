@@ -56,11 +56,11 @@ fn compileNode(comptime node: Ast.Node, comptime rules: []const Ast.Rule, compti
 
         // Nodes not produced by the ABNF parser.
         .and_predicate, .not_predicate, .char_class, .neg_char_class, .any, .anchor_start, .anchor_end, .capture => @compileError("non-ABNF nodes cannot be compiled by ABNF compiler"),
-        // Recovery nodes are runtime-only (event-log-driven). The
-        // comptime ABNF compiler returns ?Result(Value) and has no
-        // event log; recovery only makes sense in the dynamic VM/JIT
-        // path. ABNF surface syntax for recovery is out of scope.
-        .throw_label, .lcatch, .missing_label => @compileError("recovery nodes are not supported by the comptime ABNF compiler; use the runtime VM"),
+        // Recovery and field-tag nodes are runtime-only (event-log
+        // driven). The comptime ABNF compiler returns ?Result(Value)
+        // and has no event log, and ABNF surface syntax has neither
+        // recovery directives nor field tags.
+        .throw_label, .lcatch, .missing_label, .field => @compileError("recovery / field-tag nodes are not supported by the comptime ABNF compiler; use the runtime VM"),
     };
 }
 

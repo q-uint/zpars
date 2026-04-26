@@ -341,6 +341,16 @@ pub fn VmWith(comptime config: Config) type {
                         stack[sp.*] = .{ .event = .{ .event_len = event_len } };
                         sp.* += 1;
                     },
+                    .token => |t| {
+                        const event_len = try events_mod.appendToken(state, t.start, t.end);
+                        stack[sp.*] = .{ .event = .{ .event_len = event_len } };
+                        sp.* += 1;
+                    },
+                    .field_marker => |fm| {
+                        const event_len = try events_mod.appendField(state, fm.field_id, fm.pos);
+                        stack[sp.*] = .{ .event = .{ .event_len = event_len } };
+                        sp.* += 1;
+                    },
                 }
             }
             return true;
@@ -843,6 +853,38 @@ pub fn VmWith(comptime config: Config) type {
                         }
                         pc += 1;
                     },
+                    .event_token => {
+                        // Emitted by the compiler immediately after a literal-
+                        // matching opcode (`char` / `string`) under
+                        // `token_events = .all|.tagged`. The literal's byte
+                        // length is in `inst.data.byte`, so the token spans
+                        // `[pos - len, pos)` after the literal succeeds.
+                        if (config.capture_events) {
+                            if (sp >= max_stack) return null;
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const len: u32 = inst.data.byte;
+                            const start: u32 = @intCast(pos - len);
+                            const event_len = try events_mod.appendToken(state, start, @intCast(pos));
+                            stack[sp] = .{ .event = .{ .event_len = event_len } };
+                            sp += 1;
+                        }
+                        pc += 1;
+                    },
+                    .event_field => {
+                        // Stamp the field id onto the next-emitted open/token
+                        // node. The id rides in `inst.data.slot`. Compiler
+                        // emits this immediately before the call/literal it
+                        // tags; backtracking truncates the marker along with
+                        // the call/literal it precedes.
+                        if (config.capture_events) {
+                            if (sp >= max_stack) return null;
+                            const state = if (self.events) |*s| s else @panic("capture_events enabled but no events state; use Self.initEvents");
+                            const event_len = try events_mod.appendField(state, inst.data.slot, @intCast(pos));
+                            stack[sp] = .{ .event = .{ .event_len = event_len } };
+                            sp += 1;
+                        }
+                        pc += 1;
+                    },
                     .lcatch => {
                         if (sp >= max_stack) return null;
                         const ch = inst.data.catch_handler;
@@ -1046,8 +1088,10 @@ pub fn VmWith(comptime config: Config) type {
                 },
                 // Diagnostic-only events: error_open/error_close are emitted by
                 // recovery handlers, which themselves can't throw, so they never
-                // appear inside an unwind window. `missing` is purely informational.
-                .error_open, .error_close, .missing => {},
+                // appear inside an unwind window. `missing`, `.token`, and
+                // `.field_marker` are purely informational, with no nesting
+                // effect on the open stack.
+                .error_open, .error_close, .missing, .token, .field_marker => {},
             };
 
             while (open_sp > 0) {
@@ -1203,6 +1247,8 @@ pub fn VmWith(comptime config: Config) type {
                 .event_error_open => w.print("event_error_open L{d}", .{inst.data.slot}) catch {},
                 .event_error_close => w.print("event_error_close L{d}", .{inst.data.slot}) catch {},
                 .event_missing => w.print("event_missing L{d}", .{inst.data.slot}) catch {},
+                .event_token => w.print("event_token len={d}", .{inst.data.byte}) catch {},
+                .event_field => w.print("event_field f{d}", .{inst.data.slot}) catch {},
                 .throw => w.print("throw L{d}", .{inst.data.slot}) catch {},
                 .lcatch => w.print("lcatch L{d} -> {d}", .{ inst.data.catch_handler.label, inst.data.catch_handler.handler_pc }) catch {},
                 .match => w.writeAll("match") catch {},

@@ -39,6 +39,18 @@ pub const Config = struct {
     /// Maximum number of `#@ rule ... catches ...` directives in a
     /// single file. Only allocated when `recovery` is true.
     max_catch_dirs: usize = 128,
+    /// Maximum number of literals collected from `#@ tokens "..." ...`
+    /// directives. Multiple directives accumulate into the same flat
+    /// list. Only allocated when `recovery` is true.
+    max_tagged_tokens: usize = 256,
+    /// Maximum number of literal entries parsed from a single
+    /// `#@ tokens` directive line. Limits the per-directive buffer
+    /// `parseDirective` returns. Multiple directives can be used to
+    /// exceed this without raising the overall cap.
+    max_tagged_tokens_per_directive: usize = 32,
+    /// Maximum number of `#@ field` directives in a single file. Only
+    /// allocated when `recovery` is true.
+    max_field_dirs: usize = 256,
 };
 
 pub const Parser = ParserWith(.{});
@@ -97,6 +109,23 @@ pub fn ParserWith(comptime config: Config) type {
         catch_dir_count: if (config.recovery) usize else void =
             if (config.recovery) 0 else {},
 
+        /// Flat list of literal byte slices accumulated from every
+        /// `#@ tokens "..." ...` directive. Slices into `self.source`.
+        /// Surfaced via `getTaggedTokens` for the VM compiler's
+        /// `token_events = .tagged` mode.
+        tagged_tokens: if (config.recovery) [config.max_tagged_tokens][]const u8 else void =
+            if (config.recovery) undefined else {},
+        tagged_token_count: if (config.recovery) usize else void =
+            if (config.recovery) 0 else {},
+
+        /// `#@ field <rule> <name> = <target>(#N)?` directives. Applied
+        /// after each rule's AST is built by walking the body and
+        /// wrapping the matching call site in `Ast.Node.field`.
+        field_dirs: if (config.recovery) [config.max_field_dirs]FieldDir else void =
+            if (config.recovery) undefined else {},
+        field_dir_count: if (config.recovery) usize else void =
+            if (config.recovery) 0 else {},
+
         pub const ThrowDir = struct {
             label: []const u8,
             /// Index into `self.tokens`.
@@ -113,6 +142,27 @@ pub fn ParserWith(comptime config: Config) type {
             is_recover_missing: bool,
         };
 
+        /// `#@ field <rule_name> <field_name> = <target>(#N)?` directive.
+        /// Wraps the `ordinal`-th left-to-right occurrence of `target`
+        /// in `rule_name`'s body with `Ast.Node.field { name = field_name }`.
+        /// `target_is_literal` distinguishes a quoted literal from a
+        /// rule reference. `ordinal` is 1-based; 1 is the default when
+        /// the directive omits the `#N` suffix.
+        pub const FieldDir = struct {
+            rule_name: []const u8,
+            field_name: []const u8,
+            target: []const u8,
+            target_is_literal: bool,
+            ordinal: u16,
+            /// Index into `self.tokens` of the comment that produced
+            /// this directive, used to locate diagnostics.
+            token_idx: usize,
+            /// Set true when `applyFieldDirectives` finds a match;
+            /// directives that never matched raise
+            /// `directive_field_not_found` after parsing completes.
+            applied: bool,
+        };
+
         pub fn init(tokens: []const Token, source: []const u8) Self {
             return .{
                 .tokens = tokens,
@@ -125,7 +175,7 @@ pub fn ParserWith(comptime config: Config) type {
             if (config.recovery) self.collectDirectives();
             self.skipTrivia();
             while (self.peek().tag != .eof) {
-                const rule = self.parseDefinition() catch |err| switch (err) {
+                var rule = self.parseDefinition() catch |err| switch (err) {
                     error.SyntaxError => {
                         self.synchronize();
                         self.skipTrivia();
@@ -133,12 +183,72 @@ pub fn ParserWith(comptime config: Config) type {
                     },
                     else => |e| return e,
                 };
-
+                if (config.recovery) self.applyFieldDirectives(&rule);
                 _ = self.rules.addOne(rule);
                 self.skipTrivia();
             }
 
+            if (config.recovery) {
+                for (self.field_dirs[0..self.field_dir_count]) |fd| {
+                    if (!fd.applied) self.fail(.directive_field_not_found, self.tokens[fd.token_idx]);
+                }
+            }
+
             return self.rules.slice();
+        }
+
+        /// Walk `rule`'s body and rewrite the targeted call site (rule
+        /// reference or quoted literal) for every `#@ field` directive
+        /// whose `rule_name` matches. The Nth left-to-right occurrence
+        /// is wrapped in an `Ast.Node.field`; mismatched directives are
+        /// surfaced via `directive_field_not_found` after `parse()`
+        /// finishes (so a typo'd target doesn't degrade silently).
+        fn applyFieldDirectives(self: *Self, rule: *Ast.Rule) void {
+            for (self.field_dirs[0..self.field_dir_count]) |*fd| {
+                if (!std.mem.eql(u8, fd.rule_name, rule.name)) continue;
+                var counter: u16 = 0;
+                if (self.tagFirstMatch(&rule.node, fd, &counter)) fd.applied = true;
+            }
+        }
+
+        /// Recursive walk that finds the `fd.ordinal`-th matching call
+        /// site in `node` and replaces it with `Ast.Node.field`. Returns
+        /// true once the target has been wrapped. `counter` carries the
+        /// running count across recursion levels.
+        fn tagFirstMatch(self: *Self, node: *Ast.Node, fd: *const FieldDir, counter: *u16) bool {
+            if (self.matchesTarget(node.*, fd)) {
+                counter.* += 1;
+                if (counter.* == fd.ordinal) {
+                    const original = self.nodes.addOne(node.*);
+                    node.* = .{ .field = .{ .name = fd.field_name, .body = original } };
+                    return true;
+                }
+                return false;
+            }
+            return switch (node.*) {
+                .alternation => |alts| for (alts) |*alt| {
+                    if (self.tagFirstMatch(@constCast(alt), fd, counter)) break true;
+                } else false,
+                .concatenation => |elems| for (elems) |*elem| {
+                    if (self.tagFirstMatch(@constCast(elem), fd, counter)) break true;
+                } else false,
+                .repetition => |rep| self.tagFirstMatch(@constCast(rep.element), fd, counter),
+                .and_predicate, .not_predicate => |inner| self.tagFirstMatch(@constCast(inner), fd, counter),
+                // Descend through earlier-wrapped `.field` nodes so the
+                // counter sees the original target inside, keeping
+                // ordinals stable across the order in which directives
+                // are applied.
+                .field => |f| self.tagFirstMatch(@constCast(f.body), fd, counter),
+                else => false,
+            };
+        }
+
+        fn matchesTarget(self: *const Self, node: Ast.Node, fd: *const FieldDir) bool {
+            _ = self;
+            if (fd.target_is_literal) {
+                return node == .char_val and std.mem.eql(u8, node.char_val.value, fd.target);
+            }
+            return node == .rulename and std.mem.eql(u8, node.rulename, fd.target);
         }
 
         /// Pre-pass over comment tokens to collect `#@` directives.
@@ -181,6 +291,27 @@ pub fn ParserWith(comptime config: Config) type {
                         // surface a diagnostic only once enforcement
                         // exists to back it up.
                     },
+                    .tokens_d => |td| {
+                        for (td.items[0..td.count]) |item| {
+                            if (self.tagged_token_count >= self.tagged_tokens.len) {
+                                self.fail(.directive_tokens_overflow, tok);
+                                break;
+                            }
+                            self.tagged_tokens[self.tagged_token_count] = item;
+                            self.tagged_token_count += 1;
+                        }
+                    },
+                    .field_d => |fd| {
+                        if (self.field_dir_count >= self.field_dirs.len) {
+                            self.fail(.directive_field_overflow, tok);
+                            continue;
+                        }
+                        var copy = fd;
+                        copy.token_idx = i;
+                        copy.applied = false;
+                        self.field_dirs[self.field_dir_count] = copy;
+                        self.field_dir_count += 1;
+                    },
                 }
             }
         }
@@ -189,6 +320,18 @@ pub fn ParserWith(comptime config: Config) type {
             throw_d: []const u8,
             catch_d: CatchDir,
             labels_d: void,
+            tokens_d: TokensDir,
+            field_d: FieldDir,
+        };
+
+        /// Up to `max_tagged_tokens_per_directive` literal slices
+        /// extracted from a single `#@ tokens "..." ...` line. Slices
+        /// reference the comment lexeme (which itself slices the
+        /// source), so they outlive the parser as long as the source
+        /// does.
+        const TokensDir = struct {
+            items: [config.max_tagged_tokens_per_directive][]const u8,
+            count: u8,
         };
 
         /// Parse one directive from the comment text. The text starts
@@ -244,6 +387,82 @@ pub fn ParserWith(comptime config: Config) type {
                     .handler_rule_name = handler_rule,
                     .is_recover_missing = false,
                 } };
+            }
+            if (consumeWord(text, &p, "field")) {
+                if (!skipSpRequired(text, &p)) return null;
+                const rule_name = parseIdent(text, &p) orelse return null;
+                if (!skipSpRequired(text, &p)) return null;
+                const field_name = parseIdent(text, &p) orelse return null;
+                skipSp(text, &p);
+                if (p >= text.len or text[p] != '=') return null;
+                p += 1;
+                skipSp(text, &p);
+
+                // Target: a rule reference or a quoted literal.
+                var target: []const u8 = "";
+                var target_is_literal = false;
+                if (p < text.len and (text[p] == '"' or text[p] == '\'')) {
+                    const quote = text[p];
+                    p += 1;
+                    const start = p;
+                    while (p < text.len and text[p] != quote) : (p += 1) {}
+                    if (p >= text.len) return null;
+                    target = text[start..p];
+                    target_is_literal = true;
+                    p += 1;
+                } else {
+                    target = parseIdent(text, &p) orelse return null;
+                }
+
+                // Optional `#N` ordinal.
+                var ordinal: u16 = 1;
+                skipSp(text, &p);
+                if (p < text.len and text[p] == '#') {
+                    p += 1;
+                    if (p >= text.len or text[p] < '0' or text[p] > '9') return null;
+                    var n: u32 = 0;
+                    while (p < text.len and text[p] >= '0' and text[p] <= '9') : (p += 1) {
+                        n = n * 10 + (text[p] - '0');
+                        if (n > 65535) return null;
+                    }
+                    if (n == 0) return null;
+                    ordinal = @intCast(n);
+                }
+
+                skipSp(text, &p);
+                if (p != text.len) return null;
+                return .{
+                    .field_d = .{
+                        .rule_name = rule_name,
+                        .field_name = field_name,
+                        .target = target,
+                        .target_is_literal = target_is_literal,
+                        .ordinal = ordinal,
+                        .token_idx = 0, // filled by collectDirectives
+                        .applied = false,
+                    },
+                };
+            }
+            if (consumeWord(text, &p, "tokens")) {
+                if (!skipSpRequired(text, &p)) return null;
+                var td: TokensDir = .{ .items = undefined, .count = 0 };
+                while (p < text.len) {
+                    skipSp(text, &p);
+                    if (p >= text.len) break;
+                    if (text[p] != '"') return null;
+                    p += 1;
+                    const start = p;
+                    while (p < text.len and text[p] != '"') : (p += 1) {}
+                    if (p >= text.len) return null; // unterminated
+                    const literal = text[start..p];
+                    if (literal.len == 0) return null;
+                    if (td.count >= td.items.len) return null;
+                    td.items[td.count] = literal;
+                    td.count += 1;
+                    p += 1; // closing quote
+                }
+                if (td.count == 0) return null;
+                return .{ .tokens_d = td };
             }
             if (consumeWord(text, &p, "labels")) {
                 // Label sets aren't enforced, but reject garbage after
@@ -314,6 +533,15 @@ pub fn ParserWith(comptime config: Config) type {
 
         pub fn getDiagnostics(self: *const Self) []const Diagnostic {
             return self.diagnostics.slice();
+        }
+
+        /// Literal slices accumulated from `#@ tokens "..." ...` directives.
+        /// Empty when `config.recovery` is false or no such directives
+        /// were seen. Slices reference the source the parser was
+        /// initialised with.
+        pub fn getTaggedTokens(self: *const Self) []const []const u8 {
+            if (!config.recovery) return &.{};
+            return self.tagged_tokens[0..self.tagged_token_count];
         }
 
         /// Definition <- Identifier LEFTARROW Expression
@@ -1105,4 +1333,150 @@ test "directive: catch overflow emits diagnostic" {
     const diags = parser.getDiagnostics();
     try std.testing.expectEqual(@as(usize, 1), diags.len);
     try std.testing.expectEqual(Diagnostic.Expected.directive_catch_overflow, diags[0].expected);
+}
+
+test "directive: tokens collects literals across multiple directives" {
+    const RP = ParserWith(.{ .recovery = true });
+    const src =
+        \\#@ tokens "function" "if"
+        \\#@ tokens "+"
+        \\Stmt <- "function" Ident
+        \\Ident <- [a-z]+
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RP.init(tokens, src);
+    _ = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.getDiagnostics().len);
+    const tagged = parser.getTaggedTokens();
+    try std.testing.expectEqual(@as(usize, 3), tagged.len);
+    try std.testing.expectEqualStrings("function", tagged[0]);
+    try std.testing.expectEqualStrings("if", tagged[1]);
+    try std.testing.expectEqualStrings("+", tagged[2]);
+}
+
+test "directive: tokens with no entries is malformed" {
+    const RP = ParserWith(.{ .recovery = true });
+    const src =
+        \\#@ tokens
+        \\A <- "a"
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RP.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_malformed, diags[0].expected);
+}
+
+test "directive: field wraps the matching rule reference" {
+    const RP = ParserWith(.{ .recovery = true });
+    const src =
+        \\#@ field Function name = Identifier
+        \\Function <- "function" Identifier
+        \\Identifier <- [a-z]+
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RP.init(tokens, src);
+    const rules = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.getDiagnostics().len);
+
+    // First rule is Function; its body is `concat("function", Identifier)`.
+    // The second element should now be wrapped in `.field`.
+    const body = rules[0].node;
+    try std.testing.expect(body == .concatenation);
+    const elems = body.concatenation;
+    try std.testing.expectEqual(@as(usize, 2), elems.len);
+    try std.testing.expect(elems[0] == .char_val);
+    try std.testing.expect(elems[1] == .field);
+    try std.testing.expectEqualStrings("name", elems[1].field.name);
+    try std.testing.expectEqualStrings("Identifier", elems[1].field.body.rulename);
+}
+
+test "directive: field with ordinal selects Nth occurrence" {
+    const RP = ParserWith(.{ .recovery = true });
+    const src =
+        \\#@ field Bin left = Expr#1
+        \\#@ field Bin right = Expr#2
+        \\Bin <- Expr "+" Expr
+        \\Expr <- [a-z]
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RP.init(tokens, src);
+    const rules = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.getDiagnostics().len);
+
+    const elems = rules[0].node.concatenation;
+    try std.testing.expectEqualStrings("left", elems[0].field.name);
+    try std.testing.expectEqualStrings("right", elems[2].field.name);
+    try std.testing.expect(elems[1] == .char_val); // "+" untouched
+}
+
+test "directive: field tags a quoted literal" {
+    const RP = ParserWith(.{ .recovery = true });
+    const src =
+        \\#@ field Stmt keyword = "function"
+        \\Stmt <- "function" [a-z]+
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RP.init(tokens, src);
+    const rules = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.getDiagnostics().len);
+
+    const elems = rules[0].node.concatenation;
+    try std.testing.expect(elems[0] == .field);
+    try std.testing.expectEqualStrings("keyword", elems[0].field.name);
+    try std.testing.expectEqualStrings("function", elems[0].field.body.char_val.value);
+}
+
+test "directive: field with bad target reports not-found" {
+    const RP = ParserWith(.{ .recovery = true });
+    const src =
+        \\#@ field Stmt missing = Nonexistent
+        \\Stmt <- "x"
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = RP.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_field_not_found, diags[0].expected);
+}
+
+test "directive: field overflow emits diagnostic" {
+    const TinyField = ParserWith(.{ .recovery = true, .max_field_dirs = 1 });
+    const src =
+        \\#@ field A x = B
+        \\#@ field A y = C
+        \\A <- B C
+        \\B <- "b"
+        \\C <- "c"
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = TinyField.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_field_overflow, diags[0].expected);
+}
+
+test "directive: tokens overflow emits diagnostic" {
+    const TinyTokens = ParserWith(.{ .recovery = true, .max_tagged_tokens = 1 });
+    const src =
+        \\#@ tokens "a" "b"
+        \\X <- "a"
+    ;
+    var scanner = Scanner.init(src);
+    const tokens = scanner.scanTokens();
+    var parser = TinyTokens.init(tokens, src);
+    _ = try parser.parse();
+    const diags = parser.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diags.len);
+    try std.testing.expectEqual(Diagnostic.Expected.directive_tokens_overflow, diags[0].expected);
 }

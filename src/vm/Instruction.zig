@@ -72,6 +72,21 @@ pub const Opcode = enum(u8) {
     /// Append a zero-width MISSING marker keyed by label id. No-op when
     /// `capture_events` is off. Always succeeds.
     event_missing,
+    /// Append an anonymous-token event spanning `[pos - len, pos)`. The
+    /// length is carried in the `byte` field (so we cap at 255-byte
+    /// literals; `string` instructions today use a `u8` len, so this is
+    /// already the existing limit). Emitted by the compiler immediately
+    /// after a literal-matching opcode (`char` / `string`) under the
+    /// `token_events = .all|.tagged` compiler option. No-op when
+    /// `capture_events` is off. Always succeeds.
+    event_token,
+    /// Append a field-marker event keyed by field id (in the slot data
+    /// field). Emitted by the compiler immediately before a rule call
+    /// or literal that the source grammar tagged with a field name
+    /// (e.g. `name:Identifier`). The event-tree builder attaches the
+    /// pending field id to the next open/token node it produces. No-op
+    /// when `capture_events` is off. Always succeeds.
+    event_field,
     /// Accept the match and halt.
     match,
 };
@@ -133,11 +148,13 @@ pub const Inst = struct {
 };
 
 /// Returns true if `code` contains any opcode that the JIT/AOT backends
-/// do not yet support. Entry points use this to reject recovery grammars
+/// do not yet support. Entry points use this to reject affected grammars
 /// up front rather than walking into an `unreachable` during code-gen.
-pub fn containsRecoveryOps(code: []const Inst) bool {
+/// Currently covers the recovery opcodes (`throw`, `lcatch`, the
+/// `event_error_*` / `event_missing` synthesizers) and `event_token`.
+pub fn containsJitUnsupportedOps(code: []const Inst) bool {
     for (code) |inst| switch (inst.op) {
-        .throw, .lcatch, .event_error_open, .event_error_close, .event_missing => return true,
+        .throw, .lcatch, .event_error_open, .event_error_close, .event_missing, .event_token, .event_field => return true,
         else => {},
     };
     return false;

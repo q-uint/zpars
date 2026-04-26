@@ -34,6 +34,8 @@ pub const Error = error{
     InvalidQuery,
     /// Query referenced a rule name that's not in the provided `Names` table.
     UnknownRule,
+    /// Query referenced a field name that's not in the provided `Names` table.
+    UnknownField,
 } || std.mem.Allocator.Error;
 
 pub const Diagnostic = struct {
@@ -173,9 +175,10 @@ const Parser = struct {
     }
 
     /// atom := "(" head child* ")"          -- node pattern
-    ///       | "(" pattern predicate* ")"    -- grouping (Tier-1: single inner pattern)
+    ///       | "(" pattern predicate* ")"    -- grouping (single inner pattern)
     ///       | "[" pattern+ "]"
     ///       | "_"
+    ///       | "..."                          -- anonymous-token text match
     fn parseAtom(self: *Parser) Error!ast.Pattern.Body {
         const t = self.peek();
         switch (t.tag) {
@@ -188,6 +191,11 @@ const Parser = struct {
                 }
                 return self.fail("bare identifier outside parens", error.InvalidQuery);
             },
+            .string => {
+                self.advance();
+                const decoded = try decodeString(self.arena_alloc, self.lex(t));
+                return .{ .node = .{ .kind = .{ .token_text = decoded } } };
+            },
             else => return self.fail("expected pattern", error.InvalidQuery),
         }
     }
@@ -195,44 +203,88 @@ const Parser = struct {
     /// Disambiguate between a node pattern `(Head ...)` and a grouping
     /// `((inner) ...)`. The disambiguator is the token immediately after
     /// `(`: an identifier (rule head, `_`, `ERROR`, `MISSING`) starts a
-    /// node pattern; `(` or `[` starts a grouping wrapping a sub-pattern.
+    /// node pattern; `(`, `[`, or a bare string atom starts a grouping
+    /// wrapping a sub-pattern.
     fn parseLparenAtom(self: *Parser) Error!ast.Pattern.Body {
         if (self.pos + 1 >= self.tokens.len) {
             return self.fail("unexpected eof after '('", error.InvalidQuery);
         }
         const next = self.tokens[self.pos + 1];
         switch (next.tag) {
-            .lparen, .lbracket => return self.parseGroup(),
+            .lparen, .lbracket, .string => return self.parseGroup(),
             .identifier => return self.parseNodeAtom(),
-            else => return self.fail("expected node head or grouped pattern after '('", error.InvalidQuery),
+            else => return self.fail(
+                "expected node head, grouped pattern, or string literal after '('",
+                error.InvalidQuery,
+            ),
         }
     }
 
-    /// group := "(" pattern predicate* ")"
-    /// The capture/quantifier on the inner pattern apply normally; the
-    /// group's predicates are evaluated after the inner match succeeds.
+    /// group := "(" (pattern | "." | field-pattern)+ predicate* ")"
+    ///
+    /// One pattern + predicates is the predicate-scoping shape; multi-
+    /// pattern (or any anchor) shifts the matcher into sibling-sequence
+    /// mode against the visited node's children. The capture/quantifier
+    /// on each inner pattern apply normally.
     fn parseGroup(self: *Parser) Error!ast.Pattern.Body {
         _ = try self.expect(.lparen, "expected '('");
-        const inner_pat = try self.parsePattern();
-        const inner_ptr = try self.arena_alloc.create(ast.Pattern);
-        inner_ptr.* = inner_pat;
 
+        var children: std.ArrayListUnmanaged(ast.Child) = .empty;
+        defer children.deinit(self.scratch);
         var preds: std.ArrayListUnmanaged(ast.Predicate) = .empty;
         defer preds.deinit(self.scratch);
+
         while (self.peek().tag != .rparen and self.peek().tag != .eof) {
-            if (self.peek().tag == .lparen and
-                self.pos + 1 < self.tokens.len and
-                self.tokens[self.pos + 1].tag == .predicate)
-            {
-                try preds.append(self.scratch, try self.parsePredicate());
-            } else {
-                return self.fail("group bodies are limited to one inner pattern plus predicates", error.InvalidQuery);
+            switch (self.peek().tag) {
+                .dot => {
+                    self.advance();
+                    try children.append(self.scratch, .anchor);
+                },
+                .lparen => {
+                    if (self.pos + 1 < self.tokens.len and
+                        self.tokens[self.pos + 1].tag == .predicate)
+                    {
+                        try preds.append(self.scratch, try self.parsePredicate());
+                    } else {
+                        const child = try self.parsePattern();
+                        try children.append(self.scratch, .{ .pattern = child });
+                    }
+                },
+                .lbracket, .string => {
+                    const child = try self.parsePattern();
+                    try children.append(self.scratch, .{ .pattern = child });
+                },
+                .identifier => {
+                    // `<ident> ":" <pattern>` -- field-tagged child.
+                    if (self.pos + 1 < self.tokens.len and
+                        self.tokens[self.pos + 1].tag == .colon)
+                    {
+                        const name_tok = self.peek();
+                        const name = self.lex(name_tok);
+                        const fid = self.resolveField(name) orelse {
+                            return self.fail("unknown field name", error.UnknownField);
+                        };
+                        self.advance(); // identifier
+                        self.advance(); // colon
+                        const inner = try self.parsePattern();
+                        try children.append(self.scratch, .{ .field_pattern = .{
+                            .field_id = fid,
+                            .pattern = inner,
+                        } });
+                    } else {
+                        const child = try self.parsePattern();
+                        try children.append(self.scratch, .{ .pattern = child });
+                    }
+                },
+                else => return self.fail("unexpected token in group body", error.InvalidQuery),
             }
         }
         _ = try self.expect(.rparen, "expected ')'");
 
+        if (children.items.len == 0) return self.fail("empty group", error.InvalidQuery);
+
         return .{ .group = .{
-            .inner = inner_ptr,
+            .children = try self.arena_alloc.dupe(ast.Child, children.items),
             .predicates = try self.arena_alloc.dupe(ast.Predicate, preds.items),
         } };
     }
@@ -266,7 +318,7 @@ const Parser = struct {
             // doesn't get silently accepted as a no-op.
             switch (kind) {
                 .rule_named, .any => {},
-                .error_kind, .missing_kind => return self.fail(
+                .error_kind, .missing_kind, .token_text => return self.fail(
                     "'partial' modifier is only valid on rule or '_' heads",
                     error.InvalidQuery,
                 ),
@@ -298,9 +350,29 @@ const Parser = struct {
                         try children.append(self.scratch, .{ .pattern = child });
                     }
                 },
-                .lbracket, .identifier => {
-                    const child = try self.parsePattern();
-                    try children.append(self.scratch, .{ .pattern = child });
+                .lbracket, .identifier, .string => {
+                    // `<ident> ":" <pattern>` is a field-tagged child.
+                    // Anything else is a plain pattern.
+                    if (self.peek().tag == .identifier and
+                        self.pos + 1 < self.tokens.len and
+                        self.tokens[self.pos + 1].tag == .colon)
+                    {
+                        const name_tok = self.peek();
+                        const name = self.lex(name_tok);
+                        const fid = self.resolveField(name) orelse {
+                            return self.fail("unknown field name", error.UnknownField);
+                        };
+                        self.advance(); // identifier
+                        self.advance(); // colon
+                        const inner = try self.parsePattern();
+                        try children.append(self.scratch, .{ .field_pattern = .{
+                            .field_id = fid,
+                            .pattern = inner,
+                        } });
+                    } else {
+                        const child = try self.parsePattern();
+                        try children.append(self.scratch, .{ .pattern = child });
+                    }
                 },
                 else => return self.fail("unexpected token in node body", error.InvalidQuery),
             }
@@ -367,16 +439,28 @@ const Parser = struct {
             .suffix = suffix,
             .args = try self.arena_alloc.dupe(ast.Arg, args.items),
         };
-        if (std.mem.eql(u8, name, "match") or std.mem.eql(u8, name, "not-match")) {
+        if (isRegexPredicateName(name)) {
             pred.compiled_regex = try self.compileRegexPredicate(pred);
         }
         return pred;
     }
 
+    /// True for any predicate name that takes a regex string and gets
+    /// compiled at query-compile time. The matcher dispatches all of
+    /// these to the same ERE engine; see `Matcher.evalPredicate`.
+    fn isRegexPredicateName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "match") or
+            std.mem.eql(u8, name, "not-match") or
+            std.mem.eql(u8, name, "vim-match") or
+            std.mem.eql(u8, name, "not-vim-match") or
+            std.mem.eql(u8, name, "lua-match") or
+            std.mem.eql(u8, name, "not-lua-match");
+    }
+
     /// Parse and compile the regex argument of a `#match?`/`#not-match?`
-    /// predicate. Expects exactly two args: a capture and a string. The
-    /// resulting bytecode is copied into the query arena so it survives
-    /// the transient `vm.Compiler`.
+    /// (or `#vim-match?`/`#lua-match?`) predicate. Expects exactly two
+    /// args: a capture and a string. The resulting bytecode is copied
+    /// into the query arena so it survives the transient `vm.Compiler`.
     fn compileRegexPredicate(self: *Parser, pred: ast.Predicate) Error!ast.CompiledRegex {
         if (pred.args.len != 2) return self.fail("#match? takes (capture, regex)", error.InvalidQuery);
         if (pred.args[0] != .capture) return self.fail("#match? first arg must be a capture", error.InvalidQuery);
@@ -405,6 +489,13 @@ const Parser = struct {
             .charsets = try self.arena_alloc.dupe(@TypeOf(compiler.getCharsets()[0]), compiler.getCharsets()),
             .string_data = try self.arena_alloc.dupe(u8, compiler.getStringData()),
         };
+    }
+
+    fn resolveField(self: *const Parser, name: []const u8) ?u16 {
+        for (self.names.fields, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) return @intCast(i);
+        }
+        return null;
     }
 
     fn resolveRule(self: *const Parser, name: []const u8) ?u16 {
@@ -620,8 +711,10 @@ test "compile grouping with single inner and predicate" {
     , calc_names, null);
     defer query.deinit();
     const group = query.patterns[0].body.group;
-    try testing.expectEqual(@as(u16, 1), group.inner.body.node.kind.rule_named);
-    try testing.expectEqual(@as(?u16, 0), group.inner.capture);
+    try testing.expectEqual(@as(usize, 1), group.children.len);
+    const inner = group.children[0].pattern;
+    try testing.expectEqual(@as(u16, 1), inner.body.node.kind.rule_named);
+    try testing.expectEqual(@as(?u16, 0), inner.capture);
     try testing.expectEqual(@as(usize, 1), group.predicates.len);
     try testing.expectEqualStrings("eq", group.predicates[0].name);
 }
@@ -630,14 +723,20 @@ test "compile grouping with no predicate" {
     var query = try compile(testing.allocator, "((Term))", calc_names, null);
     defer query.deinit();
     const group = query.patterns[0].body.group;
-    try testing.expectEqual(@as(u16, 1), group.inner.body.node.kind.rule_named);
+    try testing.expectEqual(@as(usize, 1), group.children.len);
+    try testing.expectEqual(@as(u16, 1), group.children[0].pattern.body.node.kind.rule_named);
     try testing.expectEqual(@as(usize, 0), group.predicates.len);
 }
 
-test "compile rejects multi-pattern grouping (Tier-1 limitation)" {
-    try testing.expectError(error.InvalidQuery, compile(testing.allocator,
+test "compile multi-pattern grouping" {
+    var query = try compile(testing.allocator,
         \\((Term) (Factor))
-    , calc_names, null));
+    , calc_names, null);
+    defer query.deinit();
+    const group = query.patterns[0].body.group;
+    try testing.expectEqual(@as(usize, 2), group.children.len);
+    try testing.expectEqual(@as(u16, 1), group.children[0].pattern.body.node.kind.rule_named);
+    try testing.expectEqual(@as(u16, 2), group.children[1].pattern.body.node.kind.rule_named);
 }
 
 test "compile skips top-level comments" {

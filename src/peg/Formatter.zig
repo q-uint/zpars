@@ -132,6 +132,11 @@ pub fn formatNode(node: Ast.Node, in_predicate: bool, writer: anytype) anyerror!
         },
         .char_class => |ranges| try formatCharClass(ranges, writer),
         .any => try writer.writeByte('.'),
+        .field => |f| {
+            try writer.writeAll(f.name);
+            try writer.writeByte(':');
+            try formatNode(f.body.*, in_predicate, writer);
+        },
         // Nodes not produced by the PEG parser.
         .num_val, .prose_val, .neg_char_class, .anchor_start, .anchor_end, .capture => unreachable,
         // Recovery nodes are emitted by the `#@` directive parser. The

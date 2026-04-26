@@ -81,6 +81,26 @@ pub fn appendPartialClose(state: *State, group_id: u16, pos: u32) std.mem.Alloca
     return pre_len;
 }
 
+/// Append an anonymous-token event for a literal that just matched
+/// `input[start..end]`. The compiler emits this after every `char` /
+/// `string` opcode under `token_events = .all` (or only for tagged
+/// literals under `.tagged`).
+pub fn appendToken(state: *State, start: u32, end: u32) std.mem.Allocator.Error!u32 {
+    const pre_len: u32 = @intCast(state.list.items.len);
+    try state.list.append(state.allocator, .{ .token = .{ .start = start, .end = end } });
+    return pre_len;
+}
+
+/// Append a field-name "stamp" event. The compiler emits this just
+/// before a rule call or literal that the grammar tagged with a field
+/// name (e.g. `name:Identifier`); `buildFromEvents` attaches `field_id`
+/// to the next open/token node it produces.
+pub fn appendField(state: *State, field_id: u16, pos: u32) std.mem.Allocator.Error!u32 {
+    const pre_len: u32 = @intCast(state.list.items.len);
+    try state.list.append(state.allocator, .{ .field_marker = .{ .field_id = field_id, .pos = pos } });
+    return pre_len;
+}
+
 /// Truncate the event log to `new_len`, dropping any events appended
 /// after the matching `save`. Called from the backtrack unwind.
 pub fn truncate(state: *State, new_len: u32) void {
@@ -93,44 +113,17 @@ pub fn truncate(state: *State, new_len: u32) void {
 pub const oom_sentinel: u64 = std.math.maxInt(u64);
 
 /// C-ABI wrapper for `appendSave`. Returns `oom_sentinel` on allocator
-/// failure; the JIT jumps to the fail handler on that value.
+/// failure; the JIT jumps to the fail handler on that value. Recovery,
+/// token, and field events have no JIT helpers because the JIT/AOT
+/// path rejects grammars carrying those opcodes (see
+/// `Instruction.containsJitUnsupportedOps`); add helpers here if/when
+/// the JIT grows support.
 pub fn helperAppendSave(
     state_ptr: *State,
     slot: u64,
     pos: u64,
 ) callconv(.c) u64 {
     const pre_len = appendSave(state_ptr, @intCast(slot), @intCast(pos)) catch return oom_sentinel;
-    return pre_len;
-}
-
-/// C-ABI wrappers for the recovery-era append helpers. Same OOM contract
-/// as `helperAppendSave`. `partial_close` has no JIT helper because it
-/// is only synthesized inside the interpreter's throw unwinder, and
-/// `throw` / `lcatch` are JIT-`unreachable` until a follow-up.
-pub fn helperAppendErrorOpen(
-    state_ptr: *State,
-    label: u64,
-    pos: u64,
-) callconv(.c) u64 {
-    const pre_len = appendErrorOpen(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
-    return pre_len;
-}
-
-pub fn helperAppendErrorClose(
-    state_ptr: *State,
-    label: u64,
-    pos: u64,
-) callconv(.c) u64 {
-    const pre_len = appendErrorClose(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
-    return pre_len;
-}
-
-pub fn helperAppendMissing(
-    state_ptr: *State,
-    label: u64,
-    pos: u64,
-) callconv(.c) u64 {
-    const pre_len = appendMissing(state_ptr, @intCast(label), @intCast(pos)) catch return oom_sentinel;
     return pre_len;
 }
 
@@ -171,6 +164,30 @@ test "truncate: restores the length returned from an earlier append" {
     truncate(&state, pre);
 
     try testing.expectEqual(@as(usize, 1), state.items().len);
+}
+
+test "appendToken: records [start, end) span" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+
+    const pre = try appendToken(&state, 3, 7);
+    try testing.expectEqual(@as(u32, 0), pre);
+    const evs = state.items();
+    try testing.expectEqual(@as(usize, 1), evs.len);
+    try testing.expectEqual(@as(u32, 3), evs[0].token.start);
+    try testing.expectEqual(@as(u32, 7), evs[0].token.end);
+}
+
+test "appendField: records field id and pos" {
+    var state = State.init(testing.allocator);
+    defer state.deinit();
+
+    const pre = try appendField(&state, 5, 10);
+    try testing.expectEqual(@as(u32, 0), pre);
+    const evs = state.items();
+    try testing.expectEqual(@as(usize, 1), evs.len);
+    try testing.expectEqual(@as(u16, 5), evs[0].field_marker.field_id);
+    try testing.expectEqual(@as(u32, 10), evs[0].field_marker.pos);
 }
 
 test "recovery helpers: each variant appends correctly and returns pre-len" {
