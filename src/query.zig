@@ -1,0 +1,20 @@
+/// Tree-sitter-style query language over zpars parse trees.
+pub const Token = @import("query/Token.zig").Token;
+pub const Scanner = @import("query/Scanner.zig").Scanner;
+pub const ast = @import("query/Ast.zig");
+pub const Pattern = ast.Pattern;
+pub const NodePattern = ast.NodePattern;
+pub const NodeKindMatch = ast.NodeKindMatch;
+pub const Query = ast.Query;
+pub const Quantifier = ast.Quantifier;
+pub const Predicate = ast.Predicate;
+pub const Arg = ast.Arg;
+pub const Child = ast.Child;
+const parser_mod = @import("query/Parser.zig");
+pub const compile = parser_mod.compile;
+pub const Diagnostic = parser_mod.Diagnostic;
+pub const Error = parser_mod.Error;
+const matcher_mod = @import("query/Matcher.zig");
+pub const Cursor = matcher_mod.Cursor;
+pub const Match = matcher_mod.Match;
+pub const Capture = matcher_mod.Capture;

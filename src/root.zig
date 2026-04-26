@@ -67,6 +67,7 @@ pub const ere = struct {
     pub const Token = @import("ere/Token.zig");
 };
 pub const sexp = @import("sexp.zig");
+pub const query = @import("query.zig");
 pub const vm = struct {
     pub const Aot = @import("vm/Aot.zig");
     pub const AotRuntime = @import("vm/AotRuntime.zig");

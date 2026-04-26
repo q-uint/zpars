@@ -30,6 +30,8 @@ pub fn main(init: std.process.Init) !void {
         try runTree(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "vm")) {
         try runVm(io, allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "query")) {
+        try runQuery(io, allocator, args[2..]);
     } else {
         printUsage();
         std.process.exit(1);
@@ -48,6 +50,7 @@ fn printUsage() void {
         \\  run     <blob> <input>             Run a compiled .zpar blob
         \\  tree    [-j] [-p|--jit] <file> <input>  Parse input and print parse tree (-j JSON, -p packrat, --jit native)
         \\  vm      [-t] [-p] <file> [<input>]  Disassemble (and optionally run) via VM (-t trace, -p packrat)
+        \\  query   [-j] <grammar> <query-file> <input>  Run a tree-sitter-style query over the parse tree (-j JSON)
         \\
         \\Format is auto-detected from file extension (.abnf, .peg, .ere).
         \\
@@ -542,6 +545,129 @@ fn runAot(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !voi
         try stdout.print("match: {d} bytes \"{s}\"\n", .{ pos, input[0..pos] });
     } else {
         try stdout.print("no match\n", .{});
+    }
+    try stdout.flush();
+}
+
+fn runQuery(io: Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var grammar_file: ?[]const u8 = null;
+    var query_file: ?[]const u8 = null;
+    var input: ?[]const u8 = null;
+    var json_output = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
+        } else if (grammar_file == null) {
+            grammar_file = arg;
+        } else if (query_file == null) {
+            query_file = arg;
+        } else if (input == null) {
+            input = arg;
+        }
+    }
+
+    if (grammar_file == null or query_file == null or input == null) {
+        std.debug.print("usage: zpars query [-j] <grammar> <query-file> <input>\n", .{});
+        std.process.exit(1);
+    }
+
+    const grammar_src = try readSource(io, allocator, grammar_file.?);
+    defer allocator.free(grammar_src);
+    const query_src = try readSource(io, allocator, query_file.?);
+    defer allocator.free(query_src);
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const RecoveryPegParser = zpars.peg.ParserWith(.{ .recovery = true });
+    const rules = switch (detectFormat(grammar_file.?)) {
+        .abnf => (try parseGrammar(zpars.abnf.Scanner, zpars.abnf.Parser, grammar_src, grammar_file.?, stderr)).rules,
+        .bnf => (try parseGrammar(zpars.bnf.Scanner, zpars.bnf.Parser, grammar_src, grammar_file.?, stderr)).rules,
+        .peg => (try parseGrammar(zpars.peg.Scanner, RecoveryPegParser, grammar_src, grammar_file.?, stderr)).rules,
+        .ere => (try parseGrammar(zpars.ere.Scanner, zpars.ere.Parser, grammar_src, grammar_file.?, stderr)).rules,
+    };
+
+    var compiler = try zpars.vm.Compiler.compileOpts(rules, .{ .rules_as_captures = true });
+
+    var rule_names_buf: [256][]const u8 = undefined;
+    const rule_names = rule_names_buf[0..compiler.rule_count];
+    for (0..compiler.rule_count) |i| rule_names[i] = compiler.getRuleName(@intCast(i));
+
+    var label_names_buf: [256][]const u8 = undefined;
+    const label_names = label_names_buf[0..compiler.label_count];
+    for (0..compiler.label_count) |i| label_names[i] = compiler.getLabelName(@intCast(i));
+
+    const names: zpars.vm.CaptureTree.Names = .{ .rules = rule_names, .labels = label_names };
+
+    const EventVm = zpars.vm.VmWith(.{ .capture_events = true });
+    var vm = EventVm.initEvents(
+        allocator,
+        compiler.getCode(),
+        compiler.getCharsets(),
+        compiler.getStringData(),
+        input.?,
+    );
+    defer vm.deinit();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    if ((try vm.execute()) == null) {
+        try stderr.print("no match\n", .{});
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    var tree = try vm.buildCaptureTree(allocator);
+    defer tree.deinit();
+
+    var diag: zpars.query.Diagnostic = .{};
+    var query = zpars.query.compile(allocator, query_src, names, &diag) catch |err| {
+        try stderr.print("{s}:{d}: error: {s}\n", .{ query_file.?, diag.line, diag.message });
+        try stderr.flush();
+        return err;
+    };
+    defer query.deinit();
+
+    var cursor = try zpars.query.Cursor.init(allocator, query, &tree, input.?);
+    defer cursor.deinit();
+
+    if (json_output) try stdout.writeByte('[');
+    var first = true;
+    while (cursor.next()) |m| {
+        if (json_output) {
+            if (!first) try stdout.writeByte(',');
+            try stdout.print(
+                "{{\"pattern\":{d},\"captures\":[",
+                .{m.pattern_id},
+            );
+            for (m.captures, 0..) |cap, ci| {
+                if (ci > 0) try stdout.writeByte(',');
+                const span = cap.node.span;
+                try stdout.print(
+                    "{{\"name\":\"{s}\",\"range\":[{d},{d}],\"text\":\"{s}\"}}",
+                    .{ query.captureName(cap.name_id), span.start, span.end, input.?[span.start..span.end] },
+                );
+            }
+            try stdout.writeAll("]}");
+        } else {
+            try stdout.print("pattern: {d}\n", .{m.pattern_id});
+            for (m.captures) |cap| {
+                const span = cap.node.span;
+                try stdout.print(
+                    "  capture: name={s}, range=[{d},{d}], text='{s}'\n",
+                    .{ query.captureName(cap.name_id), span.start, span.end, input.?[span.start..span.end] },
+                );
+            }
+        }
+        first = false;
+    }
+    if (json_output) {
+        try stdout.writeByte(']');
+        try stdout.writeByte('\n');
     }
     try stdout.flush();
 }

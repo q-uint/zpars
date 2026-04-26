@@ -25,6 +25,7 @@
 - **JIT compilers** - Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
 - **AOT compilation** - Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
 - **Parse trees** - Run any multi-rule grammar with auto-rule-captures to produce a hierarchical tree (S-expression or JSON), with each rule call becoming a node typed by rule name. Works on both the VM and the JIT, with optional packrat memoization.
+- **Tree queries** - Tree-sitter-style structural queries over parse trees, with `@captures`, alternation, quantifiers, anchors, and `#eq?`/`#match?` predicates (regex compiled at query-compile time via the bundled ERE engine).
 - **Benchmarks** - 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
 ## Comptime ABNF Compiler
@@ -290,6 +291,77 @@ $ zpars tree examples/recovery.peg "foo;bar"
 
 Recovery is currently VM-only; the JIT raises `unreachable` for the recovery opcodes. Mixing recovery directives with the legacy flat-capture combinator (`Capture`) is not supported.
 
+### Tree queries (experimental)
+
+A tree-sitter-style query language runs structural patterns against parse trees. Queries are S-expression-shaped with `@captures`, `[alternation]`, `?`/`*`/`+` quantifiers, `.` anchors, and `#predicates?`:
+
+```scheme
+; Capture every Factor.
+(Factor) @factor
+
+; Capture Factors whose text matches a regex.
+((Factor) @odd
+ (#match? @odd "[13579]"))
+
+; Capture Terms that contain at least two Factors.
+(Term (Factor) (Factor)) @mul
+
+; Capture the first Term in an Expr.
+(Expr . (Term) @first-term)
+```
+
+Run with `zpars query`:
+
+```
+$ zpars query examples/calc.peg examples/calc.scm "1+2*3"
+pattern: 3
+  capture: name=first-term, range=[0,1], text='1'
+pattern: 0
+  capture: name=factor, range=[0,1], text='1'
+pattern: 1
+  capture: name=odd, range=[0,1], text='1'
+pattern: 2
+  capture: name=mul, range=[2,5], text='2*3'
+pattern: 0
+  capture: name=factor, range=[2,3], text='2'
+pattern: 0
+  capture: name=factor, range=[4,5], text='3'
+pattern: 1
+  capture: name=odd, range=[4,5], text='3'
+```
+
+The query layer also recognises the recovery-era node kinds: `(ERROR) @e` matches `error_node`s, `(MISSING) @m` matches `missing_node`s, and `(Rule partial)` filters to `rule_partial` nodes specifically.
+
+Built-in predicates:
+
+- `(#eq? @cap "literal")` / `(#eq? @a @b)` -- byte equality.
+- `(#not-eq? ...)` -- negated.
+- `(#match? @cap "regex")` -- ERE regex (compiled at query-compile time, substring search).
+- `(#not-match? ...)` -- negated.
+- Unknown predicates pass through (tree-sitter convention) so queries written for richer matchers still parse.
+
+Programmatic API:
+
+```zig
+const zpars = @import("zpars");
+
+var query = try zpars.query.compile(allocator, query_source, names, null);
+defer query.deinit();
+
+var cursor = try zpars.query.Cursor.init(allocator, query, &tree, input);
+defer cursor.deinit();
+
+while (cursor.next()) |m| {
+    for (m.captures) |cap| {
+        const name = query.captureName(cap.name_id);
+        const text = input[cap.node.span.start..cap.node.span.end];
+        // ...
+    }
+}
+```
+
+Tier-1 scope (current): query syntax, capture model, predicates, ERROR/MISSING/partial heads, `zpars query` CLI. Not yet supported: tree-sitter `field: (...)` syntax, anonymous-token nodes (`"+"`), and multi-pattern groupings -- these are the remaining wall before upstream `tree-sitter-*` `.scm` files would be reusable verbatim.
+
 Try the example grammars:
 
 ```
@@ -301,6 +373,7 @@ zpars vm examples/bit.bnf "01010011"             # binary byte
 zpars tree examples/calc.peg "1+2*3"             # parse tree
 zpars tree --jit -j examples/calc.peg "1+2*3"    # JIT, JSON output
 zpars tree examples/recovery.peg "foo;bar"       # labeled-failure recovery
+zpars query examples/calc.peg examples/calc.scm "1+2*3"  # structural query
 ```
 
 ## CLI
@@ -313,6 +386,7 @@ zpars match   -r <rule> <file> <input>        # match input against a rule
 zpars run     <blob> <input>                  # run a compiled .zpar blob
 zpars tree    [-j] [-p|--jit] <file> <input>  # print parse tree (S-exp default, -j JSON)
 zpars vm      [-t] [-p] <file> [<input>]      # disassemble and run via VM
+zpars query   [-j] <grammar> <query-file> <input>  # run a tree-sitter-style query
 ```
 
 ### check
