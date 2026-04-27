@@ -1767,6 +1767,7 @@ const CaptureTreeMod = @import("CaptureTree.zig");
 // MISSING node mapping).
 comptime {
     _ = @import("recovery_test.zig");
+    _ = @import("diff_test.zig");
 }
 
 test "capture events: flat single group" {

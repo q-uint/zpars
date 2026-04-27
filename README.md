@@ -6,7 +6,7 @@
     with comptime parser combinators, a bytecode VM, native JIT compilers, and AOT compilation for AArch64 and x86_64.
   </p>
   <p align="center">
-    <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/zig-0.15.2+-f7a41d?logo=zig&logoColor=white" alt="Zig 0.15.2+"></a>
+    <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/zig-0.16.0+-f7a41d?logo=zig&logoColor=white" alt="Zig 0.16.0+"></a>
     <a href="https://open-vsx.org/extension/q-uint/zpars"><img src="https://img.shields.io/open-vsx/v/q-uint/zpars?color=c160ef" alt="Open VSX"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-blue" alt="License: MPL-2.0"></a>
   </p>
@@ -24,7 +24,7 @@
 - **Peephole optimizer** - Optimizes compiled bytecode with charset-to-char reduction, consecutive char fusion into string instructions, common prefix factoring, and optional char fusion.
 - **JIT compilers** - Compiles bytecode to native machine code (AArch64 and x86_64), eliminating interpreter dispatch overhead.
 - **AOT compilation** - Compile grammars ahead of time to portable `.zpar` binary blobs containing native machine code. Load and execute them without the grammar compiler.
-- **Parse trees** - Run any multi-rule grammar with auto-rule-captures to produce a hierarchical tree (S-expression or JSON), with each rule call becoming a node typed by rule name. Works on both the VM and the JIT, with optional packrat memoization.
+- **Parse trees** - Run any multi-rule grammar with auto-rule-captures to produce a hierarchical tree (S-expression or JSON), with each rule call becoming a node typed by rule name. Works on both the VM and the JIT, with optional packrat memoization and Warth-style left recursion.
 - **Tree queries** - Tree-sitter-style structural queries over parse trees, with `@captures`, alternation, quantifiers, anchors, field selectors (`name: (pattern)`, declared via backwards-compatible `#@ field` directives), anonymous-token literal matches (`#@ tokens "..."` or `--tokens=all`), and `#eq?`/`#match?` predicates (regex compiled at query-compile time via the bundled ERE engine).
 - **Benchmarks** - 1M-iteration benchmarks comparing comptime vs runtime, optimized vs unoptimized VM, and interpreter vs JIT.
 
@@ -75,7 +75,7 @@ const r = c.Capture(P).parse("42,7!").?;
 // r.value == "42,7"
 ```
 
-Available primitives: `Literal`, `Char`, `CharRange`, `ByteLiteral`, `CaseInsensitiveLiteral`, `Any`, `Eof`.
+Available primitives: `Literal`, `Char`, `CharRange`, `AnyOf`, `NoneOf`, `ByteLiteral`, `CaseInsensitiveLiteral`, `Any`, `Eof`.
 
 Available combinators: `Seq`, `Alt`, `Many`, `Optional`, `Not`, `Map`, `Capture`.
 
@@ -111,25 +111,7 @@ $ zpars vm grammar.peg
    2: call    -> 8
    3: choice  -> 7
    4: char    '+'
-   5: call    -> 8
-   6: commit  -> 3
-   7: ret
-   8: call    -> 14
-   9: choice  -> 13
-  10: char    '*'
-  11: call    -> 14
-  12: commit  -> 9
-  13: ret
-  14: choice  -> 19
-  15: char    '('
-  16: call    -> 2
-  17: char    ')'
-  18: commit  -> 23
-  19: set     [0-9]
-  20: choice  -> 23
-  21: set     [0-9]
-  22: commit  -> 20
-  23: ret
+   ...
 ```
 
 Run a match with capture groups (ERE):
@@ -150,17 +132,11 @@ $ zpars vm -t pattern.ere "abcbd"
    1: sp=0   pos=1   "bcbd" choice -> 7
    2: sp=1   pos=1   "bcbd" choice -> 5
    3: sp=2   pos=1   "bcbd" char 'b'
-   4: sp=2   pos=2   "cbd" commit -> 6
-   6: sp=1   pos=2   "cbd" commit -> 1
-   1: sp=0   pos=2   "cbd" choice -> 7
-   2: sp=1   pos=2   "cbd" choice -> 5
-   3: sp=2   pos=2   "cbd" char 'b'
       backtrack -> pc=5 pos=2
-   5: sp=1   pos=2   "cbd" char 'c'
    ...
 ```
 
-The VM supports all grammar formats (ABNF, BNF, PEG, ERE) and includes 18 opcodes: `char`, `string`, `any`, `set`, `neg_set`, `choice`, `commit`, `fail`, `fail_twice`, `jump`, `call`, `ret`, `save`, `optional_char`, `memo_call`, `event_open`, `event_close`, and `match`.
+The VM supports all grammar formats (ABNF, BNF, PEG, ERE).
 
 ### Peephole Optimizer
 
@@ -202,29 +178,6 @@ match: 5 bytes "1+2*3"
 
 The blob format includes the native code, charset tables, string data, and jump tables. At runtime, the code is mmap'd as executable and called directly -- the only overhead is a single mmap syscall at load time.
 
-Use the AOT API programmatically:
-
-```zig
-const zpars = @import("zpars");
-
-var compiler = zpars.vm.Compiler.compile(rules);
-var blob = try zpars.vm.Aot.compileToBlob(
-    allocator,
-    compiler.getCode(),
-    compiler.getCharsets(),
-    compiler.getStringData(),
-    compiler.getCaptureCount(),
-);
-defer zpars.vm.Aot.freeBlob(allocator, &blob);
-
-// Serialize to bytes for storage.
-const data = try zpars.vm.Aot.serializeBlob(allocator, blob);
-
-// Later: deserialize and run.
-var blob2 = try zpars.vm.Aot.deserializeBlob(allocator, data);
-const result = zpars.vm.AotRuntime.run(blob2, "1+2*3");
-```
-
 ### Parse Trees
 
 Run any multi-rule grammar with `rules_as_captures` to produce a hierarchical parse tree where every rule call is a node typed by its rule name. The compiler emits `event_open` / `event_close` instructions around each rule body; the VM/JIT records them on a side channel so they survive backtracking, and a post-pass folds the events into a tree:
@@ -240,29 +193,6 @@ $ zpars tree examples/calc.peg "1+2*3"
 ```
 
 `-j` switches to compact JSON, `--jit` runs through the native JIT, `-p` enables packrat memoization (which transparently caches and replays the per-rule events on cache hits). The output format mirrors tree-sitter's S-expressions for easy inspection and diffing.
-
-Programmatic API:
-
-```zig
-const zpars = @import("zpars");
-
-var compiler = zpars.vm.Compiler.compileOpts(rules, .{ .rules_as_captures = true });
-
-const Vm = zpars.vm.VmWith(.{ .capture_events = true });
-var vm = Vm.initEvents(allocator, compiler.getCode(), compiler.getCharsets(), compiler.getStringData(), input);
-defer vm.deinit();
-_ = try vm.execute();
-
-var tree = try vm.buildCaptureTree(allocator);
-defer tree.deinit();
-
-// Look up node names by group_id.
-var names: [256][]const u8 = undefined;
-for (0..compiler.rule_count) |i| names[i] = compiler.getRuleName(@intCast(i));
-try tree.writeSExp(stdout, .{ .rules = names[0..compiler.rule_count] });
-```
-
-The same `JitWith(.{ .capture_events = true })` API works with the JIT for native-speed tree construction.
 
 ### Error recovery (PEG, experimental)
 
@@ -289,7 +219,7 @@ $ zpars tree examples/recovery.peg "foo;bar"
     (MISSING [7,7] missing_semi)))
 ```
 
-Recovery is currently VM-only; the JIT raises `unreachable` for the recovery opcodes. Mixing recovery directives with the legacy flat-capture combinator (`Capture`) is not supported.
+Recovery directives can't be mixed with PEG `()` capture groups in the same grammar.
 
 ### Tree queries (experimental)
 
@@ -332,18 +262,7 @@ pattern: 1
 
 The query layer also recognises the recovery-era node kinds: `(ERROR) @e` matches `error_node`s, `(MISSING) @m` matches `missing_node`s, and `(Rule partial)` filters to `rule_partial` nodes specifically.
 
-Built-in predicates:
-
-- `(#eq? @cap "literal")` / `(#eq? @a @b)` -- byte equality.
-- `(#not-eq? ...)` -- negated.
-- `(#match? @cap "regex")` -- ERE regex (compiled at query-compile time, substring search).
-- `(#not-match? ...)` -- negated.
-- `(#vim-match? ...)` / `(#lua-match? ...)` -- aliased to `#match?` so `nvim-treesitter`-style queries load. Patterns that depend on a flavor's specific metacharacters (Vim's `\v`, Lua's `%`) will misbehave.
-- `(#any-of? @cap "a" "b" ...)` -- captured text equals one of the listed strings.
-- `(#not-any-of? ...)` -- negated.
-- `(#contains? @cap "needle" ...)` -- captured text contains every listed substring (multiple needles are ANDed).
-- `(#not-contains? ...)` -- negated.
-- Unknown predicates pass through (tree-sitter convention) so queries written for richer matchers still parse.
+Built-in predicates: `#eq?`, `#match?` (ERE, compiled at query-compile time), `#any-of?`, `#contains?`, each with a `#not-` form. `#vim-match?` / `#lua-match?` are aliased to `#match?` for `nvim-treesitter` compatibility. Unknown predicates pass through (tree-sitter convention).
 
 #### Anonymous tokens
 
@@ -374,7 +293,7 @@ pattern: 1
   capture: name=star, range=[3,4], text='*'
 ```
 
-Token events are currently VM-only (the JIT/AOT backends fall back to the VM when `event_token` is present, parallel to the labeled-failure recovery opcodes).
+Both the VM and JIT emit `event_token` natively.
 
 #### Fields
 
@@ -406,47 +325,13 @@ pattern: 0
   capture: name=fbody, range=[12,14], text='{}'
 ```
 
-Field events are auto-enabled when the PEG parser collects at least one `#@ field` directive. Like token events, they're currently VM-only.
-
-Programmatic API:
-
-```zig
-const zpars = @import("zpars");
-
-var query = try zpars.query.compile(allocator, query_source, names, null);
-defer query.deinit();
-
-var cursor = try zpars.query.Cursor.init(allocator, query, &tree, input);
-defer cursor.deinit();
-
-while (cursor.next()) |m| {
-    for (m.captures) |cap| {
-        const name = query.captureName(cap.name_id);
-        const text = input[cap.node.span.start..cap.node.span.end];
-        // ...
-    }
-}
-```
+Field events are auto-enabled when the PEG parser collects at least one `#@ field` directive. Both the VM and JIT emit `event_field` natively.
 
 Multi-pattern groupings are supported: `((a) (b) (#pred? ...))` matches when the visited node has children matching `a` and `b` in order (gap-allowed by default; use `.` between them for strict adjacency). Predicates fire after the full sequence binds, so a failed predicate triggers backtracking through quantifiers naturally. Single-pattern groupings (`((Rule (Factor)+ @f) (#eq? @f "x"))`) get the same treatment: the group's predicates fold into the inner's child-sequence match so a rejected greedy bind retries with a shorter count.
 
 The CLI prints one entry per pattern match by default; pass `-c` (or `--captures`) to flatten the output into one entry per capture, ordered by source position. JSON forms are available for both modes via `-j`. An empty result set prints `no matches` to stderr.
 
-Try the example grammars:
-
-```
-zpars vm examples/calc.peg "1+2*3"               # arithmetic expressions
-zpars vm examples/email.ere "user@example.com"   # email with captures
-zpars vm examples/json.peg '[1, "hello", true]'  # JSON parser
-zpars vm examples/uri.peg "http://example.com"   # URI structure
-zpars vm examples/bit.bnf "01010011"             # binary byte
-zpars tree examples/calc.peg "1+2*3"             # parse tree
-zpars tree --jit -j examples/calc.peg "1+2*3"    # JIT, JSON output
-zpars tree examples/recovery.peg "foo;bar"       # labeled-failure recovery
-zpars query examples/calc.peg examples/calc.scm "1+2*3"           # structural query
-zpars query examples/calc-tokens.peg examples/operators.scm "1+2*3"  # query anonymous tokens
-zpars query examples/func.peg examples/func.scm "function foo{}"  # query by field name
-```
+See [`examples/`](examples/) for sample grammars (calc, email, JSON, URI, recovery, queries) and inputs.
 
 ## CLI
 
@@ -497,26 +382,6 @@ $ zpars match -r version grammar.abnf "HTTP/1.1 OK"
 HTTP/1.1
 ```
 
-### tree
-
-Parse input and print the parse tree, with each rule call becoming a node typed by its rule name:
-
-```
-$ zpars tree examples/calc.peg "1+2*3"
-(Expr [0,5]
-  (Term [0,1]
-    (Factor [0,1]))
-  (Term [2,5]
-    (Factor [2,3])
-    (Factor [4,5])))
-```
-
-Flags:
-
-- `-j` / `--json` - emit compact JSON instead of S-expressions.
-- `-p` - enable packrat memoization on the VM path.
-- `--jit` - run through the native JIT (mutually exclusive with `-p`; the JIT does not implement packrat).
-
 ## Editor Support
 
 The [VSCode extension](https://open-vsx.org/extension/q-uint/zpars) provides semantic highlighting for ABNF, BNF, PEG, CFG, and S-expression grammars, powered by the zpars WASM build.
@@ -525,7 +390,7 @@ Install from [Open VSX](https://open-vsx.org/extension/q-uint/zpars).
 
 ## Building
 
-Requires Zig 0.15.2+.
+Requires Zig 0.16.0+.
 
 ```
 zig build                      # build the CLI executable

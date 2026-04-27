@@ -8,6 +8,66 @@ const events_mod = @import("events.zig");
 const CaptureTree = @import("CaptureTree.zig");
 const jit_abi = @import("jit_abi.zig");
 
+/// Distinct integer types so a swapped `(rule_id, pos)` arg becomes a
+/// compile error inside the helpers rather than a silent miscompile.
+/// Non-exhaustive (`_`) so any underlying integer is a valid value.
+/// All have the same in-memory size as their tag, so `Frame` keeps its
+/// 32-byte layout and the C-ABI surface is unaffected.
+pub const RuleId = enum(u32) { _ };
+pub const InputPos = enum(u32) { _ };
+pub const SideIdx = enum(u32) { _ };
+/// Flat index into the memo table: `rule_id * stride + pos`. u64 because
+/// large grammars * long inputs can exceed u32.
+pub const MemoIdx = enum(u64) { _ };
+
+inline fn ridFromU64(x: u64) RuleId {
+    return @enumFromInt(@as(u32, @intCast(x)));
+}
+
+inline fn posFromU64(x: u64) InputPos {
+    return @enumFromInt(@as(u32, @intCast(x)));
+}
+
+inline fn sideFromU64(x: u64) SideIdx {
+    return @enumFromInt(@as(u32, @intCast(x)));
+}
+
+/// Single source of truth for the table-index arithmetic. The arg
+/// types make `(pos, rule_id)` a compile error.
+inline fn computeMemoIdx(rule_id: RuleId, pos: InputPos, stride: u64) MemoIdx {
+    return @enumFromInt(@as(u64, @intFromEnum(rule_id)) * stride + @intFromEnum(pos));
+}
+
+inline fn ctxTable(ctx: *const jit_abi.MemoCtx) [*]Entry {
+    return @ptrFromInt(@as(usize, @intCast(ctx.table_ptr)));
+}
+
+inline fn ctxSide(ctx: *const jit_abi.MemoCtx) *Side {
+    return @ptrFromInt(@as(usize, @intCast(ctx.side_ptr)));
+}
+
+inline fn ctxHeads(ctx: *const jit_abi.MemoCtx) *Heads {
+    return @ptrFromInt(@as(usize, @intCast(ctx.heads_ptr)));
+}
+
+inline fn ctxStack(ctx: *const jit_abi.MemoCtx) [*]jit_abi.StackEntry {
+    return @ptrFromInt(@as(usize, @intCast(ctx.stack_ptr)));
+}
+
+inline fn ctxJumpTable(ctx: *const jit_abi.MemoCtx) [*]const u64 {
+    return @ptrFromInt(@as(usize, @intCast(ctx.jump_table_ptr)));
+}
+
+inline fn ctxEventsState(ctx: *const jit_abi.MemoCtx) ?*events_mod.State {
+    if (ctx.events_state_ptr == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(ctx.events_state_ptr)));
+}
+
+inline fn ctxEventsBuf(ctx: *const jit_abi.MemoCtx) ?*EventsBuf {
+    if (ctx.events_buf_ptr == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(ctx.events_buf_ptr)));
+}
+
 pub const State = enum(u8) {
     empty = 0,
     /// In-progress evaluation; produced and consumed by Warth's
@@ -53,8 +113,8 @@ comptime {
 /// fields are only read on the LR (Warth) paths; non-LR runs leave
 /// them at their defaults.
 pub const Frame = extern struct {
-    rule_id: u32,
-    start_pos: u32,
+    rule_id: RuleId,
+    start_pos: InputPos,
     return_pc: u32, // bytecode PC to resume at after the rule completes
     rule_entry_pc: u32, // bytecode PC of the rule body's first instruction
     events_len_at_entry: u32,
@@ -98,14 +158,17 @@ pub const Side = struct {
         self.frames.clearRetainingCapacity();
     }
 
-    /// Append a frame and return its `side_idx`. Returns
-    /// `events_mod.oom_sentinel` (cast to u32 by truncation) on
-    /// allocator failure -- helpers propagate that as their own OOM
-    /// return value.
-    pub fn push(self: *Side, frame: Frame) !u32 {
-        const idx: u32 = @intCast(self.frames.items.len);
+    /// Append a frame and return its `SideIdx`. Indices are monotonic
+    /// within an `execute()` and never collide with prior pushes.
+    /// Helpers propagate allocator failure as `events_mod.oom_sentinel`.
+    pub fn push(self: *Side, frame: Frame) !SideIdx {
+        const idx: SideIdx = @enumFromInt(@as(u32, @intCast(self.frames.items.len)));
         try self.frames.append(self.allocator, frame);
         return idx;
+    }
+
+    pub fn at(self: *Side, idx: SideIdx) *Frame {
+        return &self.frames.items[@intFromEnum(idx)];
     }
 };
 
@@ -113,7 +176,7 @@ pub const Side = struct {
 /// "grown" at some position, plus the involved/eval bitsets that
 /// govern which other rules participate in the cycle.
 pub const Head = struct {
-    rule_id: u16,
+    rule_id: RuleId,
     involved: std.DynamicBitSetUnmanaged,
     eval: std.DynamicBitSetUnmanaged,
 };
@@ -208,48 +271,55 @@ pub fn helperMemoCallBegin(
     end_pos_out: *u64,
     side_idx_out: *u64,
 ) callconv(.c) u64 {
-    const heads: *Heads = @ptrFromInt(@as(usize, @intCast(memo_ctx.heads_ptr)));
-    const table: [*]Entry = @ptrFromInt(@as(usize, @intCast(memo_ctx.table_ptr)));
-    const side: *Side = @ptrFromInt(@as(usize, @intCast(memo_ctx.side_ptr)));
-    const idx: u64 = rule_id * memo_ctx.stride + pos;
+    std.debug.assert(rule_id < memo_ctx.memo_rule_count);
+    std.debug.assert(pos < memo_ctx.stride);
+    std.debug.assert(sp_top < jit_abi.max_stack);
+
+    const heads = ctxHeads(memo_ctx);
+    const table = ctxTable(memo_ctx);
+    const side = ctxSide(memo_ctx);
+    const rid = ridFromU64(rule_id);
+    const ipos = posFromU64(pos);
+    const idx = computeMemoIdx(rid, ipos, memo_ctx.stride);
+    const idx_int: usize = @intCast(@intFromEnum(idx));
     const return_pc: u32 = @truncate(pc_pair);
     const rule_entry_pc: u32 = @truncate(pc_pair >> 32);
     const events_len = currentEventsLen(memo_ctx);
 
     // RECALL fast-path: a head is active at `pos`.
-    const active_head = heads.arr[@intCast(pos)];
+    const active_head = heads.arr[@intFromEnum(ipos)];
     if (active_head != no_head) {
         const h = &heads.pool.items[active_head];
-        const rid_u16: u16 = @intCast(rule_id);
+        const rid_int: usize = @intFromEnum(rid);
         // CUT: empty entry, not the head's seed rule, not in
         // `involved`. The grammar rule cannot participate in this
         // grow cycle, so backtrack rather than re-evaluate.
-        if (table[@intCast(idx)].state == .empty and
-            rid_u16 != h.rule_id and
-            !h.involved.isSet(rid_u16))
+        if (table[idx_int].state == .empty and
+            rid != h.rule_id and
+            !h.involved.isSet(rid_int))
         {
             return call_cut;
         }
         // RECALL: rule is still in the eval set, so this iteration
         // must re-evaluate it once (with the current seed visible).
-        if (h.eval.isSet(rid_u16)) {
-            h.eval.unset(rid_u16);
+        if (h.eval.isSet(rid_int)) {
+            h.eval.unset(rid_int);
             const new_idx = side.push(.{
-                .rule_id = @intCast(rule_id),
-                .start_pos = @intCast(pos),
+                .rule_id = rid,
+                .start_pos = ipos,
                 .return_pc = return_pc,
                 .rule_entry_pc = rule_entry_pc,
                 .events_len_at_entry = events_len,
                 .is_recall = 1,
                 .head_idx = active_head,
             }) catch return events_mod.oom_sentinel;
-            side_idx_out.* = new_idx;
+            side_idx_out.* = @intFromEnum(new_idx);
             return call_recall;
         }
         // Otherwise fall through to normal table lookup.
     }
 
-    const entry = table[@intCast(idx)];
+    const entry = table[idx_int];
     switch (entry.state) {
         .empty => {
             // Mark the entry as in-progress so a re-entrant call to
@@ -257,15 +327,15 @@ pub fn helperMemoCallBegin(
             // arm below. `sp_top` is the JIT's bsp here -- after the
             // caller pushes the marker, `stack[sp_top].val1` will
             // resolve to the side frame we're about to allocate.
-            table[@intCast(idx)] = .{ .state = .lr, .next_pos_or_frame = @intCast(sp_top) };
+            table[idx_int] = .{ .state = .lr, .next_pos_or_frame = @intCast(sp_top) };
             const new_idx = side.push(.{
-                .rule_id = @intCast(rule_id),
-                .start_pos = @intCast(pos),
+                .rule_id = rid,
+                .start_pos = ipos,
                 .return_pc = return_pc,
                 .rule_entry_pc = rule_entry_pc,
                 .events_len_at_entry = events_len,
             }) catch return events_mod.oom_sentinel;
-            side_idx_out.* = new_idx;
+            side_idx_out.* = @intFromEnum(new_idx);
             return call_miss;
         },
         .fail => return call_fail,
@@ -282,16 +352,16 @@ pub fn helperMemoCallBegin(
             // `next_pos_or_frame`, which the .empty arm above set to
             // the bsp at first-call time. We need that frame's depth
             // in the JIT stack -- look it up via val1.
-            const stack: [*]jit_abi.StackEntry = @ptrFromInt(@as(usize, @intCast(memo_ctx.stack_ptr)));
+            const stack = ctxStack(memo_ctx);
             const owner_sp_top: u32 = entry.next_pos_or_frame;
             // Fetch the side index from the stack entry at depth
             // `owner_sp_top` (where the in-progress memo frame
             // marker lives). It's a tag=5 entry with val1 = side_idx.
-            const owner_side_idx: u32 = @intCast(stack[owner_sp_top].val1);
-            setupLr(heads, side, stack, sp_top, owner_side_idx, @intCast(rule_id), @intCast(memo_ctx.memo_rule_count)) catch {
+            const owner_side_idx = sideFromU64(stack[owner_sp_top].val1);
+            setupLr(heads, side, stack, sp_top, owner_side_idx, rid, @intCast(memo_ctx.memo_rule_count)) catch {
                 return events_mod.oom_sentinel;
             };
-            const fr = &side.frames.items[owner_side_idx];
+            const fr = side.at(owner_side_idx);
             if (fr.best_end != grow_sentinel) {
                 end_pos_out.* = fr.best_end;
                 return call_lr_seed;
@@ -305,8 +375,7 @@ pub fn helperMemoCallBegin(
 /// is off. Read once per memo-frame push so a future grow / recall
 /// completion can cache only the events the body produced.
 fn currentEventsLen(memo_ctx: *const jit_abi.MemoCtx) u32 {
-    if (memo_ctx.events_state_ptr == 0) return 0;
-    const state: *events_mod.State = @ptrFromInt(@as(usize, @intCast(memo_ctx.events_state_ptr)));
+    const state = ctxEventsState(memo_ctx) orelse return 0;
     return @intCast(state.list.items.len);
 }
 
@@ -331,25 +400,25 @@ fn setupLr(
     side: *Side,
     stack: [*]jit_abi.StackEntry,
     sp_top: u64,
-    owner_side_idx: u32,
-    recur_rule_id: u16,
+    owner_side_idx: SideIdx,
+    recur_rule_id: RuleId,
     num_rules: usize,
 ) std.mem.Allocator.Error!void {
-    var target_head_idx = side.frames.items[owner_side_idx].head_idx;
+    var target_head_idx = side.at(owner_side_idx).head_idx;
     if (target_head_idx == no_head) {
         var involved = try std.DynamicBitSetUnmanaged.initEmpty(heads.allocator, num_rules);
         const eval = try std.DynamicBitSetUnmanaged.initEmpty(heads.allocator, num_rules);
-        const seed_rule_id: u16 = @intCast(side.frames.items[owner_side_idx].rule_id);
-        involved.set(seed_rule_id);
+        const seed_rule_id = side.at(owner_side_idx).rule_id;
+        involved.set(@intFromEnum(seed_rule_id));
         try heads.pool.append(heads.allocator, .{
             .rule_id = seed_rule_id,
             .involved = involved,
             .eval = eval,
         });
         target_head_idx = @intCast(heads.pool.items.len - 1);
-        side.frames.items[owner_side_idx].head_idx = target_head_idx;
+        side.at(owner_side_idx).head_idx = target_head_idx;
     }
-    heads.pool.items[target_head_idx].involved.set(recur_rule_id);
+    heads.pool.items[target_head_idx].involved.set(@intFromEnum(recur_rule_id));
 
     // Walk down looking for tag=5 stack entries; for each, mark its
     // side frame with this head and add its rule_id to involved. Stop
@@ -359,12 +428,12 @@ fn setupLr(
     while (i > 0) {
         i -= 1;
         if (stack[@intCast(i)].tag != 5) continue;
-        const fr_idx: u32 = @intCast(stack[@intCast(i)].val1);
-        const fr = &side.frames.items[fr_idx];
+        const fr_idx = sideFromU64(stack[@intCast(i)].val1);
+        const fr = side.at(fr_idx);
         if (fr.head_idx == target_head_idx) break;
         fr.head_idx = target_head_idx;
-        heads.pool.items[target_head_idx].involved.set(@intCast(fr.rule_id));
-        if (fr_idx == owner_side_idx) break;
+        heads.pool.items[target_head_idx].involved.set(@intFromEnum(fr.rule_id));
+        if (@intFromEnum(fr_idx) == @intFromEnum(owner_side_idx)) break;
     }
 }
 
@@ -388,6 +457,9 @@ pub fn helperMemoCachedSlice(
     out_start: *u64,
 ) callconv(.c) u64 {
     const entry = table_ptr[@intCast(idx)];
+    // Contract: only called immediately after `helperMemoCallBegin`
+    // returned `call_success`, so the entry is `.success`.
+    std.debug.assert(entry.state == .success);
     out_start.* = entry.events_start;
     return entry.events_count;
 }
@@ -419,6 +491,9 @@ pub fn helperMemoReplayEvents(
     captures_ptr: [*]u64,
 ) callconv(.c) u64 {
     if (count == 0) return 0;
+    std.debug.assert(start <= events_buf_ptr.list.items.len);
+    std.debug.assert(count <= events_buf_ptr.list.items.len - start);
+    std.debug.assert(sp_in_out.* <= jit_abi.max_stack);
     const cached = events_buf_ptr.list.items[@intCast(start)..][0..@intCast(count)];
     var sp = sp_in_out.*;
     for (cached) |ev| {
@@ -528,21 +603,27 @@ pub fn helperMemoRet(
     bsp_ptr: *u64,
     out: *RetResult,
 ) callconv(.c) u64 {
-    const side: *Side = @ptrFromInt(@as(usize, @intCast(memo_ctx.side_ptr)));
-    const frame = side.frames.items[@intCast(side_idx)];
-    const idx: u64 = @as(u64, frame.rule_id) * memo_ctx.stride + frame.start_pos;
-    const table: [*]Entry = @ptrFromInt(@as(usize, @intCast(memo_ctx.table_ptr)));
-    const jt: [*]const u64 = @ptrFromInt(@as(usize, @intCast(memo_ctx.jump_table_ptr)));
+    const side = ctxSide(memo_ctx);
+    std.debug.assert(side_idx < side.frames.items.len);
+    std.debug.assert(bsp_ptr.* < jit_abi.max_stack);
+
+    const sidx = sideFromU64(side_idx);
+    const frame = side.at(sidx).*;
+    const idx = computeMemoIdx(frame.rule_id, frame.start_pos, memo_ctx.stride);
+    const idx_int: usize = @intCast(@intFromEnum(idx));
+    const table = ctxTable(memo_ctx);
+    const jt = ctxJumpTable(memo_ctx);
     const code_base = memo_ctx.code_base;
 
     const cur_end: u32 = @intCast(end_pos);
+    const start_pos_u32: u32 = @intFromEnum(frame.start_pos);
 
     if (frame.is_recall != 0) {
         // RECALL re-eval completed. Only update the table if the
         // answer strictly grew, so a late recall can't clobber a
         // better seed written by an earlier iteration.
-        const prev = table[@intCast(idx)];
-        const prev_end: u32 = if (prev.state == .success) prev.next_pos_or_frame else frame.start_pos;
+        const prev = table[idx_int];
+        const prev_end: u32 = if (prev.state == .success) prev.next_pos_or_frame else start_pos_u32;
         const report_end = if (cur_end > prev_end) cur_end else prev_end;
         if (cur_end > prev_end) {
             writeMemoSuccess(table, idx, cur_end, frame, memo_ctx) catch return ret_oom;
@@ -555,16 +636,16 @@ pub fn helperMemoRet(
     if (frame.best_end == grow_sentinel) {
         // First evaluation of this rule@pos completed.
         if (frame.head_idx != no_head) {
-            const heads: *Heads = @ptrFromInt(@as(usize, @intCast(memo_ctx.heads_ptr)));
+            const heads = ctxHeads(memo_ctx);
             if (heads.pool.items[frame.head_idx].rule_id == frame.rule_id) {
                 // Enter GROW: write success, register head at pos,
                 // reset eval set, re-push frame with best_end seeded.
                 writeMemoSuccess(table, idx, cur_end, frame, memo_ctx) catch return ret_oom;
-                heads.arr[frame.start_pos] = frame.head_idx;
+                heads.arr[start_pos_u32] = frame.head_idx;
                 resetEvalSet(heads, frame.head_idx);
                 pushGrowFrame(memo_ctx, bsp_ptr, frame, cur_end) catch return ret_oom;
                 out.native_target = code_base + jt[frame.rule_entry_pc];
-                out.new_pos = frame.start_pos;
+                out.new_pos = start_pos_u32;
                 return ret_regrow;
             }
             // Participant in someone else's cycle: hand answer up.
@@ -584,23 +665,23 @@ pub fn helperMemoRet(
     // re-evals may have written a better answer into the table even
     // if this iteration produced a shorter match (via alternation
     // fallback). The memo entry holds the true current best.
-    const memo_end: u32 = if (table[@intCast(idx)].state == .success)
-        table[@intCast(idx)].next_pos_or_frame
+    const memo_end: u32 = if (table[idx_int].state == .success)
+        table[idx_int].next_pos_or_frame
     else
         frame.best_end;
     const new_best = if (cur_end > memo_end) cur_end else memo_end;
     if (new_best > frame.best_end) {
         writeMemoSuccess(table, idx, new_best, frame, memo_ctx) catch return ret_oom;
-        const heads: *Heads = @ptrFromInt(@as(usize, @intCast(memo_ctx.heads_ptr)));
+        const heads = ctxHeads(memo_ctx);
         resetEvalSet(heads, frame.head_idx);
         pushGrowFrame(memo_ctx, bsp_ptr, frame, new_best) catch return ret_oom;
         out.native_target = code_base + jt[frame.rule_entry_pc];
-        out.new_pos = frame.start_pos;
+        out.new_pos = start_pos_u32;
         return ret_regrow;
     }
     // Done growing. Drop head from this position; resume at best seed.
-    const heads: *Heads = @ptrFromInt(@as(usize, @intCast(memo_ctx.heads_ptr)));
-    heads.arr[frame.start_pos] = no_head;
+    const heads = ctxHeads(memo_ctx);
+    heads.arr[start_pos_u32] = no_head;
     out.native_target = code_base + jt[frame.return_pc];
     out.new_pos = frame.best_end;
     return ret_done;
@@ -614,36 +695,39 @@ pub fn helperMemoBacktrack(
     side_idx: u64,
     out: *RetResult,
 ) callconv(.c) u64 {
-    const side: *Side = @ptrFromInt(@as(usize, @intCast(memo_ctx.side_ptr)));
-    const frame = side.frames.items[@intCast(side_idx)];
-    const idx: u64 = @as(u64, frame.rule_id) * memo_ctx.stride + frame.start_pos;
-    const table: [*]Entry = @ptrFromInt(@as(usize, @intCast(memo_ctx.table_ptr)));
-    const jt: [*]const u64 = @ptrFromInt(@as(usize, @intCast(memo_ctx.jump_table_ptr)));
+    const side = ctxSide(memo_ctx);
+    std.debug.assert(side_idx < side.frames.items.len);
+
+    const frame = side.at(sideFromU64(side_idx)).*;
+    const idx = computeMemoIdx(frame.rule_id, frame.start_pos, memo_ctx.stride);
+    const idx_int: usize = @intCast(@intFromEnum(idx));
+    const table = ctxTable(memo_ctx);
+    const jt = ctxJumpTable(memo_ctx);
 
     if (frame.is_recall != 0) {
         // RECALL re-eval failed. If a prior iteration already cached
         // a success seed, redirect to that rather than overwrite.
-        const prev = table[@intCast(idx)];
+        const prev = table[idx_int];
         if (prev.state == .success) {
             out.native_target = memo_ctx.code_base + jt[frame.return_pc];
             out.new_pos = prev.next_pos_or_frame;
             return bt_redirect;
         }
-        table[@intCast(idx)] = .{ .state = .fail, .next_pos_or_frame = 0 };
+        table[idx_int] = .{ .state = .fail, .next_pos_or_frame = 0 };
         return bt_continue;
     }
 
     if (frame.best_end != grow_sentinel) {
         // Grow iteration failed. Stop growing, resume at best seed.
-        const heads: *Heads = @ptrFromInt(@as(usize, @intCast(memo_ctx.heads_ptr)));
-        heads.arr[frame.start_pos] = no_head;
+        const heads = ctxHeads(memo_ctx);
+        heads.arr[@intFromEnum(frame.start_pos)] = no_head;
         out.native_target = memo_ctx.code_base + jt[frame.return_pc];
         out.new_pos = frame.best_end;
         return bt_redirect;
     }
 
     // First-eval failure: cache it.
-    table[@intCast(idx)] = .{ .state = .fail, .next_pos_or_frame = 0 };
+    table[idx_int] = .{ .state = .fail, .next_pos_or_frame = 0 };
     return bt_continue;
 }
 
@@ -653,25 +737,25 @@ pub fn helperMemoBacktrack(
 /// the plain and grow paths.
 fn writeMemoSuccess(
     table: [*]Entry,
-    idx: u64,
+    idx: MemoIdx,
     end_pos: u32,
     frame: Frame,
     memo_ctx: *const jit_abi.MemoCtx,
 ) std.mem.Allocator.Error!void {
     var entry: Entry = .{ .state = .success, .next_pos_or_frame = end_pos };
-    if (memo_ctx.events_state_ptr != 0 and memo_ctx.events_buf_ptr != 0) {
-        const state: *events_mod.State = @ptrFromInt(@as(usize, @intCast(memo_ctx.events_state_ptr)));
-        const buf: *EventsBuf = @ptrFromInt(@as(usize, @intCast(memo_ctx.events_buf_ptr)));
-        const live = state.list.items;
-        if (live.len > frame.events_len_at_entry) {
-            const slice = live[frame.events_len_at_entry..];
-            const start: u32 = @intCast(buf.list.items.len);
-            try buf.list.appendSlice(buf.allocator, slice);
-            entry.events_start = start;
-            entry.events_count = @intCast(slice.len);
+    if (ctxEventsState(memo_ctx)) |state| {
+        if (ctxEventsBuf(memo_ctx)) |buf| {
+            const live = state.list.items;
+            if (live.len > frame.events_len_at_entry) {
+                const slice = live[frame.events_len_at_entry..];
+                const start: u32 = @intCast(buf.list.items.len);
+                try buf.list.appendSlice(buf.allocator, slice);
+                entry.events_start = start;
+                entry.events_count = @intCast(slice.len);
+            }
         }
     }
-    table[@intCast(idx)] = entry;
+    table[@intCast(@intFromEnum(idx))] = entry;
 }
 
 /// Push a memo frame for the grow case: append a new entry to
@@ -686,8 +770,8 @@ fn pushGrowFrame(
     base: Frame,
     new_best: u32,
 ) std.mem.Allocator.Error!void {
-    const side: *Side = @ptrFromInt(@as(usize, @intCast(memo_ctx.side_ptr)));
-    const stack: [*]jit_abi.StackEntry = @ptrFromInt(@as(usize, @intCast(memo_ctx.stack_ptr)));
+    const side = ctxSide(memo_ctx);
+    const stack = ctxStack(memo_ctx);
     const new_idx = try side.push(.{
         .rule_id = base.rule_id,
         .start_pos = base.start_pos,
@@ -699,7 +783,8 @@ fn pushGrowFrame(
         .head_idx = base.head_idx,
     });
     const sp: u64 = bsp_ptr.*;
-    stack[@intCast(sp)] = .{ .tag = 5, .val1 = new_idx, .val2 = 0, .event_len = 0 };
+    std.debug.assert(sp < jit_abi.max_stack);
+    stack[@intCast(sp)] = .{ .tag = 5, .val1 = @intFromEnum(new_idx), .val2 = 0, .event_len = 0 };
     bsp_ptr.* = sp + 1;
 }
 
@@ -716,7 +801,7 @@ fn buildTestCtx(table: []Entry, side: *Side, heads: *Heads, stride: usize) jit_a
         .jump_table_ptr = 0,
         .code_base = 0,
         .heads_ptr = @intFromPtr(heads),
-        .memo_rule_count = 0,
+        .memo_rule_count = table.len / stride,
         .helper_call_begin = 0,
         .helper_cached_slice = 0,
         .helper_replay_events = 0,

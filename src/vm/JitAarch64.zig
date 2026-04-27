@@ -606,6 +606,83 @@ fn emitBacktrackHandler(
     }
 }
 
+/// Splice out the most recent .choice (tag=0) or .lcatch (tag=4) frame
+/// without disturbing any .save / .event frames a rule call inside the
+/// alt body pushed on top of it. Mirrors `Vm.spliceCtrlFrame`.
+///
+/// In capture_events mode a successful sub-call's `ret` shifts its body
+/// event frames down past the squeezed call frame, so by the time
+/// `commit` / `fail_twice` runs the choice frame is no longer at sp-1
+/// -- a plain `bsp -= 1` would pop an event frame and leave the choice
+/// stranded, causing a later backtrack to find the wrong frame and
+/// resume at the wrong control point. Caller guarantees a matching
+/// frame exists.
+fn emitSpliceCtrlFrame(buf: *Buf) void {
+    // t1 = bsp - 1 (start at sp-1)
+    buf.emit(encSub(t1, bsp, 1));
+
+    // find_loop: walk down until tag == 0 (choice) or tag == 4 (lcatch).
+    const find_loop = buf.off();
+    buf.emit(encLsl(t0, t1, 5));
+    buf.emit(encAddReg(t0, skp, t0));
+    buf.emit(encLdr(t2, t0, 0)); // t2 = tag
+
+    const found_choice_off = buf.off();
+    buf.emit(encCbz(t2, 0)); // tag == 0 → found
+    buf.emit(encCmpImm(t2, 4));
+    const found_lcatch_off = buf.off();
+    buf.emit(encBCond(CC.eq, 0)); // tag == 4 → found
+
+    buf.emit(encSub(t1, t1, 1));
+    {
+        const rel: i32 = @as(i32, @intCast(find_loop)) - @as(i32, @intCast(buf.off()));
+        buf.emit(encB(@intCast(rel)));
+    }
+
+    // found: shift frames [t1+1..bsp) down by one slot.
+    const found = buf.off();
+    {
+        const rel: i32 = @as(i32, @intCast(found)) - @as(i32, @intCast(found_choice_off));
+        buf.patchAt(found_choice_off, encCbz(t2, @intCast(rel)));
+    }
+    {
+        const rel: i32 = @as(i32, @intCast(found)) - @as(i32, @intCast(found_lcatch_off));
+        buf.patchAt(found_lcatch_off, encBCond(CC.eq, @intCast(rel)));
+    }
+
+    const shift_loop = buf.off();
+    buf.emit(encAdd(t2, t1, 1));
+    buf.emit(encCmpReg(t2, bsp));
+    const shift_done_off = buf.off();
+    buf.emit(encBCond(CC.hs, 0));
+
+    buf.emit(encLsl(t0, t1, 5));
+    buf.emit(encAddReg(t0, skp, t0));
+
+    buf.emit(encLdr(t4, t0, 32));
+    buf.emit(encStr(t4, t0, 0));
+    buf.emit(encLdr(t4, t0, 40));
+    buf.emit(encStr(t4, t0, 8));
+    buf.emit(encLdr(t4, t0, 48));
+    buf.emit(encStr(t4, t0, 16));
+    buf.emit(encLdr(t4, t0, 56));
+    buf.emit(encStr(t4, t0, 24));
+
+    buf.emit(encAdd(t1, t1, 1));
+    {
+        const rel: i32 = @as(i32, @intCast(shift_loop)) - @as(i32, @intCast(buf.off()));
+        buf.emit(encB(@intCast(rel)));
+    }
+
+    const shift_done = buf.off();
+    {
+        const rel: i32 = @as(i32, @intCast(shift_done)) - @as(i32, @intCast(shift_done_off));
+        buf.patchAt(shift_done_off, encBCond(CC.hs, @intCast(rel)));
+    }
+
+    buf.emit(encSub(bsp, bsp, 1));
+}
+
 fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup, fcount: *usize) void {
     buf.emit(encCmpReg(pos, inl));
     addFixup(fixups, fcount, buf.off(), .backtrack, .b_cond, CC.hs, 0);
@@ -664,7 +741,11 @@ fn emitInst(
             buf.emit(encAdd(bsp, bsp, 1));
         },
         .commit => {
-            buf.emit(encSub(bsp, bsp, 1));
+            if (config.capture_events) {
+                emitSpliceCtrlFrame(buf);
+            } else {
+                buf.emit(encSub(bsp, bsp, 1));
+            }
             addFixup(fixups, fcount, buf.off(), FixupTarget.bytecodePC(inst.data.offset), .b, 0, 0);
             buf.emit(encNop());
         },
@@ -673,7 +754,11 @@ fn emitInst(
             buf.emit(encNop());
         },
         .fail_twice => {
-            buf.emit(encSub(bsp, bsp, 1));
+            if (config.capture_events) {
+                emitSpliceCtrlFrame(buf);
+            } else {
+                buf.emit(encSub(bsp, bsp, 1));
+            }
             addFixup(fixups, fcount, buf.off(), .backtrack, .b, 0, 0);
             buf.emit(encNop());
         },
@@ -752,7 +837,7 @@ fn emitInst(
             // require pushing a tag=5 marker with the helper-supplied
             // side_idx and jumping to the body.
 
-            // ----- Miss / recall: stamp marker + jump.
+            // Miss / recall: stamp marker + jump.
             // stack[bsp] = { tag=5, val1=*side_idx_out, val2=0, event_len=0 }
             buf.emit(encLsl(t1, bsp, 5));
             buf.emit(encAddReg(t1, skp, t1));
@@ -766,7 +851,7 @@ fn emitInst(
             addFixup(fixups, fcount, buf.off(), FixupTarget.bytecodePC(mc.offset), .b, 0, 0);
             buf.emit(encNop());
 
-            // ----- LR-seed handler: just advance pos, no replay.
+            // LR-seed handler: just advance pos, no replay.
             const lr_seed_handler = buf.off();
             {
                 const rel: i32 = @as(i32, @intCast(lr_seed_handler)) - @as(i32, @intCast(lr_seed_branch_off));
@@ -776,13 +861,21 @@ fn emitInst(
             const lr_seed_skip_off = buf.off();
             buf.emit(encNop()); // patched to branch past the success handler
 
-            // ----- Success path: replay cached events, advance pos.
+            // Success path: replay cached events, advance pos.
             const success_handler = buf.off();
             {
                 const rel: i32 = @as(i32, @intCast(success_handler)) - @as(i32, @intCast(success_branch_off));
                 buf.patchAt(success_branch_off, encBCond(CC.eq, @intCast(rel)));
             }
             if (config.capture_events) {
+                // memo_scratch1 holds the cached end_pos (written by
+                // helperMemoCallBegin) and is consumed below to set
+                // pos. helperMemoCachedSlice writes events_start
+                // through its out_start arg, so route that to
+                // call_scratch instead -- otherwise it overwrites the
+                // end_pos and the success path resumes at the wrong
+                // position (or, with events_start = 0 on the first
+                // hit, at the start of the input).
                 buf.emit(encLdr(t0, sp_reg, sp_memo_ctx));
                 buf.emit(encLdr(0, t0, memoOff("table_ptr")));
                 buf.emit(encLdr(t1, t0, memoOff("stride")));
@@ -790,7 +883,7 @@ fn emitInst(
                 buf.emit(encMul(t1, t1, t2));
                 buf.emit(encAddReg(t1, t1, pos));
                 buf.emit(encMov(1, t1));
-                buf.emit(encAdd(2, sp_reg, sp_memo_scratch1));
+                buf.emit(encAdd(2, sp_reg, sp_call_scratch));
                 buf.emit(encLdr(t3, t0, memoOff("helper_cached_slice")));
                 buf.emit(encBlr(t3));
                 buf.emit(encMov(t4, 0)); // t4 = count
@@ -799,7 +892,7 @@ fn emitInst(
                 buf.emit(encLdr(t0, sp_reg, sp_memo_ctx));
                 buf.emit(encLdr(0, sp_reg, sp_esp));
                 buf.emit(encLdr(1, t0, memoOff("events_buf_ptr")));
-                buf.emit(encLdr(2, sp_reg, sp_memo_scratch1));
+                buf.emit(encLdr(2, sp_reg, sp_call_scratch));
                 buf.emit(encMov(3, t4));
                 buf.emit(encMov(4, skp));
                 buf.emit(encStr(bsp, sp_reg, sp_memo_scratch2));

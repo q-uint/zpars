@@ -27,11 +27,28 @@ pub const current_arch: Arch = switch (@import("builtin").cpu.arch) {
 };
 
 pub const magic = [4]u8{ 'Z', 'P', 'A', 'R' };
-pub const version: u32 = 1;
+pub const version: u32 = 0;
+
+/// Bit flags stored in `Header.flags`. Mirrors the comptime knobs in
+/// `Jit.Config` so the runtime can reject blobs compiled with a config
+/// the loader can't satisfy (e.g. capture_events blob loaded by an
+/// `EngineWith(.{})` runtime that doesn't carry an event log).
+pub const Flag = struct {
+    pub const capture_events: u32 = 1 << 0;
+    pub const memoize: u32 = 1 << 1;
+};
+
+pub fn flagsFromConfig(config: Jit.Config) u32 {
+    var f: u32 = 0;
+    if (config.capture_events) f |= Flag.capture_events;
+    if (config.memoize) f |= Flag.memoize;
+    return f;
+}
 
 pub const Header = extern struct {
     magic: [4]u8,
     version: u32,
+    flags: u32,
     arch: Arch,
     _pad: [3]u8 = .{ 0, 0, 0 },
     code_len: u32,
@@ -39,11 +56,11 @@ pub const Header = extern struct {
     string_data_len: u32,
     jump_table_entries: u32,
     capture_count: u32,
+    /// Number of `memo_call`-bearing rules in the grammar. Read by
+    /// `EngineWith.initPackrat` to size the memo table. Zero when the
+    /// blob was compiled without `memoize`.
+    memo_rule_count: u32,
 };
-
-comptime {
-    if (@sizeOf(Header) != 32) @compileError("Header must be 32 bytes");
-}
 
 pub const Blob = struct {
     header: Header,
@@ -60,17 +77,39 @@ pub fn compileToBlob(
     string_data: []const u8,
     capture_count: u16,
 ) !Blob {
-    // AOT currently always compiles with the default JIT config
-    // (capture_events = false). Recovery opcodes need an event-log
-    // state at runtime, so reject those grammars up front.
-    if (I.requiresCaptureEvents(code)) return error.JitDoesNotSupportOp;
+    return compileToBlobWith(.{}, allocator, code, charsets, string_data, capture_count, 0);
+}
 
-    // AOT currently always compiles with the default JIT config; capture
-    // events are not yet serialized into the blob format.
-    const est = backend.estimateSize(.{}, code.len);
+/// Configurable variant of `compileToBlob`. The compile-time `config`
+/// flows straight into the backend so the emitted machine code matches
+/// what `EngineWith(config)` will execute. The chosen flags are stamped
+/// into `Header.flags` so the runtime can reject mismatched loads.
+/// `memo_rule_count` is the number of memoized rules in the grammar
+/// (from `Compiler.getMemoRuleCount()`); the runtime uses it to size
+/// the per-execute memo table. Pass 0 when `config.memoize` is off.
+pub fn compileToBlobWith(
+    comptime config: Jit.Config,
+    allocator: std.mem.Allocator,
+    code: []const I.Inst,
+    charsets: []const I.Charset,
+    string_data: []const u8,
+    capture_count: u16,
+    memo_rule_count: u16,
+) !Blob {
+    // Recovery opcodes need an event log to snapshot lcatch frames and
+    // synthesize partial-close events. Reject those grammars when
+    // capture_events is off rather than miscompiling.
+    if (!config.capture_events and I.requiresCaptureEvents(code))
+        return error.JitDoesNotSupportOp;
+    // memo_call needs a memo table at runtime. Reject grammars that
+    // use it when memoize is off, mirroring the JIT's gate.
+    if (!config.memoize and I.containsMemoCall(code))
+        return error.JitDoesNotSupportOp;
+
+    const est = backend.estimateSize(config, code.len);
     const buf = try allocator.alloc(u8, est);
 
-    const result = backend.generate(.{}, code, buf.ptr);
+    const result = backend.generate(config, code, buf.ptr);
 
     // Shrink to actual size.
     const native_code = allocator.realloc(buf, result.native_len) catch buf[0..result.native_len];
@@ -89,12 +128,14 @@ pub fn compileToBlob(
         .header = .{
             .magic = magic,
             .version = version,
+            .flags = flagsFromConfig(config),
             .arch = current_arch,
             .code_len = @intCast(result.native_len),
             .charsets_count = @intCast(charsets.len),
             .string_data_len = @intCast(string_data.len),
             .jump_table_entries = @intCast(code.len),
             .capture_count = capture_count,
+            .memo_rule_count = memo_rule_count,
         },
         .native_code = native_code,
         .charsets = owned_charsets,
@@ -287,13 +328,13 @@ test "aot: peg recursive rules" {
 }
 
 test "aot: blob header validation" {
-    var bad_data = [_]u8{0} ** 32;
+    var bad_data = [_]u8{0} ** @sizeOf(Header);
     const result = deserializeBlob(testing.allocator, &bad_data);
     try testing.expectError(error.InvalidMagic, result);
 }
 
 test "aot: blob too short" {
-    var short_data = [_]u8{0} ** 16;
+    var short_data = [_]u8{0} ** (@sizeOf(Header) - 1);
     const result = deserializeBlob(testing.allocator, &short_data);
     try testing.expectError(error.UnexpectedEof, result);
 }

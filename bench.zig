@@ -386,7 +386,6 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout.print("\n  ({d} iterations per case)\n\n", .{iterations});
 
-    // ---- Packrat VM: plain vs memoized ----
     try stdout.print("  Packrat VM (plain vs memoized)\n", .{});
     try stdout.print("  {s:<20} {s:>14} {s:>14} {s:>10}\n", .{
         "case", "plain", "packrat", "speedup",
@@ -429,7 +428,6 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout.print("\n  ({d} iterations per case)\n\n", .{iterations});
 
-    // ---- Matcher: plain vs packrat (with stats) ----
     try stdout.print("  Matcher: plain vs packrat (with stats)\n", .{});
     try printStatsHeader(stdout);
 
@@ -719,15 +717,13 @@ fn printStatsRow(
         else
             0;
         try stdout.print("  {s:<16} {d:>8} ns {d:>8} ns {d:>7.2}x {d:>8} {d:>8} {d:>4.0}% {d:>8}\n", .{
-            name, pp, memo_per, speedup,
-            stats.memo_hits, stats.memo_misses, hit_pct,
-            stats.max_depth_reached,
+            name,            pp,                memo_per, speedup,
+            stats.memo_hits, stats.memo_misses, hit_pct,  stats.max_depth_reached,
         });
     } else {
         try stdout.print("  {s:<16} {s:>11} {d:>8} ns {s:>8} {d:>8} {d:>8} {d:>4.0}% {d:>8}\n", .{
-            name, "(LR: n/a)", memo_per, "-",
-            stats.memo_hits, stats.memo_misses, hit_pct,
-            stats.max_depth_reached,
+            name,            "(LR: n/a)",       memo_per, "-",
+            stats.memo_hits, stats.memo_misses, hit_pct,  stats.max_depth_reached,
         });
     }
 }

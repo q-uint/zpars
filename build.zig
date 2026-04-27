@@ -76,6 +76,17 @@ pub fn build(b: *std.Build) void {
     run_mod_tests.has_side_effects = true;
     test_step.dependOn(&run_mod_tests.step);
 
+    // Companion step for coverage-guided fuzzing. The default `test`
+    // step above uses a plain `Run` (no `--listen=-`) for readable
+    // per-test output, but the fuzzer needs the listen protocol so
+    // the build runner can discover fuzz tests and feed them mutated
+    // inputs. Run with:
+    //   zig build fuzz --fuzz
+    // The `--fuzz` is a build-runner flag, not a step argument.
+    const fuzz_step = b.step("fuzz", "Run tests via the listen protocol (pair with --fuzz)");
+    const fuzz_run = b.addRunArtifact(mod_tests);
+    fuzz_step.dependOn(&fuzz_run.step);
+
     const lsp_step = b.step("lsp", "Build the LSP server");
     const lsp_exe = b.addExecutable(.{
         .name = "zpars-lsp",

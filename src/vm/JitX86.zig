@@ -745,6 +745,75 @@ fn emitBacktrackHandler(
     if (config.memoize) patchRel32(buf, memo_rel32, memo_handler_off);
 }
 
+/// Splice out the most recent .choice (tag=0) or .lcatch (tag=4) frame
+/// without disturbing any .save / .event frames a rule call inside the
+/// alt body pushed on top of it. Mirrors `Vm.spliceCtrlFrame` and the
+/// AArch64 backend's `emitSpliceCtrlFrame`.
+///
+/// In capture_events mode a successful sub-call's `ret` shifts its body
+/// event frames down past the squeezed call frame, so by the time
+/// `commit` / `fail_twice` runs the choice frame is no longer at sp-1
+/// -- a plain `bsp -= 1` would pop an event frame and leave the choice
+/// stranded, causing a later backtrack to find the wrong frame and
+/// resume at the wrong control point. Caller guarantees a matching
+/// frame exists.
+fn emitSpliceCtrlFrame(buf: *Buf) void {
+    // t1 = bsp - 1 (start at sp-1)
+    emitMovRR(buf, t1, bsp);
+    emitDec(buf, t1);
+
+    // find_loop: walk down until tag == 0 (choice) or tag == 4 (lcatch).
+    const find_loop_off = buf.off();
+    emitMovRR(buf, t0, t1);
+    emitShlRI(buf, t0, 5);
+    emitLeaRR(buf, t0, skp, t0); // t0 = &stack[t1]
+    emitMovRM(buf, t2, t0, 0); // t2 = tag
+
+    emitCmp32RI8(buf, t2, 0);
+    const found_choice_rel32 = emitJccRel32(buf, CC.eq);
+    emitCmp32RI8(buf, t2, 4);
+    const found_lcatch_rel32 = emitJccRel32(buf, CC.eq);
+
+    emitDec(buf, t1);
+    {
+        const back = emitJmpRel32(buf);
+        patchRel32(buf, back, find_loop_off);
+    }
+
+    // found: shift frames [t1+1..bsp) down by one slot.
+    patchRel32(buf, found_choice_rel32, buf.off());
+    patchRel32(buf, found_lcatch_rel32, buf.off());
+
+    const shift_loop_off = buf.off();
+    emitMovRR(buf, t2, t1);
+    emitInc(buf, t2);
+    emitCmpRR(buf, t2, bsp);
+    const shift_done_rel32 = emitJccRel32(buf, CC.ae);
+
+    emitMovRR(buf, t0, t1);
+    emitShlRI(buf, t0, 5);
+    emitLeaRR(buf, t0, skp, t0); // dest = &stack[t1]
+
+    // Copy 32 bytes (4 qwords) from [t0+32] to [t0].
+    emitMovRM(buf, t4, t0, 32);
+    emitMovMR(buf, t0, 0, t4);
+    emitMovRM(buf, t4, t0, 40);
+    emitMovMR(buf, t0, 8, t4);
+    emitMovRM(buf, t4, t0, 48);
+    emitMovMR(buf, t0, 16, t4);
+    emitMovRM(buf, t4, t0, 56);
+    emitMovMR(buf, t0, 24, t4);
+
+    emitInc(buf, t1);
+    {
+        const back = emitJmpRel32(buf);
+        patchRel32(buf, back, shift_loop_off);
+    }
+
+    patchRel32(buf, shift_done_rel32, buf.off());
+    emitDec(buf, bsp);
+}
+
 fn emitCharsetCheck(buf: *Buf, charset: u16, negate: bool, fixups: *[8192]Fixup, fcount: *usize) void {
     emitCmpRR(buf, pos, inl);
     addFixup(fixups, fcount, emitJccRel32(buf, CC.ae), .backtrack);
@@ -802,14 +871,22 @@ fn emitInst(
             emitInc(buf, bsp);
         },
         .commit => {
-            emitDec(buf, bsp);
+            if (config.capture_events) {
+                emitSpliceCtrlFrame(buf);
+            } else {
+                emitDec(buf, bsp);
+            }
             addFixup(fixups, fcount, emitJmpRel32(buf), FixupTarget.bytecodePC(inst.data.offset));
         },
         .fail => {
             addFixup(fixups, fcount, emitJmpRel32(buf), .backtrack);
         },
         .fail_twice => {
-            emitDec(buf, bsp);
+            if (config.capture_events) {
+                emitSpliceCtrlFrame(buf);
+            } else {
+                emitDec(buf, bsp);
+            }
             addFixup(fixups, fcount, emitJmpRel32(buf), .backtrack);
         },
         .jump => {
@@ -886,7 +963,7 @@ fn emitInst(
             // require pushing a tag=5 marker with the helper-returned
             // side_idx and jumping to the body.
 
-            // ----- Miss / recall: stamp marker + jump.
+            // Miss / recall: stamp marker + jump.
             emitMovRR(buf, t1, bsp);
             emitShlRI(buf, t1, 5);
             emitLeaRR(buf, t1, skp, t1);
@@ -906,7 +983,15 @@ fn emitInst(
             // Success path.
             patchRel32(buf, success_branch_off, buf.off());
             if (config.capture_events) {
-                // helperMemoCachedSlice(table, idx, &cached_start) -> count
+                // helperMemoCachedSlice(table, idx, &cached_start) -> count.
+                //
+                // memo_scratch1 already holds the cached end_pos
+                // (written by helperMemoCallBegin). Routing the helper's
+                // out_start through call_scratch keeps memo_scratch1
+                // intact for the `pos = end_pos` load below; otherwise
+                // helperMemoCachedSlice overwrites end_pos with
+                // events_start and the success path resumes at the
+                // wrong byte.
                 emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
                 emitMovRM(buf, rdi_r, t0, memoOff("table_ptr"));
                 emitMovRM(buf, t1, t0, memoOff("stride"));
@@ -914,7 +999,7 @@ fn emitInst(
                 emitImulRR(buf, t1, t2);
                 emitAddRR(buf, t1, pos);
                 emitMovRR(buf, rsi_r, t1);
-                emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1);
+                emitLeaRMDisp(buf, t2, rsp_r, stk_call_scratch);
                 emitMovRM(buf, t3, t0, memoOff("helper_cached_slice"));
                 emitCallR(buf, t3);
                 emitMovRR(buf, t4, t0);
@@ -924,7 +1009,7 @@ fn emitInst(
                 emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
                 emitMovRM(buf, rdi_r, rsp_r, stk_esp);
                 emitMovRM(buf, rsi_r, t0, memoOff("events_buf_ptr"));
-                emitMovRM(buf, t2, rsp_r, stk_memo_scratch1);
+                emitMovRM(buf, t2, rsp_r, stk_call_scratch);
                 emitMovRR(buf, t1, t4);
                 emitMovRR(buf, r8_r, skp);
                 emitMovMR(buf, rsp_r, stk_memo_scratch2, bsp);
