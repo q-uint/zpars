@@ -57,19 +57,40 @@ comptime {
 /// Runtime data needed by memoization codegen. The JIT prologue loads
 /// `JitCtx.memo_ctx_ptr` into a stack slot; memo emit sites then index
 /// into this struct rather than carrying a dozen separate JitCtx
-/// fields.
+/// fields. Includes static state (jump_table / code_base / heads /
+/// stack_ptr) so the helpers can resolve native targets and walk the
+/// JIT stack without taking those as per-call args.
 pub const MemoCtx = extern struct {
     /// Pointer to `[memo_rule_count * stride]memo.Entry`.
     table_ptr: u64,
     /// `input.len + 1`. Used to compute `idx = rule_id * stride + pos`.
     stride: u64,
-    /// Pointer to `[max_stack]memo.Frame` indexed by stack depth.
+    /// `*memo.Side`. The Side struct owns a growable list of frames;
+    /// helpers append on push and index on read. Side indices are
+    /// monotonic and never reused within an `execute()`.
     side_ptr: u64,
     /// `*memo.EventsBuf`. Zero when capture_events is off.
     events_buf_ptr: u64,
-    helper_lookup: u64,
+    /// `*events_mod.State`. Zero when capture_events is off. Used by
+    /// the memo helpers that need to snapshot the events log length
+    /// or cache event slices.
+    events_state_ptr: u64,
+    /// Pointer to the JIT's `[max_stack]StackEntry`. Helpers walk this
+    /// for `setupLr`'s stack-attach pass.
+    stack_ptr: u64,
+    /// Native code base; used by helpers to resolve `jump_table[bc_pc]`
+    /// offsets into absolute addresses for indirect branches.
+    jump_table_ptr: u64,
+    code_base: u64,
+    /// `*memo.Heads`. Owns the per-position arr + heads pool. Zero
+    /// when memoize is off.
+    heads_ptr: u64,
+    /// Number of memoized rules in this grammar. Used as the bitset
+    /// length when allocating new `Head`s.
+    memo_rule_count: u64,
+    helper_call_begin: u64,
     helper_cached_slice: u64,
     helper_replay_events: u64,
-    helper_ret_success: u64,
-    helper_ret_fail: u64,
+    helper_ret: u64,
+    helper_backtrack: u64,
 };

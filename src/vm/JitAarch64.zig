@@ -180,12 +180,6 @@ fn encMul(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x9B007C00 | (@as(u32, rm) << 16) | (@as(u32, rn) << 5) | rd;
 }
 
-/// `STR Wt, [Xn, #imm]` 32-bit store. `imm_bytes` must be a multiple
-/// of 4 and `imm_bytes / 4` must fit in 12 bits.
-fn encStrW(rt: Reg, rn: Reg, imm_bytes: u14) u32 {
-    return 0xB9000000 | (@as(u32, imm_bytes / 4) << 10) | (@as(u32, rn) << 5) | rt;
-}
-
 fn emitImm64(buf: *Buf, rd: Reg, val: u64) void {
     buf.emit(encMovz(rd, @truncate(val), 0));
     if (val > 0xFFFF)
@@ -376,13 +370,17 @@ const sp_haem: u15 = spSlot("helper_append_missing");
 const sp_ht: u15 = spSlot("helper_throw");
 const sp_hel: u15 = spSlot("helper_events_len");
 const sp_call_scratch: u15 = spSlot("call_scratch");
+const sp_call_scratch2: u15 = spSlot("call_scratch2");
 const sp_memo_ctx: u15 = spSlot("memo_ctx");
 const sp_memo_scratch1: u15 = spSlot("memo_scratch1");
 const sp_memo_scratch2: u15 = spSlot("memo_scratch2");
 
 fn localsSize(comptime config: Jit.Config) u12 {
-    // Must be a multiple of 16 for AArch64 SP alignment.
-    if (config.memoize) return 128;
+    // Must be a multiple of 16 for AArch64 SP alignment. Capture-events
+    // adds 11 helper slots (88 bytes) above the 2 base helper slots
+    // (= 104 used, padded to 112). Memoize adds another `call_scratch2`
+    // + 3 memo slots (= 144 used, padded to 144 since 144 mod 16 = 0).
+    if (config.memoize) return 144;
     if (config.capture_events) return 112;
     return 16;
 }
@@ -400,13 +398,6 @@ fn ctxOff(comptime field: []const u8) u15 {
 /// backtrack lowerings when they index into the runtime memo bundle.
 fn memoOff(comptime field: []const u8) u15 {
     return @intCast(@offsetOf(Jit.MemoCtx, field));
-}
-
-/// Same idea for `Jit.Frame` (memo side-table entry). Used by the
-/// `memo_call` miss path when it writes the new frame. `u14` matches
-/// the `encStrW` immediate-offset encoding (12-bit / 4-byte scaled).
-fn frameOff(comptime field: []const u8) u14 {
-    return @intCast(@offsetOf(Jit.Frame, field));
 }
 
 fn emitPrologue(comptime config: Jit.Config, buf: *Buf) void {
@@ -556,16 +547,36 @@ fn emitBacktrackHandler(
         break :blk off;
     } else 0;
 
-    // memo handler (memoize only): mark the entry .fail and continue.
+    // memo handler (memoize only): call helperMemoBacktrack.
+    // Returns either `bt_continue` (just keep walking the stack) or
+    // `bt_redirect` (recall failure with cached success / grow
+    // failure with seed -- branch to `out.native_target` with `pos =
+    // out.new_pos`). The 16-byte `RetResult` is laid out across the
+    // adjacent `memo_scratch1` / `memo_scratch2` slots.
     const memo_handler = if (config.memoize) blk: {
         const off = buf.off();
         buf.emit(encLdr(1, t1, 8)); // x1 = side_idx (val1)
         buf.emit(encLdr(0, sp_reg, sp_memo_ctx)); // x0 = memo_ctx
-        buf.emit(encLdr(t0, 0, memoOff("helper_ret_fail")));
+        buf.emit(encAdd(2, sp_reg, sp_memo_scratch1)); // x2 = &out_result
+        buf.emit(encLdr(t0, 0, memoOff("helper_backtrack")));
         buf.emit(encBlr(t0));
+        // x0 = action: 0=bt_continue, 1=bt_redirect.
+        buf.emit(encCmpImm(0, 1));
+        const redirect_off = buf.off();
+        buf.emit(encBCond(CC.eq, 0)); // patched to redirect_handler
+        // Continue loop (or fail if stack empty).
         addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, bsp);
         buf.emit(encNop());
         buf.emit(encB(@intCast(@as(i32, @intCast(loop_off)) - @as(i32, @intCast(buf.off())))));
+        // Redirect: load native target + new pos, branch.
+        const redirect_handler = buf.off();
+        {
+            const rel: i32 = @as(i32, @intCast(redirect_handler)) - @as(i32, @intCast(redirect_off));
+            buf.patchAt(redirect_off, encBCond(CC.eq, @intCast(rel)));
+        }
+        buf.emit(encLdr(t0, sp_reg, sp_memo_scratch1));
+        buf.emit(encLdr(pos, sp_reg, sp_memo_scratch2));
+        buf.emit(encBr(t0));
         break :blk off;
     } else 0;
 
@@ -682,136 +693,137 @@ fn emitInst(
             buf.emit(encNop());
         },
         .memo_call => {
-            // See JitX86.zig's `memo_call` for the algorithm.
+            // Mirrors `Vm`'s `memo_call` arm. The heavy lifting --
+            // RECALL detection, table lookup, SETUP-LR, and (for
+            // miss/recall) appending the new memo frame to `Side` --
+            // all lives in `helperMemoCallBegin`; the JIT just
+            // dispatches on its action code:
+            //   0 miss     -> stamp tag=5 marker + side_idx, jump body
+            //   1 fail     -> backtrack
+            //   2 success  -> pos = end_pos, replay cached events
+            //   3 lr_seed  -> pos = end_pos, fall through (no replay)
+            //   4 recall   -> stamp tag=5 marker + side_idx, jump body
+            //   5 cut      -> backtrack
+            // Any other return value is the OOM sentinel; route to fail.
             const mc = inst.data.memo;
 
-            // 1. Compute idx = rule_id * stride + pos.
-            buf.emit(encLdr(t0, sp_reg, sp_memo_ctx)); // t0 = MemoCtx*
-            buf.emit(encLdr(t1, t0, memoOff("stride")));
-            emitImm64(buf, t2, mc.rule_id); // t2 = rule_id
-            buf.emit(encMul(t1, t1, t2)); // t1 = stride * rule_id
-            buf.emit(encAddReg(t1, t1, pos)); // t1 = idx
-
-            // 2. helperMemoLookup(table, idx, &end_pos_out).
-            buf.emit(encLdr(0, t0, memoOff("table_ptr")));
-            buf.emit(encMov(1, t1)); // x1 = idx
-            buf.emit(encAdd(2, sp_reg, sp_memo_scratch1)); // x2 = &end_pos_out
-            buf.emit(encLdr(t3, t0, memoOff("helper_lookup")));
+            // 1. helperMemoCallBegin(memo_ctx, bsp, rule_id, pos,
+            //                        pc_pair, &end_pos_out, &side_idx_out)
+            //    pc_pair packs return_pc | rule_entry_pc << 32.
+            buf.emit(encLdr(0, sp_reg, sp_memo_ctx));
+            buf.emit(encMov(1, bsp));
+            emitImm64(buf, 2, mc.rule_id);
+            buf.emit(encMov(3, pos));
+            const pc_pair: u64 = @as(u64, bc_pc + 1) | (@as(u64, mc.offset) << 32);
+            emitImm64(buf, 4, pc_pair);
+            buf.emit(encAdd(5, sp_reg, sp_memo_scratch1));
+            buf.emit(encAdd(6, sp_reg, sp_memo_scratch2));
+            buf.emit(encLdr(t3, 0, memoOff("helper_call_begin")));
             buf.emit(encBlr(t3));
-            // x0 = action code. Caller-saved t0..t4 clobbered.
+            // x0 = action code (or oom_sentinel).
 
-            // 3. Dispatch on action.
-            buf.emit(encCmpImm(0, 1)); // == lookup_fail?
-            addFixup(fixups, fcount, buf.off(), .backtrack, .b_cond, CC.eq, 0);
+            // OOM check: action_codes are 0..5; oom_sentinel is the
+            // only larger return.
+            buf.emit(encCmpImm(0, 5));
+            const not_oom_off = buf.off();
+            buf.emit(encBCond(CC.lo, 0)); // patched to land just past the fail branch
+            addFixup(fixups, fcount, buf.off(), .fail, .b, 0, 0);
             buf.emit(encNop());
-
-            buf.emit(encCmpImm(0, 2)); // == lookup_success?
-            const success_branch_off = buf.off();
-            buf.emit(encBCond(CC.eq, 0)); // patched after miss path
-
-            // `lookup_lr` falls through into the miss path here. The
-            // table only enters `.lr` once Warth's left-recursion
-            // SETUP-LR path is wired up (currently unreachable on this
-            // backend); when it is, replace this fallthrough with a
-            // SETUP-LR dispatch.
-
-            // ----- Miss path: build the side frame, push marker, jump.
-            // 4a. Get events_len_at_entry.
-            if (config.capture_events) {
-                buf.emit(encLdr(0, sp_reg, sp_esp));
-                buf.emit(encLdr(t3, sp_reg, sp_hel));
-                buf.emit(encBlr(t3));
-                buf.emit(encMov(t4, 0)); // t4 = events_len (low 32 bits)
-            } else {
-                buf.emit(encMovz(t4, 0, 0)); // t4 = 0
+            const dispatch_off = buf.off();
+            {
+                const rel: i32 = @as(i32, @intCast(dispatch_off)) - @as(i32, @intCast(not_oom_off));
+                buf.patchAt(not_oom_off, encBCond(CC.lo, @intCast(rel)));
             }
 
-            // 4b. Compute &side[bsp].
-            buf.emit(encLdr(t0, sp_reg, sp_memo_ctx));
-            buf.emit(encLdr(t1, t0, memoOff("side_ptr")));
-            buf.emit(encLsl(t2, bsp, 4)); // t2 = bsp * 16
-            buf.emit(encAddReg(t1, t1, t2)); // t1 = &side[bsp]
+            // 2. Dispatch.
+            buf.emit(encCmpImm(0, 1)); // call_fail
+            addFixup(fixups, fcount, buf.off(), .backtrack, .b_cond, CC.eq, 0);
+            buf.emit(encNop());
+            buf.emit(encCmpImm(0, 5)); // call_cut
+            addFixup(fixups, fcount, buf.off(), .backtrack, .b_cond, CC.eq, 0);
+            buf.emit(encNop());
+            buf.emit(encCmpImm(0, 2)); // call_success
+            const success_branch_off = buf.off();
+            buf.emit(encBCond(CC.eq, 0));
+            buf.emit(encCmpImm(0, 3)); // call_lr_seed
+            const lr_seed_branch_off = buf.off();
+            buf.emit(encBCond(CC.eq, 0));
+            // Fall through: action == 0 (miss) or 4 (recall). Both
+            // require pushing a tag=5 marker with the helper-supplied
+            // side_idx and jumping to the body.
 
-            // 4c. Write Frame fields.
-            emitImm64(buf, t2, mc.rule_id);
-            buf.emit(encStrW(t2, t1, frameOff("rule_id")));
-            buf.emit(encStrW(pos, t1, frameOff("start_pos")));
-            emitImm64(buf, t2, bc_pc + 1);
-            buf.emit(encStrW(t2, t1, frameOff("return_pc")));
-            buf.emit(encStrW(t4, t1, frameOff("events_len_at_entry")));
-
-            // 4d. Push tag=5 marker at stack[bsp].
+            // ----- Miss / recall: stamp marker + jump.
+            // stack[bsp] = { tag=5, val1=*side_idx_out, val2=0, event_len=0 }
             buf.emit(encLsl(t1, bsp, 5));
             buf.emit(encAddReg(t1, skp, t1));
             buf.emit(encMovz(t2, 5, 0));
             buf.emit(encStr(t2, t1, 0));
-            buf.emit(encStr(bsp, t1, 8));
+            buf.emit(encLdr(t2, sp_reg, sp_memo_scratch2)); // side_idx
+            buf.emit(encStr(t2, t1, 8));
             buf.emit(encStr(xzr, t1, 16));
             buf.emit(encStr(xzr, t1, 24));
             buf.emit(encAdd(bsp, bsp, 1));
-
-            // 4e. Jump to the rule body.
             addFixup(fixups, fcount, buf.off(), FixupTarget.bytecodePC(mc.offset), .b, 0, 0);
             buf.emit(encNop());
 
-            // ----- Success path: replay events (if any), advance pos.
+            // ----- LR-seed handler: just advance pos, no replay.
+            const lr_seed_handler = buf.off();
+            {
+                const rel: i32 = @as(i32, @intCast(lr_seed_handler)) - @as(i32, @intCast(lr_seed_branch_off));
+                buf.patchAt(lr_seed_branch_off, encBCond(CC.eq, @intCast(rel)));
+            }
+            buf.emit(encLdr(pos, sp_reg, sp_memo_scratch1));
+            const lr_seed_skip_off = buf.off();
+            buf.emit(encNop()); // patched to branch past the success handler
+
+            // ----- Success path: replay cached events, advance pos.
             const success_handler = buf.off();
-            // Patch the conditional from step 3.
             {
                 const rel: i32 = @as(i32, @intCast(success_handler)) - @as(i32, @intCast(success_branch_off));
                 buf.patchAt(success_branch_off, encBCond(CC.eq, @intCast(rel)));
             }
-
             if (config.capture_events) {
-                // Look up cached event range.
                 buf.emit(encLdr(t0, sp_reg, sp_memo_ctx));
                 buf.emit(encLdr(0, t0, memoOff("table_ptr")));
-                // Recompute idx -- regs were clobbered.
                 buf.emit(encLdr(t1, t0, memoOff("stride")));
                 emitImm64(buf, t2, mc.rule_id);
                 buf.emit(encMul(t1, t1, t2));
                 buf.emit(encAddReg(t1, t1, pos));
                 buf.emit(encMov(1, t1));
-                buf.emit(encAdd(2, sp_reg, sp_memo_scratch1)); // out: cached_start
+                buf.emit(encAdd(2, sp_reg, sp_memo_scratch1));
                 buf.emit(encLdr(t3, t0, memoOff("helper_cached_slice")));
                 buf.emit(encBlr(t3));
-                // x0 = count of cached events.
-                buf.emit(encMov(t4, 0)); // preserve count
-
-                // If count == 0 skip replay.
+                buf.emit(encMov(t4, 0)); // t4 = count
                 const skip_replay_off = buf.off();
-                buf.emit(encCbz(t4, 0)); // patched to land after replay
-
-                // helperMemoReplayEvents(state, events_buf, start, count, stack, &sp, captures).
-                // 7 args -> all in x0..x6 on AArch64.
+                buf.emit(encCbz(t4, 0));
                 buf.emit(encLdr(t0, sp_reg, sp_memo_ctx));
-                buf.emit(encLdr(0, sp_reg, sp_esp)); // x0 = state
+                buf.emit(encLdr(0, sp_reg, sp_esp));
                 buf.emit(encLdr(1, t0, memoOff("events_buf_ptr")));
-                buf.emit(encLdr(2, sp_reg, sp_memo_scratch1)); // x2 = start
-                buf.emit(encMov(3, t4)); // x3 = count
-                buf.emit(encMov(4, skp)); // x4 = stack_ptr
-                // Stash bsp for the replay helper to update.
+                buf.emit(encLdr(2, sp_reg, sp_memo_scratch1));
+                buf.emit(encMov(3, t4));
+                buf.emit(encMov(4, skp));
                 buf.emit(encStr(bsp, sp_reg, sp_memo_scratch2));
-                buf.emit(encAdd(5, sp_reg, sp_memo_scratch2)); // x5 = &sp
-                buf.emit(encMov(6, cap)); // x6 = captures_ptr
+                buf.emit(encAdd(5, sp_reg, sp_memo_scratch2));
+                buf.emit(encMov(6, cap));
                 buf.emit(encLdr(t3, t0, memoOff("helper_replay_events")));
                 buf.emit(encBlr(t3));
-                // x0 = 0 ok or oom_sentinel.
-                buf.emit(encAdd(t0, 0, 1)); // t0 = x0 + 1
+                buf.emit(encAdd(t0, 0, 1));
                 addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, t0);
                 buf.emit(encNop());
-                // Reload bsp from the scratch slot (helper updated it).
                 buf.emit(encLdr(bsp, sp_reg, sp_memo_scratch2));
-
                 const replay_done_off = buf.off();
                 {
                     const rel: i32 = @as(i32, @intCast(replay_done_off)) - @as(i32, @intCast(skip_replay_off));
                     buf.patchAt(skip_replay_off, encCbz(t4, @intCast(rel)));
                 }
             }
-
-            // Advance pos to the cached end position and fall through.
             buf.emit(encLdr(pos, sp_reg, sp_memo_scratch1));
+
+            const after_all = buf.off();
+            {
+                const rel: i32 = @as(i32, @intCast(after_all)) - @as(i32, @intCast(lr_seed_skip_off));
+                buf.patchAt(lr_seed_skip_off, encB(@intCast(rel)));
+            }
         },
         .ret => {
             if (config.capture_events or config.memoize) {
@@ -856,32 +868,50 @@ fn emitInst(
 
                 const found_memo = if (config.memoize) blk: {
                     const off = buf.off();
-                    // Stack entry's val1 holds the side index. Call
-                    // helperMemoRetSuccess(memo_ctx, side_idx, end_pos,
-                    // state_ptr, jump_table, code_base) -> native_addr
-                    // (or oom_sentinel on OOM).
+                    // helperMemoRet(memo_ctx, side_idx, end_pos,
+                    //               state_ptr, bsp_ptr, &out_result)
+                    //   -> action: 0 ret_done | 1 ret_regrow | 2 oom
+                    //
+                    // The helper handles the entire LR ret dispatch
+                    // (recall completion / first-eval-with-head /
+                    // grow-iter completion). For `ret_regrow` it
+                    // pushes a new memo frame at the JIT's current
+                    // `bsp` (read/written via the spilled `bsp_ptr`
+                    // scratch). Both done and regrow flow into the
+                    // same shift loop below: we always set
+                    // `pos = out.new_pos` and branch to
+                    // `out.native_target`. The 16-byte RetResult is
+                    // laid out across `memo_scratch1` /
+                    // `memo_scratch2` (adjacent slots).
                     buf.emit(encLdr(1, t0, 8)); // x1 = side_idx
                     buf.emit(encLdr(0, sp_reg, sp_memo_ctx)); // x0 = memo_ctx
                     buf.emit(encMov(2, pos)); // x2 = end_pos
-                    if (config.capture_events) {
-                        buf.emit(encLdr(3, sp_reg, sp_esp)); // x3 = state_ptr
-                    } else {
-                        buf.emit(encMovz(3, 0, 0));
-                    }
-                    buf.emit(encMov(4, jtp)); // x4 = jump_table
-                    buf.emit(encMov(5, cbp)); // x5 = code_base
-                    // Stash t1 (the matched-frame index) across the
-                    // call -- it's caller-saved, but the shift loop
-                    // below depends on it.
-                    buf.emit(encStr(t1, sp_reg, sp_call_scratch));
-                    buf.emit(encLdr(t3, 0, memoOff("helper_ret_success")));
+                    // Spill bsp into the scratch slot the helper
+                    // reads/writes through; load &slot into x3.
+                    buf.emit(encStr(bsp, sp_reg, sp_call_scratch));
+                    buf.emit(encAdd(3, sp_reg, sp_call_scratch));
+                    buf.emit(encAdd(4, sp_reg, sp_memo_scratch1)); // x4 = &out_result
+                    // Stash t1 (the matched-frame index) too -- it's
+                    // caller-saved, and the shift loop depends on it.
+                    buf.emit(encStr(t1, sp_reg, sp_call_scratch2));
+
+                    buf.emit(encLdr(t3, 0, memoOff("helper_ret")));
                     buf.emit(encBlr(t3));
-                    buf.emit(encLdr(t1, sp_reg, sp_call_scratch));
-                    // x0 = native target or oom_sentinel.
-                    buf.emit(encAdd(t2, 0, 1)); // OOM check via +1==0
-                    addFixup(fixups, fcount, buf.off(), .fail, .cbz, 0, t2);
+
+                    // Reload t1 (matched-frame index) and bsp.
+                    buf.emit(encLdr(t1, sp_reg, sp_call_scratch2));
+                    buf.emit(encLdr(bsp, sp_reg, sp_call_scratch));
+
+                    // OOM check (action == 2).
+                    buf.emit(encCmpImm(0, 2));
+                    addFixup(fixups, fcount, buf.off(), .fail, .b_cond, CC.eq, 0);
                     buf.emit(encNop());
-                    buf.emit(encMov(t3, 0)); // t3 = native target
+
+                    // Both `done` and `regrow` use the same downstream
+                    // shift + branch: load native target into t3 and
+                    // pos override.
+                    buf.emit(encLdr(t3, sp_reg, sp_memo_scratch1));
+                    buf.emit(encLdr(pos, sp_reg, sp_memo_scratch2));
                     break :blk off;
                 } else 0;
 
@@ -1148,10 +1178,10 @@ fn emitInst(
             buf.emit(encStr(bsp, sp_reg, sp_call_scratch));
 
             buf.emit(encLdr(0, sp_reg, sp_esp)); // x0 = state_ptr
-            buf.emit(encMov(1, skp));            // x1 = stack_ptr
+            buf.emit(encMov(1, skp)); // x1 = stack_ptr
             buf.emit(encAdd(2, sp_reg, sp_call_scratch)); // x2 = &sp
-            buf.emit(encMovz(3, label, 0));      // x3 = label
-            buf.emit(encMov(4, pos));            // x4 = throw_pos
+            buf.emit(encMovz(3, label, 0)); // x3 = label
+            buf.emit(encMov(4, pos)); // x4 = throw_pos
 
             buf.emit(encLdr(t0, sp_reg, sp_ht));
             buf.emit(encBlr(t0));
@@ -1167,10 +1197,10 @@ fn emitInst(
 
             // x0 = handler bytecode PC. Index into jump_table to get
             // the native code offset, add code_base, branch.
-            buf.emit(encLsl(t1, 0, 3));        // t1 = bc_pc * 8
-            buf.emit(encAddReg(t1, jtp, t1));  // t1 = &jt[bc_pc]
-            buf.emit(encLdr(t1, t1, 0));       // t1 = jt[bc_pc]
-            buf.emit(encAddReg(t1, cbp, t1));  // t1 = code_base + offset
+            buf.emit(encLsl(t1, 0, 3)); // t1 = bc_pc * 8
+            buf.emit(encAddReg(t1, jtp, t1)); // t1 = &jt[bc_pc]
+            buf.emit(encLdr(t1, t1, 0)); // t1 = jt[bc_pc]
+            buf.emit(encAddReg(t1, cbp, t1)); // t1 = code_base + offset
             buf.emit(encBr(t1));
         },
     }

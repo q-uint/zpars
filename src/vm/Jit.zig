@@ -18,7 +18,6 @@ const jit_abi = @import("jit_abi.zig");
 pub const StackEntry = jit_abi.StackEntry;
 pub const MemoCtx = jit_abi.MemoCtx;
 pub const max_stack = jit_abi.max_stack;
-pub const Frame = memo_mod.Frame;
 
 /// Layout of the per-call stack region the backends spill `JitCtx`
 /// helper pointers and scratch values into. Both backends mirror this
@@ -46,7 +45,14 @@ pub const StackSlots = extern struct {
     helper_append_missing: u64,
     helper_throw: u64,
     helper_events_len: u64,
+    /// Reused by `throw` (capture_events) and the memo helper-call
+    /// path (memoize) to spill an out-pointer arg or stash a caller-
+    /// saved register across a BLR/CALL. Two slots are reserved
+    /// because some sites (notably the memo `ret` lowering) need to
+    /// stash both `bsp` and the matched-frame index `t1` across the
+    /// helper call.
     call_scratch: u64,
+    call_scratch2: u64,
     memo_ctx: u64,
     memo_scratch1: u64,
     memo_scratch2: u64,
@@ -148,9 +154,10 @@ pub fn JitWith(comptime config: Config) type {
         /// freed by `deinit`. Sized for `memo_rule_count * (input.len+1)`.
         memo_table: if (config.memoize) []memo_mod.Entry else void =
             if (config.memoize) &.{} else {},
-        /// Side table holding the per-stack-depth memo frame data.
-        /// Indexed by the depth at which a memo frame was pushed.
-        memo_side: if (config.memoize) [max_stack]memo_mod.Frame else void =
+        /// Side table holding memo frame data. Grown as frames are
+        /// pushed; never indexed by stack depth (the JIT stores a
+        /// fresh side index in each memo `StackEntry.val1`).
+        memo_side: if (config.memoize) memo_mod.Side else void =
             if (config.memoize) undefined else {},
         /// Append-only events buffer for cached event ranges. Only
         /// present when both memoize and capture_events are on.
@@ -165,6 +172,14 @@ pub fn JitWith(comptime config: Config) type {
         /// it via `MemoCtx.stride`.
         memo_stride: if (config.memoize) usize else void =
             if (config.memoize) 0 else {},
+        /// Number of memoized rules in the compiled grammar. Used as
+        /// the bitset length when `setupLr` allocates new `Head`s.
+        memo_rule_count: if (config.memoize) u16 else void =
+            if (config.memoize) 0 else {},
+        /// Per-position active head + heads pool. Backs the LR (Warth)
+        /// machinery; not touched on non-LR runs.
+        memo_heads: if (config.memoize) memo_mod.Heads else void =
+            if (config.memoize) undefined else {},
         /// Backing storage for `MemoCtx` populated each `execute()` call.
         memo_ctx: if (config.memoize) MemoCtx else void =
             if (config.memoize) undefined else {},
@@ -254,6 +269,7 @@ pub fn JitWith(comptime config: Config) type {
                         .stack_buf = undefined,
                         .memo_allocator = allocator,
                         .memo_stride = stride,
+                        .memo_rule_count = memo_rule_count,
                     };
                     if (config.capture_events) {
                         self.events = events_mod.State.init(allocator);
@@ -264,6 +280,8 @@ pub fn JitWith(comptime config: Config) type {
                         @memset(table, .{ .state = .empty, .next_pos_or_frame = 0 });
                         self.memo_table = table;
                     }
+                    self.memo_heads = try memo_mod.Heads.init(allocator, stride);
+                    self.memo_side = memo_mod.Side.init(allocator);
                     try backend.compile(&self);
                     return self;
                 }
@@ -277,6 +295,8 @@ pub fn JitWith(comptime config: Config) type {
             }
             if (config.memoize) {
                 if (config.capture_events) self.memo_events_buf.deinit();
+                self.memo_heads.deinit();
+                self.memo_side.deinit();
                 if (self.memo_allocator) |a| {
                     if (self.memo_table.len > 0) a.free(self.memo_table);
                 }
@@ -297,16 +317,24 @@ pub fn JitWith(comptime config: Config) type {
                 if (config.capture_events) {
                     self.memo_events_buf.list.clearRetainingCapacity();
                 }
+                self.memo_heads.clear();
+                self.memo_side.clear();
                 self.memo_ctx = .{
                     .table_ptr = @intFromPtr(self.memo_table.ptr),
                     .stride = self.memo_stride,
                     .side_ptr = @intFromPtr(&self.memo_side),
                     .events_buf_ptr = if (config.capture_events) @intFromPtr(&self.memo_events_buf) else 0,
-                    .helper_lookup = @intFromPtr(&memo_mod.helperMemoLookup),
+                    .events_state_ptr = if (config.capture_events) @intFromPtr(&self.events) else 0,
+                    .stack_ptr = @intFromPtr(&self.stack_buf),
+                    .jump_table_ptr = @intFromPtr(&self.jump_table),
+                    .code_base = @intFromPtr(self.native_code.ptr),
+                    .heads_ptr = @intFromPtr(&self.memo_heads),
+                    .memo_rule_count = self.memo_rule_count,
+                    .helper_call_begin = @intFromPtr(&memo_mod.helperMemoCallBegin),
                     .helper_cached_slice = @intFromPtr(&memo_mod.helperMemoCachedSlice),
                     .helper_replay_events = if (config.capture_events) @intFromPtr(&memo_mod.helperMemoReplayEvents) else 0,
-                    .helper_ret_success = @intFromPtr(&memo_mod.helperMemoRetSuccess),
-                    .helper_ret_fail = @intFromPtr(&memo_mod.helperMemoRetFail),
+                    .helper_ret = @intFromPtr(&memo_mod.helperMemoRet),
+                    .helper_backtrack = @intFromPtr(&memo_mod.helperMemoBacktrack),
                 };
             }
 
@@ -1150,4 +1178,71 @@ test "jit packrat: rejects bytecode without memoize config" {
         error.JitDoesNotSupportOp,
         Jit.init(memo.getCode(), memo.getCharsets(), memo.getStringData(), "a"),
     );
+}
+
+fn runJitPackrat(src: []const u8, input: []const u8) !?usize {
+    var memo = try Compiler.compileOpts(blk: {
+        var sc = PegScanner.init(src);
+        const tokens = sc.scanTokens();
+        var p = PegParser.init(tokens, src);
+        break :blk try p.parse();
+    }, .{ .memoize = true });
+    var jit = try PackJit.initPackrat(
+        testing.allocator,
+        memo.getCode(),
+        memo.getCharsets(),
+        memo.getStringData(),
+        memo.getMemoRuleCount(),
+        input,
+    );
+    defer jit.deinit();
+    return jit.execute();
+}
+
+test "jit warth: direct left recursion (single digit seed)" {
+    const src =
+        \\Expr <- Expr "+" Num / Num
+        \\Num  <- [0-9]+
+    ;
+    try testing.expectEqual(@as(?usize, 1), try runJitPackrat(src, "1"));
+}
+
+test "jit warth: direct left recursion grows across input" {
+    const src =
+        \\Expr <- Expr "+" Num / Num
+        \\Num  <- [0-9]+
+    ;
+    try testing.expectEqual(@as(?usize, 5), try runJitPackrat(src, "1+2+3"));
+}
+
+test "jit warth: direct left recursion stops at non-matching suffix" {
+    const src =
+        \\Expr <- Expr "+" Num / Num
+        \\Num  <- [0-9]+
+    ;
+    try testing.expectEqual(@as(?usize, 3), try runJitPackrat(src, "1+2+x"));
+}
+
+test "jit warth: left recursion with two operators" {
+    const src =
+        \\Expr <- Expr "+" Num / Expr "-" Num / Num
+        \\Num  <- [0-9]+
+    ;
+    try testing.expectEqual(@as(?usize, 7), try runJitPackrat(src, "1+2-3+4"));
+}
+
+test "jit warth: left recursion that never matches returns null" {
+    const src =
+        \\Expr <- Expr "+" Num / Num
+        \\Num  <- [0-9]+
+    ;
+    try testing.expectEqual(@as(?usize, null), try runJitPackrat(src, "x"));
+}
+
+test "jit warth: indirect left recursion through two rules" {
+    const src =
+        \\A <- B
+        \\B <- A "x" / "y"
+    ;
+    try testing.expectEqual(@as(?usize, 3), try runJitPackrat(src, "yxx"));
 }

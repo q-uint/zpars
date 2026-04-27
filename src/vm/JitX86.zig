@@ -70,6 +70,7 @@ const stk_haem: i32 = stkSlot("helper_append_missing");
 const stk_ht: i32 = stkSlot("helper_throw");
 const stk_hel: i32 = stkSlot("helper_events_len");
 const stk_call_scratch: i32 = stkSlot("call_scratch");
+const stk_call_scratch2: i32 = stkSlot("call_scratch2");
 const stk_memo_ctx: i32 = stkSlot("memo_ctx");
 const stk_memo_scratch1: i32 = stkSlot("memo_scratch1");
 const stk_memo_scratch2: i32 = stkSlot("memo_scratch2");
@@ -79,7 +80,10 @@ fn stkSize(comptime config: Jit.Config) i32 {
     // callee enters with rsp 0 mod 16. Function entry rsp is 8 mod 16,
     // 6 register pushes drop it by 48 bytes (still 8 mod 16), so
     // stkSize must itself be ≡ 8 mod 16 to preserve the invariant.
-    if (config.memoize) return 168;
+    // Memoize adds the `call_scratch2` slot on top of `call_scratch`,
+    // bumping from 168 to 184 (jumps a single padding slot to keep
+    // the 8-mod-16 invariant).
+    if (config.memoize) return 184;
     if (config.capture_events) return 136;
     return 48;
 }
@@ -96,12 +100,6 @@ fn ctxOff(comptime field: []const u8) i32 {
 /// backtrack lowerings when they index into the runtime memo bundle.
 fn memoOff(comptime field: []const u8) i32 {
     return @intCast(@offsetOf(Jit.MemoCtx, field));
-}
-
-/// Same idea for `Jit.Frame` (memo side-table entry). Used by the
-/// `memo_call` miss path when it writes the new frame.
-fn frameOff(comptime field: []const u8) i32 {
-    return @intCast(@offsetOf(Jit.Frame, field));
 }
 
 // Condition codes for Jcc
@@ -212,23 +210,6 @@ fn emitMovMI(buf: *Buf, base: Reg, disp: i32, imm: i32) void {
     buf.emit1(0xC7);
     emitModRMDisp(buf, @as(Reg, 0), base, disp);
     buf.emitI32(imm);
-}
-
-/// `mov dword ptr [base + disp], imm32`. 32-bit memory store with a
-/// 32-bit immediate (no sign extension to 64 bits unlike `emitMovMI`).
-fn emitMovMI32(buf: *Buf, base: Reg, disp: i32, imm: i32) void {
-    if (regHi(base) != 0) buf.emit1(0x40 | @as(u8, regHi(base)));
-    buf.emit1(0xC7);
-    emitModRMDisp(buf, @as(Reg, 0), base, disp);
-    buf.emitI32(imm);
-}
-
-/// `mov dword ptr [base + disp], src` (32-bit register store).
-fn emitMov32MR(buf: *Buf, base: Reg, disp: i32, src: Reg) void {
-    const need_rex = regHi(base) != 0 or regHi(src) != 0;
-    if (need_rex) buf.emit1(0x40 | (@as(u8, regHi(src)) << 2) | @as(u8, regHi(base)));
-    buf.emit1(0x89);
-    emitModRMDisp(buf, src, base, disp);
 }
 
 /// `imul dst, src` (64-bit). `dst = dst * src`.
@@ -719,17 +700,32 @@ fn emitBacktrackHandler(
         break :blk off;
     } else 0;
 
-    // memo handler (memoize only): mark the entry .fail and continue.
+    // memo handler (memoize only): call helperMemoBacktrack. The
+    // helper returns either `bt_continue` (just keep walking the
+    // stack) or `bt_redirect` (recall failure with cached success /
+    // grow failure with seed -- branch to `out.native_target` with
+    // `pos = out.new_pos`). The 16-byte `RetResult` is laid out
+    // across the adjacent `memo_scratch1` / `memo_scratch2` slots.
     const memo_handler_off = if (config.memoize) blk: {
         const off = buf.off();
         emitMovRM(buf, rsi_r, t0, 8); // rsi = side_idx (val1)
         emitMovRM(buf, rdi_r, rsp_r, stk_memo_ctx); // rdi = memo_ctx
-        emitMovRM(buf, t3, rdi_r, memoOff("helper_ret_fail"));
+        emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1); // rdx = &out_result
+        emitMovRM(buf, t3, rdi_r, memoOff("helper_backtrack"));
         emitCallR(buf, t3);
+        // rax = action: 0 = bt_continue, 1 = bt_redirect.
+        emitCmpRI8(buf, t0, 1);
+        const redirect_rel32 = emitJccRel32(buf, CC.eq);
+        // Continue loop (or fail if stack empty).
         emitTestRR(buf, bsp, bsp);
         addFixup(fixups, fcount, emitJccRel32(buf, CC.z), .fail);
         const jmp_off = emitJmpRel32(buf);
         patchRel32(buf, jmp_off, loop_off);
+        // Redirect handler: load native target + new pos, jmp.
+        patchRel32(buf, redirect_rel32, buf.off());
+        emitMovRM(buf, t0, rsp_r, stk_memo_scratch1);
+        emitMovRM(buf, pos, rsp_r, stk_memo_scratch2);
+        emitJmpR(buf, t0);
         break :blk off;
     } else 0;
 
@@ -832,133 +828,121 @@ fn emitInst(
             patchRel32(buf, lea_disp_off, buf.off());
         },
         .memo_call => {
-            // Mirrors `Vm`'s `memo_call` switch: look up the memo
-            // entry, dispatch to fail/success/miss. The miss path
-            // builds a side-table frame at depth `bsp`, pushes a
-            // tag=5 marker onto the stack, and jumps to the rule
-            // body. The eventual `ret` walks down to that marker
-            // (the tag dispatches it through `helperMemoRetSuccess`
-            // instead of treating it as a regular call return).
+            // Mirrors AArch64's `memo_call` arm. The helper does all
+            // the LR / recall / lookup work AND appends the new memo
+            // frame to `Side` for miss/recall actions; the JIT just
+            // dispatches and stamps a tag=5 marker with the helper-
+            // returned `side_idx`.
+            //   0 miss     -> stamp marker, jump to body
+            //   1 fail     -> backtrack
+            //   2 success  -> pos = end_pos, replay cached events
+            //   3 lr_seed  -> pos = end_pos, fall through
+            //   4 recall   -> stamp marker, jump to body
+            //   5 cut      -> backtrack
+            // Higher values are the OOM sentinel; route to fail.
             const mc = inst.data.memo;
 
-            // 1. Compute idx = rule_id * stride + pos.
-            emitMovRM(buf, t0, rsp_r, stk_memo_ctx); // t0 = MemoCtx*
-            emitMovRM(buf, t1, t0, memoOff("stride"));
-            emitMovRI32(buf, t2, mc.rule_id); // t2 = rule_id
-            emitImulRR(buf, t1, t2); // t1 = stride * rule_id
-            emitAddRR(buf, t1, pos); // t1 = idx
-
-            // 2. helperMemoLookup(table, idx, &end_pos_out).
-            emitMovRM(buf, rdi_r, t0, memoOff("table_ptr"));
-            emitMovRR(buf, rsi_r, t1); // rsi = idx
-            emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1); // rdx = &end_pos_out
-            emitMovRM(buf, t3, t0, memoOff("helper_lookup"));
+            // 1. helperMemoCallBegin(memo_ctx, bsp, rule_id, pos,
+            //                        pc_pair, &end_pos_out, &side_idx_out)
+            //    pc_pair packs return_pc | rule_entry_pc << 32. SysV
+            //    has 6 reg args; the 7th `&side_idx_out` is stack-
+            //    passed, so we sub rsp by 16 (alignment-keeping) and
+            //    write at [rsp+0], then add rsp back.
+            const pc_pair_lo: u32 = bc_pc + 1;
+            const pc_pair_hi: u32 = mc.offset;
+            emitMovRM(buf, rdi_r, rsp_r, stk_memo_ctx);
+            emitMovRR(buf, rsi_r, bsp);
+            emitMovRI32(buf, t2, mc.rule_id); // rdx = rule_id
+            emitMovRR(buf, t1, pos); // rcx = pos
+            // r8 = pc_pair (build via 64-bit immediate).
+            emitMovRI64(buf, r8_r, @as(u64, pc_pair_lo) | (@as(u64, pc_pair_hi) << 32));
+            emitLeaRMDisp(buf, r9_r, rsp_r, stk_memo_scratch1); // r9 = &end_pos_out
+            emitMovRM(buf, t3, rdi_r, memoOff("helper_call_begin"));
+            // arg7 = &side_idx_out, passed at [rsp+0]. Sub rsp 16 to
+            // make room without clobbering stk_csp/stk_sdp.
+            emitSubRI(buf, rsp_r, 16);
+            emitLeaRMDisp(buf, t0, rsp_r, 16 + stk_memo_scratch2);
+            emitMovMR(buf, rsp_r, 0, t0);
             emitCallR(buf, t3);
+            emitAddRI(buf, rsp_r, 16);
+            // rax = action (or oom_sentinel).
 
-            // 3. Dispatch on action code (rax = t0).
-            emitCmpRI8(buf, t0, 1); // == lookup_fail?
+            // OOM check: action > 5 means oom_sentinel.
+            emitCmpRI8(buf, t0, 5);
+            // 0x7 is JA (Jcc above, unsigned-greater).
+            const oom_jmp_rel32 = emitJccRel32(buf, 0x7);
+            addFixup(fixups, fcount, oom_jmp_rel32, .fail);
+
+            // 2. Dispatch.
+            emitCmpRI8(buf, t0, 1); // call_fail
             addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .backtrack);
-
-            emitCmpRI8(buf, t0, 2); // == lookup_success?
+            emitCmpRI8(buf, t0, 5); // call_cut
+            addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .backtrack);
+            emitCmpRI8(buf, t0, 2); // call_success
             const success_branch_off = emitJccRel32(buf, CC.eq);
+            emitCmpRI8(buf, t0, 3); // call_lr_seed
+            const lr_seed_branch_off = emitJccRel32(buf, CC.eq);
+            // Fall through: action == 0 (miss) or 4 (recall). Both
+            // require pushing a tag=5 marker with the helper-returned
+            // side_idx and jumping to the body.
 
-            // `lookup_lr` falls through into the miss path here. Once
-            // Warth's left-recursion SETUP-LR path is wired up (not on
-            // this backend yet), replace this fallthrough with a
-            // SETUP-LR dispatch.
-
-            // ----- Miss path
-            // 4a. Get events_len_at_entry into t4.
-            if (config.capture_events) {
-                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
-                emitMovRM(buf, t3, rsp_r, stk_hel);
-                emitCallR(buf, t3);
-                emitMovRR(buf, t4, t0); // t4 = events_len
-            } else {
-                emitXorRR32(buf, t4); // t4 = 0
-            }
-
-            // 4b. Compute &side[bsp].
-            emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
-            emitMovRM(buf, t1, t0, memoOff("side_ptr"));
-            emitMovRR(buf, t2, bsp);
-            emitShlRI(buf, t2, 4);
-            emitAddRR(buf, t1, t2); // t1 = &side[bsp]
-
-            // 4c. Write Frame fields.
-            emitMovMI32(buf, t1, frameOff("rule_id"), mc.rule_id);
-            emitMov32MR(buf, t1, frameOff("start_pos"), pos);
-            emitMovMI32(buf, t1, frameOff("return_pc"), @intCast(bc_pc + 1));
-            emitMov32MR(buf, t1, frameOff("events_len_at_entry"), t4);
-
-            // 4d. Push tag=5 marker at stack[bsp].
+            // ----- Miss / recall: stamp marker + jump.
             emitMovRR(buf, t1, bsp);
             emitShlRI(buf, t1, 5);
             emitLeaRR(buf, t1, skp, t1);
             emitMovMI(buf, t1, 0, 5); // tag=5
-            emitMovMR(buf, t1, 8, bsp); // val1=bsp
-            emitMovMI(buf, t1, 16, 0); // val2=0
-            emitMovMI(buf, t1, 24, 0); // event_len=0
+            emitMovRM(buf, t2, rsp_r, stk_memo_scratch2); // side_idx
+            emitMovMR(buf, t1, 8, t2); // val1=side_idx
+            emitMovMI(buf, t1, 16, 0);
+            emitMovMI(buf, t1, 24, 0);
             emitInc(buf, bsp);
-
-            // 4e. Jump to rule body.
             addFixup(fixups, fcount, emitJmpRel32(buf), FixupTarget.bytecodePC(mc.offset));
 
-            // ----- Success path
-            const success_handler = buf.off();
-            patchRel32(buf, success_branch_off, success_handler);
+            // LR-seed path.
+            patchRel32(buf, lr_seed_branch_off, buf.off());
+            emitMovRM(buf, pos, rsp_r, stk_memo_scratch1);
+            const lr_seed_skip_rel32 = emitJmpRel32(buf); // jump past success path
 
+            // Success path.
+            patchRel32(buf, success_branch_off, buf.off());
             if (config.capture_events) {
-                // Look up cached event range, replay if non-empty.
+                // helperMemoCachedSlice(table, idx, &cached_start) -> count
                 emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
                 emitMovRM(buf, rdi_r, t0, memoOff("table_ptr"));
-                // Recompute idx (regs were clobbered by the lookup call).
                 emitMovRM(buf, t1, t0, memoOff("stride"));
                 emitMovRI32(buf, t2, mc.rule_id);
                 emitImulRR(buf, t1, t2);
                 emitAddRR(buf, t1, pos);
                 emitMovRR(buf, rsi_r, t1);
-                emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1); // rdx = &cached_start
+                emitLeaRMDisp(buf, t2, rsp_r, stk_memo_scratch1);
                 emitMovRM(buf, t3, t0, memoOff("helper_cached_slice"));
                 emitCallR(buf, t3);
-                // rax = count.
-                emitMovRR(buf, t4, t0); // preserve count
-
-                // If count == 0 skip replay.
+                emitMovRR(buf, t4, t0);
                 emitTestRR(buf, t4, t4);
                 const skip_replay_off = emitJccRel32(buf, CC.eq);
-
-                // helperMemoReplayEvents(state, events_buf, start, count, stack, &sp, captures).
-                // 7 args -> 6 in registers + 1 on the stack. We sub
-                // rsp by 16 first so the outgoing-arg area sits below
-                // our own locals (preserving stk_csp/stk_sdp at the
-                // bottom of the locals frame). The 16-byte adjustment
-                // also keeps rsp ≡ 0 mod 16 across the inner CALL.
+                // helperMemoReplayEvents -- 7 args, sub rsp 16 trick.
                 emitMovRM(buf, t0, rsp_r, stk_memo_ctx);
-                emitMovRM(buf, rdi_r, rsp_r, stk_esp); // arg1 = state
+                emitMovRM(buf, rdi_r, rsp_r, stk_esp);
                 emitMovRM(buf, rsi_r, t0, memoOff("events_buf_ptr"));
-                emitMovRM(buf, t2, rsp_r, stk_memo_scratch1); // arg3 = start (rdx)
-                emitMovRR(buf, t1, t4); // arg4 = count (rcx)
-                emitMovRR(buf, r8_r, skp); // arg5 = stack
-                emitMovMR(buf, rsp_r, stk_memo_scratch2, bsp); // stash bsp
-                emitLeaRMDisp(buf, r9_r, rsp_r, stk_memo_scratch2); // arg6 = &sp
+                emitMovRM(buf, t2, rsp_r, stk_memo_scratch1);
+                emitMovRR(buf, t1, t4);
+                emitMovRR(buf, r8_r, skp);
+                emitMovMR(buf, rsp_r, stk_memo_scratch2, bsp);
+                emitLeaRMDisp(buf, r9_r, rsp_r, stk_memo_scratch2);
                 emitMovRM(buf, t3, t0, memoOff("helper_replay_events"));
-                // Make outgoing-arg area below our locals; arg7 lives
-                // at [new_rsp + 0] = [old_rsp - 16].
                 emitSubRI(buf, rsp_r, 16);
-                emitMovMR(buf, rsp_r, 0, cap); // [rsp+0] = captures
+                emitMovMR(buf, rsp_r, 0, cap);
                 emitCallR(buf, t3);
                 emitAddRI(buf, rsp_r, 16);
-                // rax = 0 ok or oom_sentinel.
                 emitCmpRI8(buf, t0, -1);
                 addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
-                emitMovRM(buf, bsp, rsp_r, stk_memo_scratch2); // reload bsp
-
+                emitMovRM(buf, bsp, rsp_r, stk_memo_scratch2);
                 patchRel32(buf, skip_replay_off, buf.off());
             }
-
-            // Advance pos to the cached end position and fall through.
             emitMovRM(buf, pos, rsp_r, stk_memo_scratch1);
+
+            // Patch lr_seed jump to land here (after success completes).
+            patchRel32(buf, lr_seed_skip_rel32, buf.off());
         },
         .ret => {
             if (config.capture_events or config.memoize) {
@@ -996,30 +980,43 @@ fn emitInst(
 
                 if (config.memoize) {
                     patchRel32(buf, found_memo_branch_off, buf.off());
-                    // Stash t1 (= the matched-frame index from
-                    // find_loop) before the call clobbers caller-saved
-                    // regs; the shift loop below depends on it.
-                    emitMovMR(buf, rsp_r, stk_call_scratch, t1);
-                    // helperMemoRetSuccess(memo_ctx, side_idx, end_pos,
-                    // state_ptr, jump_table, code_base) -> native_addr
-                    // (or oom_sentinel on OOM). 6 args, all in regs.
-                    emitMovRM(buf, rsi_r, t0, 8); // arg2 = side_idx (val1)
-                    emitMovRM(buf, rdi_r, rsp_r, stk_memo_ctx); // arg1 = memo_ctx
-                    emitMovRR(buf, t2, pos); // arg3 = end_pos (rdx)
-                    if (config.capture_events) {
-                        emitMovRM(buf, t1, rsp_r, stk_esp); // arg4 = state (rcx)
-                    } else {
-                        emitXorRR32(buf, t1); // arg4 = 0
-                    }
-                    emitMovRM(buf, r8_r, rsp_r, stk_jtp); // arg5 = jump_table
-                    emitMovRM(buf, r9_r, rsp_r, stk_cbp); // arg6 = code_base
-                    emitMovRM(buf, t3, rdi_r, memoOff("helper_ret_success"));
+                    // helperMemoRet(memo_ctx, side_idx, end_pos,
+                    //               state_ptr, bsp_ptr, &out_result)
+                    //   -> action: 0 ret_done | 1 ret_regrow | 2 oom
+                    //
+                    // The helper does the entire LR ret dispatch. For
+                    // `ret_regrow` it pushes a new memo frame at the
+                    // JIT's current `bsp` (read/written via the
+                    // spilled `bsp_ptr` scratch). Both done and regrow
+                    // flow into the same shift loop below: we always
+                    // set `pos = out.new_pos` and branch to
+                    // `out.native_target`. The 16-byte RetResult is
+                    // laid out across `memo_scratch1` /
+                    // `memo_scratch2` (adjacent slots).
+
+                    // Stash t1 (matched-frame index, set in
+                    // find_loop) and bsp -- both needed by the shift
+                    // loop after the call clobbers caller-saved regs.
+                    emitMovMR(buf, rsp_r, stk_call_scratch2, t1);
+                    emitMovMR(buf, rsp_r, stk_call_scratch, bsp);
+
+                    emitMovRM(buf, rsi_r, t0, 8); // rsi = side_idx (val1)
+                    emitMovRM(buf, rdi_r, rsp_r, stk_memo_ctx); // rdi = memo_ctx
+                    emitMovRR(buf, t2, pos); // rdx = end_pos
+                    emitLeaRMDisp(buf, t1, rsp_r, stk_call_scratch); // rcx = &bsp
+                    emitLeaRMDisp(buf, r8_r, rsp_r, stk_memo_scratch1); // r8 = &out_result
+                    emitMovRM(buf, t3, rdi_r, memoOff("helper_ret"));
                     emitCallR(buf, t3);
-                    // rax = native target or oom_sentinel.
-                    emitCmpRI8(buf, t0, -1);
+                    // Reload bsp + matched-frame index.
+                    emitMovRM(buf, bsp, rsp_r, stk_call_scratch);
+                    emitMovRM(buf, t1, rsp_r, stk_call_scratch2);
+                    // Action: 0 = done, 1 = regrow, 2 = oom.
+                    emitCmpRI8(buf, t0, 2);
                     addFixup(fixups, fcount, emitJccRel32(buf, CC.eq), .fail);
-                    emitMovRR(buf, t3, t0); // t3 = native target
-                    emitMovRM(buf, t1, rsp_r, stk_call_scratch); // restore t1
+                    // Both done & regrow share the downstream path:
+                    // load native target into t3 + pos override.
+                    emitMovRM(buf, t3, rsp_r, stk_memo_scratch1);
+                    emitMovRM(buf, pos, rsp_r, stk_memo_scratch2);
 
                     patchRel32(buf, skip_memo_block_off, buf.off());
                 }
