@@ -1768,6 +1768,7 @@ const CaptureTreeMod = @import("CaptureTree.zig");
 comptime {
     _ = @import("recovery_test.zig");
     _ = @import("diff_test.zig");
+    _ = @import("incremental_test.zig");
 }
 
 test "capture events: flat single group" {

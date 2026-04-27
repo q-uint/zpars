@@ -60,6 +60,11 @@ pub const Header = extern struct {
     /// `EngineWith.initPackrat` to size the memo table. Zero when the
     /// blob was compiled without `memoize`.
     memo_rule_count: u32,
+    /// Length of the trailing `examined_max` section in u32 entries.
+    /// Equal to `memo_rule_count` for memoized blobs, zero otherwise.
+    /// Each entry is the `LookaheadAnalysis.examined_max` for the
+    /// corresponding memo rule id; consumed by `RuntimeState.applyEdit`.
+    examined_max_len: u32,
 };
 
 pub const Blob = struct {
@@ -68,6 +73,10 @@ pub const Blob = struct {
     charsets: []const I.Charset,
     string_data: []const u8,
     jump_table: []const u64,
+    /// Per-memo-rule upper bound on byte offset read past entry pos.
+    /// Indexed by memo rule id; length matches `header.memo_rule_count`.
+    /// Empty for non-memoized blobs.
+    examined_max: []const u32,
 };
 
 pub fn compileToBlob(
@@ -77,7 +86,7 @@ pub fn compileToBlob(
     string_data: []const u8,
     capture_count: u16,
 ) !Blob {
-    return compileToBlobWith(.{}, allocator, code, charsets, string_data, capture_count, 0);
+    return compileToBlobWith(.{}, allocator, code, charsets, string_data, capture_count, 0, &.{});
 }
 
 /// Configurable variant of `compileToBlob`. The compile-time `config`
@@ -86,7 +95,9 @@ pub fn compileToBlob(
 /// into `Header.flags` so the runtime can reject mismatched loads.
 /// `memo_rule_count` is the number of memoized rules in the grammar
 /// (from `Compiler.getMemoRuleCount()`); the runtime uses it to size
-/// the per-execute memo table. Pass 0 when `config.memoize` is off.
+/// the per-execute memo table. `examined_max` is the per-memo-rule
+/// lookahead bound from `Compiler.getExaminedMax()`; pass `&.{}` when
+/// `config.memoize` is off (length must otherwise match `memo_rule_count`).
 pub fn compileToBlobWith(
     comptime config: Jit.Config,
     allocator: std.mem.Allocator,
@@ -95,7 +106,9 @@ pub fn compileToBlobWith(
     string_data: []const u8,
     capture_count: u16,
     memo_rule_count: u16,
+    examined_max: []const u32,
 ) !Blob {
+    std.debug.assert(examined_max.len == memo_rule_count);
     // Recovery opcodes need an event log to snapshot lcatch frames and
     // synthesize partial-close events. Reject those grammars when
     // capture_events is off rather than miscompiling.
@@ -124,6 +137,9 @@ pub fn compileToBlobWith(
     const owned_string_data = try allocator.alloc(u8, string_data.len);
     @memcpy(owned_string_data, string_data);
 
+    const owned_examined_max = try allocator.alloc(u32, examined_max.len);
+    @memcpy(owned_examined_max, examined_max);
+
     return .{
         .header = .{
             .magic = magic,
@@ -136,19 +152,23 @@ pub fn compileToBlobWith(
             .jump_table_entries = @intCast(code.len),
             .capture_count = capture_count,
             .memo_rule_count = memo_rule_count,
+            .examined_max_len = @intCast(examined_max.len),
         },
         .native_code = native_code,
         .charsets = owned_charsets,
         .string_data = owned_string_data,
         .jump_table = jt,
+        .examined_max = owned_examined_max,
     };
 }
 
 pub fn serializeBlob(allocator: std.mem.Allocator, blob: Blob) ![]u8 {
     const charsets_bytes = std.mem.sliceAsBytes(blob.charsets);
     const jt_bytes = std.mem.sliceAsBytes(blob.jump_table);
+    const examined_bytes = std.mem.sliceAsBytes(blob.examined_max);
     const total = @sizeOf(Header) + blob.native_code.len +
-        charsets_bytes.len + blob.string_data.len + jt_bytes.len;
+        charsets_bytes.len + blob.string_data.len + jt_bytes.len +
+        examined_bytes.len;
 
     const buf = try allocator.alloc(u8, total);
     var off: usize = 0;
@@ -162,6 +182,8 @@ pub fn serializeBlob(allocator: std.mem.Allocator, blob: Blob) ![]u8 {
     @memcpy(buf[off..][0..blob.string_data.len], blob.string_data);
     off += blob.string_data.len;
     @memcpy(buf[off..][0..jt_bytes.len], jt_bytes);
+    off += jt_bytes.len;
+    @memcpy(buf[off..][0..examined_bytes.len], examined_bytes);
 
     return buf;
 }
@@ -206,6 +228,14 @@ pub fn deserializeBlob(allocator: std.mem.Allocator, data: []const u8) !Blob {
     const jump_table = try allocator.alloc(u64, header.jump_table_entries);
     errdefer allocator.free(jump_table);
     @memcpy(std.mem.sliceAsBytes(jump_table), data[off..jt_end]);
+    off = jt_end;
+
+    const examined_byte_len = header.examined_max_len * @sizeOf(u32);
+    const examined_end = off + examined_byte_len;
+    if (examined_end > data.len) return error.UnexpectedEof;
+    const examined_max = try allocator.alloc(u32, header.examined_max_len);
+    errdefer allocator.free(examined_max);
+    @memcpy(std.mem.sliceAsBytes(examined_max), data[off..examined_end]);
 
     return .{
         .header = header,
@@ -213,6 +243,7 @@ pub fn deserializeBlob(allocator: std.mem.Allocator, data: []const u8) !Blob {
         .charsets = charsets,
         .string_data = string_data,
         .jump_table = jump_table,
+        .examined_max = examined_max,
     };
 }
 
@@ -221,6 +252,7 @@ pub fn freeBlob(allocator: std.mem.Allocator, blob: *Blob) void {
     allocator.free(blob.charsets);
     allocator.free(blob.string_data);
     allocator.free(blob.jump_table);
+    allocator.free(blob.examined_max);
 }
 
 const testing = std.testing;

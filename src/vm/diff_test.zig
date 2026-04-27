@@ -102,6 +102,7 @@ fn diffCheckMemoize(
         c.getStringData(),
         c.getCaptureCount(),
         c.getMemoRuleCount(),
+        c.getExaminedMax(),
     );
     defer Aot.freeBlob(allocator, &blob);
     const data = try Aot.serializeBlob(allocator, blob);
@@ -156,6 +157,7 @@ fn diffCheckMemoizeEvents(
         c.getStringData(),
         c.getCaptureCount(),
         c.getMemoRuleCount(),
+        c.getExaminedMax(),
     );
     defer Aot.freeBlob(allocator, &blob);
     const data = try Aot.serializeBlob(allocator, blob);
@@ -250,6 +252,7 @@ fn diffCheckEvents(
         c.getStringData(),
         c.getCaptureCount(),
         0,
+        &.{},
     );
     defer Aot.freeBlob(allocator, &blob);
     const data = try Aot.serializeBlob(allocator, blob);

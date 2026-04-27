@@ -11,6 +11,24 @@
 /// definitions both sides need to agree on.
 const std = @import("std");
 
+/// Compile-time configuration shared by `JitWith` (Jit.zig) and
+/// `EngineWith` (AotRuntime.zig). Lives here so the `RuntimeState`
+/// mixin can refer to it without a cycle through `Jit.zig`.
+pub const Config = struct {
+    /// Record open/close events for each capture save so a tree can be
+    /// built in a post-pass. When true, use `initEvents` (the plain
+    /// `init` is gated off because no allocator is available to back
+    /// the event log).
+    capture_events: bool = false,
+    /// Lower `memo_call` opcodes to native code that consults a packrat
+    /// memo table. When true, use `initPackrat` (the plain `init` and
+    /// `initEvents` are gated off because they cannot allocate the
+    /// table). Compatible with `capture_events`: a successful cache
+    /// hit replays the cached event range so the tree builder still
+    /// sees the same log.
+    memoize: bool = false,
+};
+
 /// Maximum depth of the JIT's backtrack stack and (parallel) memo
 /// side table. Must stay in sync with the array sizing on
 /// `JitWith(...).stack_buf` / `memo_side` in `Jit.zig`.

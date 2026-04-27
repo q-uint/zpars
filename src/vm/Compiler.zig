@@ -4,6 +4,7 @@ const Ast = @import("../Ast.zig");
 const I = @import("Instruction.zig");
 
 const Optimizer = @import("Optimizer.zig");
+const LookaheadAnalysis = @import("LookaheadAnalysis.zig");
 
 pub const Config = struct {
     max_code: u32 = 4096,
@@ -92,6 +93,30 @@ pub fn CompilerWith(comptime config: Config) type {
         field_names: [256]I.Inst.StringRef = [_]I.Inst.StringRef{.{ .offset = 0, .len = 0 }} ** 256,
         field_count: u16 = 0,
 
+        /// Per-rule bytecode bounds (`[rule_addrs[i], rule_ends[i])`),
+        /// retained for post-compile analysis (`LookaheadAnalysis`).
+        /// Indexed by rule index `i < rule_count`. Zero outside that
+        /// range.
+        rule_addrs: [256]u32 = [_]u32{0} ** 256,
+        rule_ends: [256]u32 = [_]u32{0} ** 256,
+
+        /// Map from rule index to memo rule id. `null` means the rule
+        /// isn't memoized (either because `memoize` is off or because
+        /// it carries captures and `memoize_captures` is off). Set by
+        /// `rewriteMemoCalls`.
+        memo_id_for_rule: [256]?u16 = [_]?u16{null} ** 256,
+
+        /// Per-memo-rule upper bound on the byte offset (relative to
+        /// rule entry pos) the rule's body can read. Indexed by memo
+        /// rule id, valid for `id < memo_rule_count`. Computed by
+        /// `LookaheadAnalysis` when `opts.memoize` is true; zero (and
+        /// unused) otherwise. `unbounded_value` flags rules whose
+        /// bound couldn't be statically established (recursive cycles,
+        /// `*` / `+` loops). Read by `RuntimeState.applyEdit` to
+        /// decide whether a cached `(rule, p)` memo entry can survive
+        /// a byte-range edit.
+        examined_max: [256]u32 = [_]u32{0} ** 256,
+
         const Patch = struct {
             addr: u32,
             name: []const u8,
@@ -177,28 +202,27 @@ pub fn CompilerWith(comptime config: Config) type {
                 const entry_call = try c.emitPlaceholder();
                 try c.emit(.{ .op = .match });
 
-                var rule_addrs: [256]u32 = undefined;
-                var rule_ends: [256]u32 = undefined;
                 for (rules, 0..) |rule, i| {
-                    rule_addrs[i] = c.code_len;
+                    c.rule_addrs[i] = c.code_len;
                     if (opts.rules_as_captures)
                         try c.emit(.{ .op = .event_open, .data = .{ .slot = @intCast(i) } });
                     try c.compileNode(&rule.node);
                     if (opts.rules_as_captures)
                         try c.emit(.{ .op = .event_close, .data = .{ .slot = @intCast(i) } });
                     try c.emit(.{ .op = .ret });
-                    rule_ends[i] = c.code_len;
+                    c.rule_ends[i] = c.code_len;
                 }
 
-                c.code[entry_call] = .{ .op = .call, .data = .{ .offset = rule_addrs[0] } };
-                c.patchCalls(&rule_addrs, rules);
+                c.code[entry_call] = .{ .op = .call, .data = .{ .offset = c.rule_addrs[0] } };
+                c.patchCalls(c.rule_addrs[0..rules.len], rules);
 
                 if (opts.memoize) {
                     c.rewriteMemoCalls(
-                        rule_addrs[0..rules.len],
-                        rule_ends[0..rules.len],
+                        c.rule_addrs[0..rules.len],
+                        c.rule_ends[0..rules.len],
                         opts.memoize_captures,
                     );
+                    c.runLookaheadAnalysis(rules.len);
                 }
             }
 
@@ -206,6 +230,34 @@ pub fn CompilerWith(comptime config: Config) type {
                 Optimizer.optimize(&c);
             }
             return c;
+        }
+
+        /// Run `LookaheadAnalysis` over the just-compiled bytecode and
+        /// populate `examined_max` for each memoized rule. Called after
+        /// `rewriteMemoCalls` (so `memo_call` opcodes carry their rule
+        /// ids) and before `Optimizer.optimize` (the optimizer rewrites
+        /// the bytecode but preserves examined-byte semantics, so the
+        /// pre-optimization analysis is still a valid upper bound).
+        fn runLookaheadAnalysis(self: *Self, rule_count_arg: usize) void {
+            // Stack-allocate the analysis scratch and per-rule summary
+            // buffer. Sized for the Compiler's `max_code` configuration
+            // since a single rule body cannot exceed the total code
+            // budget.
+            var scratch: LookaheadAnalysis.Scratch(config.max_code) = .{};
+            var summaries: [256]LookaheadAnalysis.RuleSummary = undefined;
+            const slice = summaries[0..rule_count_arg];
+            LookaheadAnalysis.analyze(
+                self.code[0..self.code_len],
+                self.rule_addrs[0..rule_count_arg],
+                self.rule_ends[0..rule_count_arg],
+                slice,
+                &scratch,
+            );
+            for (0..rule_count_arg) |i| {
+                if (self.memo_id_for_rule[i]) |mid| {
+                    self.examined_max[mid] = slice[i].examined_max;
+                }
+            }
         }
 
         /// Copy the rule name into `string_data` so it outlives the AST.
@@ -277,7 +329,6 @@ pub fn CompilerWith(comptime config: Config) type {
             rule_ends: []const u32,
             memoize_captures: bool,
         ) void {
-            var memo_id: [256]?u16 = [_]?u16{null} ** 256;
             for (rule_addrs, rule_ends, 0..) |start, end, i| {
                 if (!memoize_captures) {
                     var has_save = false;
@@ -289,7 +340,7 @@ pub fn CompilerWith(comptime config: Config) type {
                     }
                     if (has_save) continue;
                 }
-                memo_id[i] = self.memo_rule_count;
+                self.memo_id_for_rule[i] = self.memo_rule_count;
                 self.memo_rule_count += 1;
             }
 
@@ -298,7 +349,7 @@ pub fn CompilerWith(comptime config: Config) type {
                 const target = inst.data.offset;
                 for (rule_addrs, 0..) |addr, i| {
                     if (addr == target) {
-                        if (memo_id[i]) |id| {
+                        if (self.memo_id_for_rule[i]) |id| {
                             inst.* = .{
                                 .op = .memo_call,
                                 .data = .{ .memo = .{ .rule_id = id, .offset = target } },
@@ -603,6 +654,13 @@ pub fn CompilerWith(comptime config: Config) type {
 
         pub fn getMemoRuleCount(self: *const Self) u16 {
             return self.memo_rule_count;
+        }
+
+        /// Per-memo-rule upper bound on read offset. Indexed by memo
+        /// rule id, length `getMemoRuleCount()`. Empty when the
+        /// grammar wasn't compiled with `memoize`.
+        pub fn getExaminedMax(self: *const Self) []const u32 {
+            return self.examined_max[0..self.memo_rule_count];
         }
     };
 }

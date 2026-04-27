@@ -10,6 +10,7 @@ const CaptureTree = @import("CaptureTree.zig");
 const events_mod = @import("events.zig");
 const memo_mod = @import("memo.zig");
 const jit_abi = @import("jit_abi.zig");
+const runtime_state = @import("RuntimeState.zig");
 
 /// Re-export the shared layout types so existing callers that reach
 /// for `Jit.StackEntry` / `Jit.MemoCtx` / `Jit.max_stack` keep working
@@ -104,21 +105,10 @@ pub const JitCtx = extern struct {
 };
 
 /// Compile-time configuration for the JIT. Mirrors `Vm.Config` so the
-/// same feature flags drive both backends.
-pub const Config = struct {
-    /// Record open/close events for each capture save so a tree can be
-    /// built in a post-pass. When true, use `initEvents` (the plain
-    /// `init` is gated off because no allocator is available to back
-    /// the event log).
-    capture_events: bool = false,
-    /// Lower `memo_call` opcodes to native code that consults a packrat
-    /// memo table. When true, use `initPackrat` (the plain `init` and
-    /// `initEvents` are gated off because they cannot allocate the
-    /// table). Compatible with `capture_events`: a successful cache
-    /// hit replays the cached event range so the tree builder still
-    /// sees the same log.
-    memoize: bool = false,
-};
+/// same feature flags drive both backends. Re-exported from `jit_abi`
+/// so the `RuntimeState` mixin can refer to it without importing
+/// `Jit.zig`.
+pub const Config = jit_abi.Config;
 
 /// Default JIT type. Equivalent to `JitWith(.{})`.
 pub const Jit = JitWith(.{});
@@ -146,43 +136,9 @@ pub fn JitWith(comptime config: Config) type {
         jump_table: [4096]u64,
         captures_buf: [max_captures]u64,
         stack_buf: [max_stack]StackEntry,
-        /// Only present when `config.capture_events` is true. The JIT
-        /// writes into this via the C-ABI helpers in `events.zig`.
-        events: if (config.capture_events) events_mod.State else void =
-            if (config.capture_events) undefined else {},
-        /// Memo-table backing storage. Allocated by `initPackrat`,
-        /// freed by `deinit`. Sized for `memo_rule_count * (input.len+1)`.
-        memo_table: if (config.memoize) []memo_mod.Entry else void =
-            if (config.memoize) &.{} else {},
-        /// Side table holding memo frame data. Grown as frames are
-        /// pushed; never indexed by stack depth (the JIT stores a
-        /// fresh side index in each memo `StackEntry.val1`).
-        memo_side: if (config.memoize) memo_mod.Side else void =
-            if (config.memoize) undefined else {},
-        /// Append-only events buffer for cached event ranges. Only
-        /// present when both memoize and capture_events are on.
-        memo_events_buf: if (config.memoize and config.capture_events) memo_mod.EventsBuf else void =
-            if (config.memoize and config.capture_events) undefined else {},
-        /// Allocator that backs the memo table (and `memo_events_buf`
-        /// when capture_events is on). Stored so `deinit` can free.
-        memo_allocator: if (config.memoize) ?std.mem.Allocator else void =
-            if (config.memoize) null else {},
-        /// `input.len + 1`. Cached so it survives between executes
-        /// without re-derivation; the JIT-emitted memo_call code reads
-        /// it via `MemoCtx.stride`.
-        memo_stride: if (config.memoize) usize else void =
-            if (config.memoize) 0 else {},
-        /// Number of memoized rules in the compiled grammar. Used as
-        /// the bitset length when `setupLr` allocates new `Head`s.
-        memo_rule_count: if (config.memoize) u16 else void =
-            if (config.memoize) 0 else {},
-        /// Per-position active head + heads pool. Backs the LR (Warth)
-        /// machinery; not touched on non-LR runs.
-        memo_heads: if (config.memoize) memo_mod.Heads else void =
-            if (config.memoize) undefined else {},
-        /// Backing storage for `MemoCtx` populated each `execute()` call.
-        memo_ctx: if (config.memoize) MemoCtx else void =
-            if (config.memoize) undefined else {},
+        /// Optional event log + memo state shared with the AOT runtime.
+        /// All `config`-gated optional fields live here.
+        state: runtime_state.RuntimeState(config) = .{},
 
         /// Default constructor. Unavailable when `config.capture_events`
         /// or `config.memoize` is true - use `initEvents` / `initPackrat`,
@@ -204,6 +160,7 @@ pub fn JitWith(comptime config: Config) type {
                     .jump_table = [_]u64{0} ** 4096,
                     .captures_buf = [_]u64{null_cap} ** max_captures,
                     .stack_buf = undefined,
+                    .state = .empty(),
                 };
                 try backend.compile(&self);
                 return self;
@@ -233,7 +190,7 @@ pub fn JitWith(comptime config: Config) type {
                         .jump_table = [_]u64{0} ** 4096,
                         .captures_buf = [_]u64{null_cap} ** max_captures,
                         .stack_buf = undefined,
-                        .events = events_mod.State.init(allocator),
+                        .state = runtime_state.RuntimeState(config).initEvents(allocator),
                     };
                     try backend.compile(&self);
                     return self;
@@ -256,7 +213,27 @@ pub fn JitWith(comptime config: Config) type {
                     memo_rule_count: u16,
                     input: []const u8,
                 ) !Self {
-                    const stride = input.len + 1;
+                    return initPackratWithExamined(allocator, code, charsets, string_data, memo_rule_count, input, &.{});
+                }
+            }.f
+        else {};
+
+        /// Variant of `initPackrat` that threads the `LookaheadAnalysis`
+        /// result through to `RuntimeState`. `examined_max` must be
+        /// either empty (opt out of `applyEdit` precision) or exactly
+        /// `memo_rule_count` long. Required path for hosts that intend
+        /// to call `state.applyEdit` between executes.
+        pub const initPackratWithExamined = if (config.memoize)
+            struct {
+                fn f(
+                    allocator: std.mem.Allocator,
+                    code: []const I.Inst,
+                    charsets: []const I.Charset,
+                    string_data: []const u8,
+                    memo_rule_count: u16,
+                    input: []const u8,
+                    examined_max: []const u32,
+                ) !Self {
                     var self = Self{
                         .code = code,
                         .charsets = charsets,
@@ -267,21 +244,13 @@ pub fn JitWith(comptime config: Config) type {
                         .jump_table = [_]u64{0} ** 4096,
                         .captures_buf = [_]u64{null_cap} ** max_captures,
                         .stack_buf = undefined,
-                        .memo_allocator = allocator,
-                        .memo_stride = stride,
-                        .memo_rule_count = memo_rule_count,
+                        .state = try runtime_state.RuntimeState(config).initPackratEager(
+                            allocator,
+                            memo_rule_count,
+                            input.len,
+                            examined_max,
+                        ),
                     };
-                    if (config.capture_events) {
-                        self.events = events_mod.State.init(allocator);
-                        self.memo_events_buf = memo_mod.EventsBuf.init(allocator);
-                    }
-                    if (memo_rule_count > 0) {
-                        const table = try allocator.alloc(memo_mod.Entry, @as(usize, memo_rule_count) * stride);
-                        @memset(table, .{ .state = .empty, .next_pos_or_frame = 0 });
-                        self.memo_table = table;
-                    }
-                    self.memo_heads = try memo_mod.Heads.init(allocator, stride);
-                    self.memo_side = memo_mod.Side.init(allocator);
                     try backend.compile(&self);
                     return self;
                 }
@@ -290,52 +259,18 @@ pub fn JitWith(comptime config: Config) type {
 
         pub fn deinit(self: *Self) void {
             std.posix.munmap(self.native_code);
-            if (config.capture_events) {
-                self.events.deinit();
-            }
-            if (config.memoize) {
-                if (config.capture_events) self.memo_events_buf.deinit();
-                self.memo_heads.deinit();
-                self.memo_side.deinit();
-                if (self.memo_allocator) |a| {
-                    if (self.memo_table.len > 0) a.free(self.memo_table);
-                }
-            }
+            self.state.deinit();
         }
 
         pub fn execute(self: *Self) ?usize {
             @memset(&self.captures_buf, null_cap);
-            if (config.capture_events) {
-                self.events.clear();
-            }
+            self.state.beginExecute(self.input.len) catch return null;
             if (config.memoize) {
-                // Reset the memo table per execute(): cached results
-                // from a previous run are tied to that run's input.
-                if (self.memo_table.len > 0) {
-                    @memset(self.memo_table, .{ .state = .empty, .next_pos_or_frame = 0 });
-                }
-                if (config.capture_events) {
-                    self.memo_events_buf.list.clearRetainingCapacity();
-                }
-                self.memo_heads.clear();
-                self.memo_side.clear();
-                self.memo_ctx = .{
-                    .table_ptr = @intFromPtr(self.memo_table.ptr),
-                    .stride = self.memo_stride,
-                    .side_ptr = @intFromPtr(&self.memo_side),
-                    .events_buf_ptr = if (config.capture_events) @intFromPtr(&self.memo_events_buf) else 0,
-                    .events_state_ptr = if (config.capture_events) @intFromPtr(&self.events) else 0,
-                    .stack_ptr = @intFromPtr(&self.stack_buf),
-                    .jump_table_ptr = @intFromPtr(&self.jump_table),
-                    .code_base = @intFromPtr(self.native_code.ptr),
-                    .heads_ptr = @intFromPtr(&self.memo_heads),
-                    .memo_rule_count = self.memo_rule_count,
-                    .helper_call_begin = @intFromPtr(&memo_mod.helperMemoCallBegin),
-                    .helper_cached_slice = @intFromPtr(&memo_mod.helperMemoCachedSlice),
-                    .helper_replay_events = if (config.capture_events) @intFromPtr(&memo_mod.helperMemoReplayEvents) else 0,
-                    .helper_ret = @intFromPtr(&memo_mod.helperMemoRet),
-                    .helper_backtrack = @intFromPtr(&memo_mod.helperMemoBacktrack),
-                };
+                self.state.populateMemoCtx(
+                    @intFromPtr(&self.stack_buf),
+                    @intFromPtr(&self.jump_table),
+                    @intFromPtr(self.native_code.ptr),
+                );
             }
 
             const ctx = JitCtx{
@@ -349,7 +284,7 @@ pub fn JitWith(comptime config: Config) type {
                 .code_base_ptr = @intFromPtr(self.native_code.ptr),
                 .helper_string_match = @intFromPtr(&helperStringMatch),
                 .helper_charset_match = @intFromPtr(&helperCharsetMatch),
-                .events_state_ptr = if (config.capture_events) @intFromPtr(&self.events) else 0,
+                .events_state_ptr = self.state.eventsStatePtr(),
                 .helper_append_save = if (config.capture_events) @intFromPtr(&events_mod.helperAppendSave) else 0,
                 .helper_truncate_events = if (config.capture_events) @intFromPtr(&events_mod.helperTruncate) else 0,
                 .helper_append_token = if (config.capture_events) @intFromPtr(&events_mod.helperAppendToken) else 0,
@@ -359,7 +294,7 @@ pub fn JitWith(comptime config: Config) type {
                 .helper_append_missing = if (config.capture_events) @intFromPtr(&events_mod.helperAppendMissing) else 0,
                 .helper_throw = if (config.capture_events) @intFromPtr(&events_mod.helperThrow) else 0,
                 .helper_events_len = if (config.capture_events) @intFromPtr(&events_mod.helperEventsLen) else 0,
-                .memo_ctx_ptr = if (config.memoize) @intFromPtr(&self.memo_ctx) else 0,
+                .memo_ctx_ptr = self.state.memoCtxPtr(),
             };
 
             const jit_fn: *const fn (*const JitCtx) callconv(.c) u64 =
@@ -391,7 +326,7 @@ pub fn JitWith(comptime config: Config) type {
         pub const buildCaptureTree = if (config.capture_events)
             struct {
                 fn f(self: *const Self, tree_allocator: std.mem.Allocator) CaptureTree.BuildError!CaptureTree.Tree {
-                    return CaptureTree.buildFromEvents(tree_allocator, self.events.items());
+                    return self.state.buildCaptureTree(tree_allocator);
                 }
             }.f
         else {};
@@ -402,7 +337,7 @@ pub fn JitWith(comptime config: Config) type {
         pub const getCaptureEvents = if (config.capture_events)
             struct {
                 fn f(self: *const Self) []const CaptureTree.Event {
-                    return self.events.items();
+                    return self.state.getCaptureEvents();
                 }
             }.f
         else {};
