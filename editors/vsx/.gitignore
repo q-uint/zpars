@@ -1,4 +1,4 @@
 node_modules/
 out/
-wasm/zpars.wasm
+server/
 *.vsix

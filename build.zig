@@ -7,9 +7,8 @@
 //   zig build bench        Run benchmarks (ReleaseFast)
 //   zig build lsp          Build the LSP server
 //   zig build vim          Generate Vim syntax files
-//   zig build wasm         Build WASM module for the Open VSX extension
 //   zig build web          Build WASM module for the web demo
-//   zig build vsx          Build the full Open VSX extension (WASM + TypeScript)
+//   zig build vsx          Build the full Open VSX extension (LSP binary + TypeScript)
 //   zig build vsix         Package the extension as a .vsix
 //
 // The library module ("zpars") is rooted at src/root.zig and re-exported
@@ -102,6 +101,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lsp_exe);
     lsp_step.dependOn(b.getInstallStep());
 
+    // Side-install of the LSP binary into the extension's server/
+    // directory so `vsce package` picks it up.
+    const install_lsp_for_vsx = b.addInstallArtifact(lsp_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "../editors/vsx/server" } },
+    });
+
     const vim_step = b.step("vim", "Generate Vim syntax files");
     const vim_exe = b.addExecutable(.{
         .name = "zpars-vim",
@@ -121,27 +126,6 @@ pub fn build(b: *std.Build) void {
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
-
-    const wasm_step = b.step("wasm", "Build WASM module for the Open VSX extension");
-    const wasm_lib = b.addExecutable(.{
-        .name = "zpars",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm.zig"),
-            .target = wasm_target,
-            .optimize = .ReleaseSmall,
-        }),
-    });
-    wasm_lib.entry = .disabled;
-    wasm_lib.root_module.export_symbol_names = &.{
-        "alloc",
-        "free",
-        "analyze",
-        "tree",
-    };
-    const install_wasm = b.addInstallArtifact(wasm_lib, .{
-        .dest_dir = .{ .override = .{ .custom = "../editors/vsx/wasm" } },
-    });
-    wasm_step.dependOn(&install_wasm.step);
 
     const web_step = b.step("web", "Build WASM module for the web demo");
     const web_wasm = b.addExecutable(.{
@@ -166,10 +150,13 @@ pub fn build(b: *std.Build) void {
     });
     web_step.dependOn(&install_web_wasm.step);
 
-    const vsx_step = b.step("vsx", "Build the Open VSX extension (WASM + TypeScript)");
+    const vsx_step = b.step("vsx", "Build the Open VSX extension (LSP binary + TypeScript)");
+    const npm_install = b.addSystemCommand(&.{ "npm", "ci", "--no-fund", "--no-audit" });
+    npm_install.setCwd(b.path("editors/vsx"));
     const npm_compile = b.addSystemCommand(&.{ "npm", "run", "compile" });
     npm_compile.setCwd(b.path("editors/vsx"));
-    npm_compile.step.dependOn(&install_wasm.step);
+    npm_compile.step.dependOn(&npm_install.step);
+    npm_compile.step.dependOn(&install_lsp_for_vsx.step);
     vsx_step.dependOn(&npm_compile.step);
 
     const vsix_step = b.step("vsix", "Package the Open VSX extension as a .vsix");

@@ -209,8 +209,7 @@ fn analyzeOne(
                     examined_max = @max(examined_max, after);
                     try propagate(i + 1, after, len, pos_in, reachable, on_worklist, worklist, &wl_len);
                 },
-                .save, .event_open, .event_close, .event_error_open,
-                .event_error_close, .event_missing, .event_token, .event_field => {
+                .save, .event_open, .event_close, .event_error_open, .event_error_close, .event_missing, .event_token, .event_field => {
                     try propagate(i + 1, in_pos, len, pos_in, reachable, on_worklist, worklist, &wl_len);
                 },
                 .choice => {

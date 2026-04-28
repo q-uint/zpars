@@ -1,8 +1,8 @@
 {
   "name": "zpars",
   "displayName": "zpars",
-  "description": "Syntax highlighting for ABNF, BNF, PEG, CFG, and S-expression formats powered by Zig",
-  "version": "0.0.2",
+  "description": "Language server and editor support for ABNF, BNF, PEG, CFG, S-expression, and ERE grammar formats",
+  "version": "0.0.3",
   "icon": "icon.png",
   "publisher": "q-uint",
   "repository": {
@@ -72,6 +72,16 @@
           ".sexp"
         ],
         "configuration": "./languages/sexp.json"
+      },
+      {
+        "id": "ere",
+        "aliases": [
+          "ERE",
+          "ere"
+        ],
+        "extensions": [
+          ".ere"
+        ]
       }
     ],
     "semanticTokenTypes": [
@@ -139,12 +149,42 @@
       },
       "[sexp]": {
         "editor.semanticHighlighting.enabled": true
+      },
+      "[ere]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "commands": [
+      {
+        "command": "zpars.match",
+        "title": "zpars: Match Input Against Rule"
+      },
+      {
+        "command": "zpars.tree",
+        "title": "zpars: Show Capture Tree (PEG)"
+      },
+      {
+        "command": "zpars.restartServer",
+        "title": "zpars: Restart Language Server"
+      }
+    ],
+    "configuration": {
+      "title": "zpars",
+      "properties": {
+        "zpars.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the zpars-lsp binary. If empty, the bundled binary in the extension's server/ directory is used; otherwise zpars-lsp is resolved on PATH."
+        }
       }
     }
   },
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
     "@types/node": "^25.3.2",

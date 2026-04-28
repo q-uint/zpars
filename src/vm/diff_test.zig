@@ -489,4 +489,3 @@ test "diff: json divergence candidates" {
         };
     }
 }
-
