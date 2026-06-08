@@ -17,6 +17,14 @@
 
 const std = @import("std");
 
+// Build-time re-export: a bare `@import("zpars")` from a consumer's
+// build.zig resolves to this file's namespace, not src/root.zig, so the
+// comptime-safe combinators are surfaced here for use in parent build
+// scripts. Only std-only, pure-comptime modules belong here; anything
+// pulling in runtime/allocator machinery would be unsafe to evaluate in
+// the build-runner context.
+pub const combinators = @import("src/combinators.zig");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
