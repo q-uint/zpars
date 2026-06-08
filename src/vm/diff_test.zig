@@ -461,6 +461,56 @@ test "fuzz: json grammar - VM/JIT/AOT agree on random input" {
     });
 }
 
+// `diffCheck` only asserts VM/JIT/AOT *agree* on a result, so it can't
+// catch a bug that lives in the shared Compiler. The and-predicate
+// tests below run `diffCheck` AND independently assert the absolute
+// end position, so a broken `&P` lowering (where all three backends
+// agree on the wrong answer) gets caught.
+fn vmEnd(allocator: std.mem.Allocator, source: []const u8, input: []const u8) !?usize {
+    _ = allocator;
+    var scanner = PegScanner.init(source);
+    const tokens = scanner.scanTokens();
+    var parser = PegParser.init(tokens, source);
+    const rules = try parser.parse();
+    var c = try Compiler.compile(rules);
+    var vm = Vm.Vm.init(c.getCode(), c.getCharsets(), c.getStringData(), input);
+    return try vm.execute();
+}
+
+test "diff: and-predicate succeeds without consuming" {
+    // `&"a"` must succeed when 'a' is next, then leave the cursor at
+    // 0 so the following "ab" can match. A broken `&` lowering that
+    // always fails would reject "ab"; one that consumes would reject
+    // "ab" by leaving the cursor at 1 (so "ab" wouldn't match).
+    const grammar = "Main <- &\"a\" \"ab\"";
+    try diffCheck(testing.allocator, grammar, "ab");
+    try testing.expectEqual(@as(?usize, 2), try vmEnd(testing.allocator, grammar, "ab"));
+}
+
+test "diff: and-predicate fails when lookahead does not match" {
+    // `&"a"` must fail on "bc", causing the whole rule to fail — so
+    // the match returns null even though "bc" matches the tail in
+    // isolation.
+    const grammar = "Main <- &\"a\" \"bc\"";
+    try diffCheck(testing.allocator, grammar, "bc");
+    try testing.expectEqual(@as(?usize, null), try vmEnd(testing.allocator, grammar, "bc"));
+}
+
+test "diff: and-predicate inside alternation picks the guarded branch" {
+    // Classic disambiguation use of `&`: peek to choose a branch
+    // without consuming.
+    const grammar =
+        \\Main <- &"1" Digit / "fallback"
+        \\Digit <- [0-9]
+    ;
+    try diffCheck(testing.allocator, grammar, "1");
+    try diffCheck(testing.allocator, grammar, "fallback");
+    try diffCheck(testing.allocator, grammar, "2");
+    try testing.expectEqual(@as(?usize, 1), try vmEnd(testing.allocator, grammar, "1"));
+    try testing.expectEqual(@as(?usize, 8), try vmEnd(testing.allocator, grammar, "fallback"));
+    try testing.expectEqual(@as(?usize, null), try vmEnd(testing.allocator, grammar, "2"));
+}
+
 test "diff: json divergence candidates" {
     const candidates = [_][]const u8{
         "[1,2,3,4,5,6,7,8",

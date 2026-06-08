@@ -4,6 +4,7 @@
 const std = @import("std");
 const I = @import("Instruction.zig");
 const Jit = @import("Jit.zig");
+const JitMemory = @import("JitMemory.zig");
 
 const page_size = Jit.page_size;
 
@@ -51,6 +52,7 @@ const CC = struct {
     const ne: u4 = 0x1; // not equal
     const hs: u4 = 0x2; // unsigned >=
     const lo: u4 = 0x3; // unsigned <
+    const ls: u4 = 0x9; // unsigned <=
 };
 
 fn encB(off: i28) u32 {
@@ -329,23 +331,15 @@ pub fn compile(self: anytype) !void {
     const est = estimateSize(config, self.code.len);
     const size = std.mem.alignForward(usize, est, page_size);
 
-    self.native_code = try std.posix.mmap(
-        null,
-        size,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
+    const mem = try JitMemory.alloc(size);
+    self.native_code = mem.slice;
+    self.code_used_map_jit = mem.used_map_jit;
 
     const result = generate(config, self.code, self.native_code.ptr);
     self.native_len = result.native_len;
     self.jump_table = result.jump_table;
 
-    try std.process.protectMemory(
-        @alignCast(self.native_code[0..size]),
-        .{ .read = true, .execute = true },
-    );
+    try JitMemory.finalize(.{ .slice = self.native_code, .used_map_jit = self.code_used_map_jit });
 }
 
 /// Stack slots for helper pointers (offsets within the locals frame).
@@ -808,16 +802,17 @@ fn emitInst(
             // x0 = action code (or oom_sentinel).
 
             // OOM check: action_codes are 0..5; oom_sentinel is the
-            // only larger return.
+            // only larger return. `b.ls` (unsigned <= 5) keeps cut on
+            // the dispatcher path; `b.lo` (<) would treat cut as OOM.
             buf.emit(encCmpImm(0, 5));
             const not_oom_off = buf.off();
-            buf.emit(encBCond(CC.lo, 0)); // patched to land just past the fail branch
+            buf.emit(encBCond(CC.ls, 0)); // patched to land just past the fail branch
             addFixup(fixups, fcount, buf.off(), .fail, .b, 0, 0);
             buf.emit(encNop());
             const dispatch_off = buf.off();
             {
                 const rel: i32 = @as(i32, @intCast(dispatch_off)) - @as(i32, @intCast(not_oom_off));
-                buf.patchAt(not_oom_off, encBCond(CC.lo, @intCast(rel)));
+                buf.patchAt(not_oom_off, encBCond(CC.ls, @intCast(rel)));
             }
 
             // 2. Dispatch.

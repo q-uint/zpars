@@ -11,6 +11,7 @@ const events_mod = @import("events.zig");
 const memo_mod = @import("memo.zig");
 const jit_abi = @import("jit_abi.zig");
 const runtime_state = @import("RuntimeState.zig");
+const JitMemory = @import("JitMemory.zig");
 
 /// Re-export the shared layout types so existing callers that reach
 /// for `Jit.StackEntry` / `Jit.MemoCtx` / `Jit.max_stack` keep working
@@ -133,6 +134,12 @@ pub fn JitWith(comptime config: Config) type {
         input: []const u8,
         native_code: []align(page_size) u8,
         native_len: usize,
+        /// Tracks whether the page was mapped with `MAP_JIT` so
+        /// `deinit` (and any future re-finalize path) knows whether to
+        /// flip `pthread_jit_write_protect_np`. Set by the backend's
+        /// `compile`. Only ever true on Apple Silicon under a process
+        /// that holds the JIT entitlement.
+        code_used_map_jit: bool = false,
         jump_table: [4096]u64,
         captures_buf: [max_captures]u64,
         stack_buf: [max_stack]StackEntry,
@@ -258,7 +265,7 @@ pub fn JitWith(comptime config: Config) type {
         else {};
 
         pub fn deinit(self: *Self) void {
-            std.posix.munmap(self.native_code);
+            JitMemory.free(.{ .slice = self.native_code, .used_map_jit = self.code_used_map_jit });
             self.state.deinit();
         }
 

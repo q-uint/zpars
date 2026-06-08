@@ -408,15 +408,20 @@ pub fn CompilerWith(comptime config: Config) type {
                     try self.emit(.{ .op = .fail });
                 },
                 .and_predicate => |inner| {
+                    // &P ≡ !!P, lowered as:
+                    //   choice L_outer_end
+                    //   choice L_inner_end
+                    //   <body>
+                    //   fail_twice                ; body matched → !P fails → !! succeeds
+                    //   L_inner_end: fail_twice   ; body failed → !P succeeds → !! fails
+                    //   L_outer_end:
                     const outer = try self.emitPlaceholder();
                     const inner_choice = try self.emitPlaceholder();
                     try self.compileNode(inner);
-                    const commit_addr = try self.emitPlaceholder();
                     try self.emit(.{ .op = .fail_twice });
-                    self.code[inner_choice] = .{ .op = .choice, .data = .{ .offset = self.code_len - 1 } };
-                    self.code[commit_addr] = .{ .op = .commit, .data = .{ .offset = self.code_len - 1 } };
+                    self.code[inner_choice] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
+                    try self.emit(.{ .op = .fail_twice });
                     self.code[outer] = .{ .op = .choice, .data = .{ .offset = self.code_len } };
-                    try self.emit(.{ .op = .fail_twice });
                 },
                 .not_predicate => |inner| {
                     const choice_addr = try self.emitPlaceholder();

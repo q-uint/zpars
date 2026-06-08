@@ -4,6 +4,7 @@
 const std = @import("std");
 const I = @import("Instruction.zig");
 const Jit = @import("Jit.zig");
+const JitMemory = @import("JitMemory.zig");
 
 const page_size = Jit.page_size;
 
@@ -76,17 +77,40 @@ const stk_memo_scratch1: i32 = stkSlot("memo_scratch1");
 const stk_memo_scratch2: i32 = stkSlot("memo_scratch2");
 
 fn stkSize(comptime config: Jit.Config) i32 {
-    // SysV: rsp must be 8 mod 16 just before an inner CALL so the
-    // callee enters with rsp 0 mod 16. Function entry rsp is 8 mod 16,
+    // SysV: rsp must be 0 mod 16 just before an inner CALL so the
+    // callee enters with rsp 8 mod 16. Function entry rsp is 8 mod 16,
     // 6 register pushes drop it by 48 bytes (still 8 mod 16), so
-    // stkSize must itself be ≡ 8 mod 16 to preserve the invariant.
-    // Memoize adds the `call_scratch2` slot on top of `call_scratch`,
-    // bumping from 168 to 184 (jumps a single padding slot to keep
-    // the 8-mod-16 invariant).
+    // stkSize must itself be ≡ 8 mod 16 to land at 0 mod 16 before
+    // CALL. Memoize adds the `call_scratch2` slot on top of
+    // `call_scratch`, bumping from 168 to 184 (jumps a single padding
+    // slot to keep the 8-mod-16 invariant).
     if (config.memoize) return 184;
     if (config.capture_events) return 136;
-    return 48;
+    // Plain config: 5 used 8-byte slots (csp, sdp, jtp, cbp, hsm,
+    // hcm = 48 bytes) is 0 mod 16, which would land rsp at 8 mod 16
+    // before the CALL — violating SysV. Pad to 56 to restore the
+    // 8-mod-16 invariant.
+    return 56;
 }
+
+test "stkSize keeps rsp 0 mod 16 before inner CALL for every config" {
+    // Mirrors the prologue: function-entry rsp ≡ 8 (mod 16), then 6
+    // pushes (-48) leave it ≡ 8 (mod 16), then `sub rsp, stkSize`
+    // must land it at ≡ 0 (mod 16) so an inner CALL pushes a return
+    // address onto a 16-byte-aligned rsp (callee enters at ≡ 8).
+    const configs = [_]Jit.Config{
+        .{},
+        .{ .capture_events = true },
+        .{ .memoize = true },
+        .{ .capture_events = true, .memoize = true },
+    };
+    inline for (configs) |cfg| {
+        const rsp_before_call: i32 = 8 - 48 - stkSize(cfg);
+        try testing.expectEqual(@as(i32, 0), @mod(rsp_before_call, 16));
+    }
+}
+
+const testing = std.testing;
 
 /// Comptime offset of a `Jit.JitCtx` field, narrowed to `i32` for the
 /// x86_64 displacement encoding. Using `@offsetOf` here keeps the
@@ -522,23 +546,15 @@ pub fn compile(self: anytype) !void {
     const est = estimateSize(config, self.code.len);
     const size = std.mem.alignForward(usize, est, page_size);
 
-    self.native_code = try std.posix.mmap(
-        null,
-        size,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
+    const mem = try JitMemory.alloc(size);
+    self.native_code = mem.slice;
+    self.code_used_map_jit = mem.used_map_jit;
 
     const result = generate(config, self.code, self.native_code.ptr);
     self.native_len = result.native_len;
     self.jump_table = result.jump_table;
 
-    try std.process.protectMemory(
-        @alignCast(self.native_code[0..size]),
-        .{ .read = true, .execute = true },
-    );
+    try JitMemory.finalize(.{ .slice = self.native_code, .used_map_jit = self.code_used_map_jit });
 }
 
 fn emitPrologue(comptime config: Jit.Config, buf: *Buf) void {
