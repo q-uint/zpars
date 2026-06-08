@@ -108,6 +108,9 @@ test {
     // CnfBuilder is not exposed in the public API above (see comment on
     // `cfg` namespace). Pull its tests in explicitly so they still run.
     _ = @import("cfg/CnfBuilder.zig");
+    // JitMemory is a private const inside vm/Jit.zig, so refAllDecls
+    // can't reach its tests. Pull them in explicitly.
+    _ = @import("vm/JitMemory.zig");
 }
 
 fn refAllDeclsRecursive(comptime T: type) void {

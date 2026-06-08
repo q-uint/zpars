@@ -19,11 +19,12 @@
 ///    can hold stale icache lines from when the page was zero or RW
 ///    data. Without an explicit flush, freshly written branches can
 ///    execute as garbage (SIGILL or silent miscompile). On Linux arm64
-///    `mprotect(PROT_EXEC)` does NOT flush the icache, so we must do it
-///    ourselves. macOS's `mprotect`-to-PROT_EXEC implementation does
-///    issue cache maintenance, but `pthread_jit_write_protect_np` is
-///    the documented barrier, so we use it. x86 keeps the I- and
-///    D-caches coherent in hardware, no explicit flush needed.
+///    `mprotect(PROT_EXEC)` does NOT flush the icache. Neither path
+///    documents an icache flush as a side effect (`pthread_jit_write_
+///    protect_np` promises W^X barriers but not icache maintenance), so
+///    on every arm64 path we flush explicitly rather than depend on
+///    undocumented behavior. x86 keeps the I- and D-caches coherent in
+///    hardware, no explicit flush needed.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -148,3 +149,41 @@ fn flushICache(ptr: [*]const u8, len: usize) void {
 }
 
 extern "c" fn sys_icache_invalidate(start: [*]const u8, len: usize) void;
+
+const testing = std.testing;
+
+test "alloc returns page-aligned, page-rounded region" {
+    const mem = try alloc(1);
+    defer free(mem);
+    try testing.expect(mem.slice.len == page_size);
+    try testing.expect(@intFromPtr(mem.slice.ptr) % page_size == 0);
+    if (want_map_jit) try testing.expect(mem.used_map_jit);
+}
+
+test "free of a never-finalized region is safe" {
+    const mem = try alloc(page_size + 1);
+    try testing.expect(mem.slice.len == 2 * page_size);
+    free(mem);
+}
+
+// End-to-end proof of the W^X flip + icache flush: write a stub that
+// returns a constant for the host arch, finalize, call it. If finalize
+// skipped the icache invalidation on arm64 this would SIGILL or return
+// garbage. Skipped on arches without a hand-written stub below.
+test "write, finalize, and execute a return-constant stub" {
+    const stub: []const u8 = switch (builtin.cpu.arch) {
+        // mov w0, #42 ; ret
+        .aarch64 => &.{ 0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6 },
+        // mov eax, 42 ; ret
+        .x86_64 => &.{ 0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3 },
+        else => return error.SkipZigTest,
+    };
+
+    const mem = try alloc(stub.len);
+    defer free(mem);
+    @memcpy(mem.slice[0..stub.len], stub);
+    try finalize(mem);
+
+    const f: *const fn () callconv(.c) u32 = @ptrCast(mem.slice.ptr);
+    try testing.expectEqual(@as(u32, 42), f());
+}
